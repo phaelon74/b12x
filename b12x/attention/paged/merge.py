@@ -498,9 +498,7 @@ class PagedPersistentMergeKernel:
                 head_idx = work_linear_idx % num_heads
             if const_expr(self.regular_decode_graph):
                 start_idx = row_idx * max_chunks_per_req
-                kv_chunk_size = mKvChunkSizePtr[0]
-                cache_len = mCacheSeqlens[row_idx]
-                num_index_sets = (cache_len + kv_chunk_size - 1) // kv_chunk_size
+                num_index_sets = mMergeIndptr[row_idx + 1] - mMergeIndptr[row_idx]
                 end_idx = start_idx + num_index_sets
             else:
                 start_idx = mMergeIndptr[row_idx]

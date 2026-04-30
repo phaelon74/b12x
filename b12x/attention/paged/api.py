@@ -286,9 +286,6 @@ def _run_cached_host_launcher(
         cache[cache_key] = compiled
         if len(cache) > _EAGER_HOST_LAUNCHER_CACHE_SIZE:
             cache.popitem(last=False)
-    if torch.cuda.is_current_stream_capturing():
-        kernel(*args)
-        return
     exe_args, _ = compiled.generate_execution_args(*args)
     compiled.run_compiled_program(exe_args)
 
@@ -296,6 +293,7 @@ def _run_cached_host_launcher(
 @lru_cache(maxsize=64)
 def _build_forward_kernel(
     traits: PagedForwardTraits,
+    gqa_group_size: int,
     split_kv: bool,
     single_request_decode_graph: bool,
     single_qtile_decode_graph: bool,
@@ -313,6 +311,7 @@ def _build_forward_kernel(
         _torch_to_cutlass_storage_dtype(traits.kv_dtype),
         _torch_to_cutlass_dtype(traits.o_dtype),
         traits=traits,
+        gqa_group_size=gqa_group_size,
         split_kv=split_kv,
         single_request_decode_graph=single_request_decode_graph,
         single_qtile_decode_graph=single_qtile_decode_graph,
@@ -441,23 +440,32 @@ def paged_attention_forward(
             has_attention_sink_bias,
         )
     else:
+        disable_single_request_decode_graph = os.environ.get(
+            "B12X_PAGED_DISABLE_SINGLE_REQUEST_DECODE_GRAPH", "0"
+        ).lower() in {"1", "true", "yes", "on"}
         single_request_decode_graph = (
             plan.mode == "decode"
             and plan.enable_cuda_graph
             and plan.split_kv
+            and plan.gqa_group_size <= 8
+            and workspace._decode_graph_chunk_pages_lut is not None
             and plan.num_qo_tiles == 1
             and plan.page_table_shape[0] == 1
+            and not disable_single_request_decode_graph
         )
         single_qtile_decode_graph = (
             plan.mode == "decode"
             and plan.enable_cuda_graph
             and plan.split_kv
+            and plan.gqa_group_size <= 8
+            and workspace._decode_graph_chunk_pages_lut is not None
             and plan.page_table_shape[0] > 1
             and max(plan.qo_tile_indices, default=0) == 0
         )
         regularized_decode_graph = bool(single_qtile_decode_graph and workspace._use_regular_decode_graph_replay)
         forward_kernel = _build_forward_kernel(
             traits,
+            plan.gqa_group_size,
             plan.split_kv,
             single_request_decode_graph,
             single_qtile_decode_graph,
@@ -654,7 +662,10 @@ def paged_attention_forward(
         merge_regular_decode_graph = (
             plan.mode == "decode"
             and plan.enable_cuda_graph
+            and plan.gqa_group_size <= 8
+            and workspace._decode_graph_chunk_pages_lut is not None
             and workspace._use_regular_decode_graph_replay
+            and max(plan.qo_tile_indices, default=0) == 0
         )
         merge_direct_grid = merge_regular_decode_graph
         merge_kernel = _build_merge_kernel(

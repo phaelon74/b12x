@@ -70,6 +70,44 @@ def _align_up(x: int, y: int) -> int:
     return _ceil_div(x, y) * y
 
 
+def _decode_graph_chunk_pages_env(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return None
+    value = int(raw)
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+    return value
+
+
+def _apply_decode_graph_chunk_pages_debug_policy(chunk_pages: int) -> int:
+    forced = _decode_graph_chunk_pages_env("B12X_PAGED_DECODE_GRAPH_CHUNK_PAGES")
+    if forced is not None:
+        return forced
+    minimum = _decode_graph_chunk_pages_env("B12X_PAGED_DECODE_GRAPH_MIN_CHUNK_PAGES")
+    if minimum is not None:
+        return max(int(chunk_pages), minimum)
+    return int(chunk_pages)
+
+
+def _window_start_page(
+    *,
+    cache_len: int,
+    q_len: int,
+    window_left: int,
+    page_size: int,
+) -> int:
+    if window_left < 0:
+        return 0
+    # Paged attention uses the right-aligned causal convention.  For a request
+    # with cached length K and query length Q, the first query row can see up to
+    # key index K - Q.  Start from that earliest row so every later row remains
+    # covered by the request-level page span.
+    first_causal_key = max(int(cache_len) - max(int(q_len), 1), 0)
+    first_window_key = max(first_causal_key - int(window_left), 0)
+    return first_window_key // int(page_size)
+
+
 def _graph_max_batch_size_if_split(
     *,
     device: torch.device,
@@ -95,12 +133,31 @@ def _kv_dtype_tuning_key(kv_dtype: torch.dtype) -> str:
     raise TypeError(f"unsupported kv dtype for CTA tuning lookup: {kv_dtype}")
 
 
+def _decode_graph_tuning_regime(
+    *,
+    mode: _PagedMode,
+    page_size: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    gqa_group_size: int,
+) -> str | None:
+    tuning_regime = "decode" if mode == "verify" else mode
+    if tuning_regime != "decode" or page_size != 64:
+        return None
+    if head_dim_qk == 256 and head_dim_vo == 256 and gqa_group_size == 8:
+        return "decode"
+    return f"decode_qk{head_dim_qk}_vo{head_dim_vo}_gqa{gqa_group_size}"
+
+
 def _resolve_graph_ctas_per_sm(
     *,
     mode: _PagedMode,
     kv_dtype: torch.dtype,
     policy_batch: int,
-    max_effective_kv_pages: int,
+    page_size: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    gqa_group_size: int,
     graph_ctas_per_sm: int | None,
 ) -> int:
     if graph_ctas_per_sm is not None:
@@ -109,8 +166,14 @@ def _resolve_graph_ctas_per_sm(
             raise ValueError("graph_ctas_per_sm must be positive")
         return resolved_graph_ctas_per_sm
 
-    tuning_regime = "decode" if mode == "verify" else mode
-    if tuning_regime != "decode":
+    tuning_regime = _decode_graph_tuning_regime(
+        mode=mode,
+        page_size=page_size,
+        head_dim_qk=head_dim_qk,
+        head_dim_vo=head_dim_vo,
+        gqa_group_size=gqa_group_size,
+    )
+    if tuning_regime is None:
         return _DEFAULT_GRAPH_CTAS_PER_SM
 
     try:
@@ -236,28 +299,28 @@ def chunk_pages_for_family(
     gqa_group_size: int,
     max_effective_kv_pages: int,
 ) -> int | None:
-    if page_size != 64 or head_dim_qk != 256 or head_dim_vo != 256 or gqa_group_size != 8:
-        return None
     if q_dtype != torch.bfloat16:
         return None
-    if mode == "extend" and not graph_chunk_policy and kv_dtype == _FP8_KV_DTYPE:
+    is_default_geometry = page_size == 64 and head_dim_qk == 256 and head_dim_vo == 256 and gqa_group_size == 8
+    if mode == "extend" and is_default_geometry and not graph_chunk_policy and kv_dtype == _FP8_KV_DTYPE:
         return _lookup_chunk_pages_from_table(max_effective_kv_pages, _PAGED_EXTEND_FP8_CHUNK_TABLE_PAGES)
-    if mode == "extend" and not graph_chunk_policy and kv_dtype == torch.bfloat16:
+    if mode == "extend" and is_default_geometry and not graph_chunk_policy and kv_dtype == torch.bfloat16:
         return _lookup_chunk_pages_from_table(
             max_effective_kv_pages,
             _PAGED_EXTEND_BF16_CHUNK_TABLE_PAGES,
         )
 
-    tuning_regime = "decode" if mode == "verify" else mode
+    tuning_regime = _decode_graph_tuning_regime(
+        mode=mode,
+        page_size=page_size,
+        head_dim_qk=head_dim_qk,
+        head_dim_vo=head_dim_vo,
+        gqa_group_size=gqa_group_size,
+    )
     if (
-        tuning_regime != "decode"
+        tuning_regime is None
         or not graph_chunk_policy
         or policy_batch is None
-        or q_dtype != torch.bfloat16
-        or page_size != 64
-        or head_dim_qk != 256
-        or head_dim_vo != 256
-        or gqa_group_size != 8
     ):
         return None
 
@@ -267,7 +330,7 @@ def chunk_pages_for_family(
         return None
 
     try:
-        return int(
+        chunk_pages = int(
             lookup_decode_graph_chunk_pages(
                 kv_dtype=_kv_dtype_tuning_key(kv_dtype),
                 regime=tuning_regime,
@@ -275,6 +338,7 @@ def chunk_pages_for_family(
                 page_count=max(max_effective_kv_pages, 1),
             )
         )
+        return _apply_decode_graph_chunk_pages_debug_policy(chunk_pages)
     except KeyError:
         return None
 
@@ -599,45 +663,63 @@ def create_paged_plan(
         total_q=total_q,
     )
 
+    if window_left >= 0:
+        kv_window_start_pages = [
+            min(
+                _window_start_page(
+                    cache_len=cache_len,
+                    q_len=q_len,
+                    window_left=window_left,
+                    page_size=page_size,
+                ),
+                max(kv_pages - 1, 0),
+            )
+            for cache_len, q_len, kv_pages in zip(cache_lengths, q_lengths, kv_len_arr)
+        ]
+        effective_kv_len_arr = [
+            max(kv_pages - start_page, 1)
+            for kv_pages, start_page in zip(kv_len_arr, kv_window_start_pages)
+        ]
+    else:
+        kv_window_start_pages = [0 for _ in kv_len_arr]
+        effective_kv_len_arr = kv_len_arr
+
+    if enable_cuda_graph and window_left >= 0:
+        max_graph_window_pages = max(1, _ceil_div(window_left + page_size, page_size))
+        effective_kv_len_arr = [
+            max(effective_pages, min(kv_pages, max_graph_window_pages))
+            for effective_pages, kv_pages in zip(effective_kv_len_arr, kv_len_arr)
+        ]
+        kv_window_start_pages = [
+            min(start_page, max(kv_pages - effective_pages, 0))
+            for start_page, kv_pages, effective_pages in zip(
+                kv_window_start_pages, kv_len_arr, effective_kv_len_arr
+            )
+        ]
+
     if enable_cuda_graph:
         total_num_rows = total_q
         max_seq_len = total_num_rows - batch + 1
         max_qo_len = max_seq_len * gqa_group_size
-        max_effective_kv_pages = max(kv_len_arr) if window_left < 0 else min(
-            _ceil_div(window_left + _fa2_determine_cta_tile_q(max_qo_len, head_dim_qk), page_size),
-            max(kv_len_arr),
-        )
         cta_tile_q = _paged_determine_cta_tile_q(
             mode=mode,
             kv_dtype=k_cache.dtype,
             packed_qo_len=max_qo_len,
             head_dim=head_dim_qk,
-            max_effective_kv_pages=max(max_effective_kv_pages, 1),
+            max_effective_kv_pages=max(max(effective_kv_len_arr), 1),
         )
         total_num_qo_tiles = _ceil_div(total_num_rows * gqa_group_size, cta_tile_q) + batch - 1
     else:
         avg_packed_qo_len = sum(packed_qo_len_arr) // max(batch, 1)
-        max_effective_kv_pages = max(kv_len_arr) if window_left < 0 else min(
-            _ceil_div(window_left + _fa2_determine_cta_tile_q(avg_packed_qo_len, head_dim_qk), page_size),
-            max(kv_len_arr),
-        )
         cta_tile_q = _paged_determine_cta_tile_q(
             mode=mode,
             kv_dtype=k_cache.dtype,
             packed_qo_len=avg_packed_qo_len,
             head_dim=head_dim_qk,
-            max_effective_kv_pages=max(max_effective_kv_pages, 1),
+            max_effective_kv_pages=max(max(effective_kv_len_arr), 1),
         )
         total_num_qo_tiles = sum(_ceil_div(packed_qo_len, cta_tile_q) for packed_qo_len in packed_qo_len_arr)
 
-    effective_kv_len_arr = [
-        min(_ceil_div(window_left + cta_tile_q, page_size), kv_len) if window_left >= 0 else kv_len
-        for kv_len in kv_len_arr
-    ]
-    kv_window_start_pages = [
-        max(kv_pages - effective_pages, 0)
-        for kv_pages, effective_pages in zip(kv_len_arr, effective_kv_len_arr)
-    ]
     kv_window_start_tokens = tuple(start_page * page_size for start_page in kv_window_start_pages)
     resolved_graph_ctas_per_sm = 0
     if enable_cuda_graph:
@@ -645,7 +727,10 @@ def create_paged_plan(
             mode=mode,
             kv_dtype=k_cache.dtype,
             policy_batch=policy_batch,
-            max_effective_kv_pages=max(max(effective_kv_len_arr), 1),
+            page_size=page_size,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            gqa_group_size=gqa_group_size,
             graph_ctas_per_sm=graph_ctas_per_sm,
         )
     if max_batch_size_if_split is None:

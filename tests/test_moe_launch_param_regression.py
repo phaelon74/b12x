@@ -24,6 +24,8 @@ def _skip_if_unavailable() -> None:
         pytest.skip(f"Requires SM120 or SM121, got sm_{major}{minor}")
     if not MODEL_PATH.exists():
         pytest.skip(f"Model not found at {MODEL_PATH}")
+    if not (MODEL_PATH / "model.safetensors.index.json").exists():
+        pytest.skip(f"Indexed model weights not found at {MODEL_PATH}")
 
 
 def _make_spec() -> ModelSpec:

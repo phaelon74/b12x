@@ -2691,9 +2691,7 @@ class PagedForwardKernel:
             return False
         if dtype_o not in (cutlass.Float16, cutlass.BFloat16):
             return False
-        if traits.head_dim_qk != traits.head_dim_vo:
-            return False
-        if traits.head_dim_qk % 32 != 0:
+        if traits.head_dim_qk % 32 != 0 or traits.head_dim_vo % 32 != 0:
             return False
         if traits.num_threads != 128:
             return False

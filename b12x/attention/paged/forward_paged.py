@@ -2113,6 +2113,7 @@ class PagedForwardKernel:
         dtype_o: Type[cutlass.Numeric],
         *,
         traits: PagedForwardTraits,
+        gqa_group_size: int,
         split_kv: bool,
         single_request_decode_graph: bool = False,
         single_qtile_decode_graph: bool = False,
@@ -2129,6 +2130,7 @@ class PagedForwardKernel:
         self.dtype_kv_storage = dtype_kv_storage
         self.dtype_o = dtype_o
         self.traits = traits
+        self.gqa_group_size = int(gqa_group_size)
         self.split_kv = split_kv
         self.single_request_decode_graph = single_request_decode_graph
         self.single_qtile_decode_graph = single_qtile_decode_graph
@@ -2740,12 +2742,15 @@ class PagedForwardKernel:
                 request_partial_end = mOIndptr[1]
             elif const_expr(self.single_qtile_decode_graph):
                 request_idx = mRequestIndices[work_idx]
-                kv_tile_idx = work_idx - mOIndptr[mRequestIndices[work_idx]]
+                max_chunks_per_req = Int32(mO.shape[0] // mPageTable.shape[0])
+                request_partial_start = request_idx * max_chunks_per_req
+                kv_tile_idx = work_idx - request_partial_start
                 q_start = request_idx
                 q_end = request_idx + 1
                 qo_len = Int32(1)
-                request_partial_start = mOIndptr[request_idx]
-                request_partial_end = mOIndptr[request_idx + 1]
+                request_partial_end = request_partial_start + (
+                    mOIndptr[request_idx + 1] - mOIndptr[request_idx]
+                )
             elif const_expr(self.decode_only):
                 request_idx = mRequestIndices[work_idx]
                 kv_tile_idx = mKvTileIndices[work_idx]
@@ -3195,6 +3200,7 @@ class PagedForwardKernel:
             and self.traits.num_mma_q == 1
             and self.traits.num_warps_q == 1
             and self.traits.num_warps_kv == 4
+            and self.gqa_group_size == 8
         )
         decode_row_metadata_fastpath = const_expr(
             self.decode_only

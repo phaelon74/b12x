@@ -94,7 +94,9 @@ def test_joint_arena_size_is_max_of_attention_and_moe_phases() -> None:
     assert lane.attention_nbytes == expected_attn
     assert lane.paged_attention_nbytes == expected_paged_attn
     assert lane.moe_nbytes == expected_moe
-    assert lane.shared_arena_nbytes == max(expected_attn, expected_paged_attn, expected_moe, 1)
+    assert lane.shared_arena_nbytes == max(
+        expected_attn, expected_paged_attn, expected_moe, 1
+    )
 
 
 def test_joint_arena_views_share_one_backing_allocation() -> None:
@@ -132,6 +134,8 @@ def test_joint_arena_views_share_one_backing_allocation() -> None:
             max_page_table_width=4,
             max_work_items=16,
             max_partial_rows=32,
+            num_q_heads=2,
+            num_kv_heads=1,
             head_dim_qk=128,
             head_dim_vo=128,
             num_cache_pages=8,
@@ -172,8 +176,14 @@ def test_joint_arena_views_share_one_backing_allocation() -> None:
         storage_key=("static",),
     )
     assert _storage_ptr(moe_ws.packed_input) == base_ptr
-    assert moe_ws.packed_input.data_ptr() >= lane.shared_arena.data_ptr() + pool.core_arena_offset_bytes
-    assert route_ws.router_logits.data_ptr() < lane.shared_arena.data_ptr() + pool.core_arena_offset_bytes
+    assert (
+        moe_ws.packed_input.data_ptr()
+        >= lane.shared_arena.data_ptr() + pool.core_arena_offset_bytes
+    )
+    assert (
+        route_ws.router_logits.data_ptr()
+        < lane.shared_arena.data_ptr() + pool.core_arena_offset_bytes
+    )
     assert pool.shared_arena is lane.shared_arena
 
 
