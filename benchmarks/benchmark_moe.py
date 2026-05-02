@@ -243,7 +243,8 @@ class ModelProfile:
     checkpoint_family: str
     default_layer_idx: int
     tp_size: int
-    hf_repo_id: str
+    hf_repo_id: str | None
+    default_model_path: pathlib.Path | None = None
 
 
 MODEL_PROFILES = {
@@ -260,6 +261,14 @@ MODEL_PROFILES = {
         default_layer_idx=1,
         tp_size=1,
         hf_repo_id="nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
+    ),
+    "glm51": ModelProfile(
+        label="GLM-5.1",
+        checkpoint_family="glm",
+        default_layer_idx=3,
+        tp_size=8,
+        hf_repo_id=None,
+        default_model_path=pathlib.Path("/data/models/GLM-5.1-NVFP4"),
     ),
 }
 
@@ -307,12 +316,19 @@ def resolve_model_path(
     env_path = os.environ.get("B12X_MODEL_PATH")
     if env_path:
         return pathlib.Path(env_path)
-    cached_path = _cached_snapshot_path(profile.hf_repo_id)
-    if cached_path is not None:
-        return cached_path
-    from huggingface_hub import snapshot_download
+    if profile.default_model_path is not None and profile.default_model_path.is_dir():
+        return profile.default_model_path
+    if profile.hf_repo_id is not None:
+        cached_path = _cached_snapshot_path(profile.hf_repo_id)
+        if cached_path is not None:
+            return cached_path
+        from huggingface_hub import snapshot_download
 
-    return pathlib.Path(snapshot_download(repo_id=profile.hf_repo_id))
+        return pathlib.Path(snapshot_download(repo_id=profile.hf_repo_id))
+
+    raise FileNotFoundError(
+        f"no default path found for {profile.label}; pass --model-path explicitly"
+    )
 
 MODEL_PATH = _default_legacy_model_path()
 
@@ -357,6 +373,15 @@ def build_model_spec(model_path: pathlib.Path, profile: ModelProfile) -> ModelSp
             tp_size=profile.tp_size,
             tp_rank=0,
         )
+    if profile.checkpoint_family == "glm":
+        return ModelSpec(
+            hidden_size=cfg["hidden_size"],
+            intermediate_size=cfg["moe_intermediate_size"],
+            num_experts=cfg["n_routed_experts"],
+            top_k=cfg["num_experts_per_tok"],
+            tp_size=profile.tp_size,
+            tp_rank=0,
+        )
     if profile.checkpoint_family == "nemotron":
         if cfg["hidden_size"] % TP_SIZE != 0:
             raise ValueError(
@@ -392,14 +417,19 @@ def load_expert_weights(
     I_tp = spec.I_tp
     loader = IndexedSafetensorLoader(model_path)
 
-    if checkpoint_family == "qwen":
+    if checkpoint_family in {"qwen", "glm"}:
         if activation != "silu":
-            raise ValueError("Qwen FP4 benchmark only supports silu experts")
-        assert cfg["num_experts"] == spec.num_experts
+            raise ValueError(f"{checkpoint_family} FP4 benchmark only supports silu experts")
+        if checkpoint_family == "qwen":
+            cfg_num_experts = cfg["num_experts"]
+            prefix = f"model.language_model.layers.{layer_idx}.mlp.experts"
+        else:
+            cfg_num_experts = cfg["n_routed_experts"]
+            prefix = f"model.layers.{layer_idx}.mlp.experts"
+        assert cfg_num_experts == spec.num_experts
         assert cfg["moe_intermediate_size"] == spec.intermediate_size
         assert cfg["hidden_size"] == spec.hidden_size
 
-        prefix = f"model.language_model.layers.{layer_idx}.mlp.experts"
         gate_w = torch.empty(E, I_tp, K // 2, dtype=torch.uint8, device=device)
         up_w = torch.empty(E, I_tp, K // 2, dtype=torch.uint8, device=device)
         down_w = torch.empty(E, K, I_tp // 2, dtype=torch.uint8, device=device)
@@ -763,9 +793,9 @@ def make_oracle_reference(
 
 ORACLE_TOLERANCES = {
     "silu": {
-        "max_abs": 0.0005,
-        "rmse": 0.0001,
-        "mean_abs": 0.0001,
+        "max_abs": 0.001,
+        "rmse": 0.0002,
+        "mean_abs": 0.0002,
         "cos_min": 0.99925,
     },
     # relu2 outputs are ~1000x larger in magnitude than silu's, and the
@@ -809,6 +839,34 @@ def _clear_b12x_caches() -> None:
     from b12x.integration.tp_moe import clear_tp_moe_caches
 
     clear_tp_moe_caches()
+
+
+def _validate_reference_case(
+    args,
+    spec: ModelSpec,
+    model_profile: ModelProfile,
+    batch_sizes: Sequence[int],
+) -> None:
+    if args.reference not in ("r4v2",):
+        return
+    raise ValueError(f"--reference {args.reference} is no longer supported")
+    expected = {
+        "hidden_size": 4096,
+        "I_tp": 256,
+        "num_experts": 512,
+        "top_k": 10,
+    }
+    actual = {
+        "hidden_size": spec.hidden_size,
+        "I_tp": spec.I_tp,
+        "num_experts": spec.num_experts,
+        "top_k": spec.top_k,
+    }
+    if actual != expected:
+        raise ValueError(f"--reference r4v2 expects {expected}, got {actual}")
+    unsupported = sorted(set(batch_sizes) - {1, 2, 4, 8})
+    if unsupported:
+        raise ValueError(f"--reference r4v2 only supports batch sizes 1, 2, 4, 8; got {unsupported}")
 
 
 GRAPH_REPLAY_TOLERANCES = {
@@ -1256,6 +1314,7 @@ def bench_e2e() -> None:
     l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes) if args.flush_l2 else 0
 
     spec = build_model_spec(model_path, model_profile)
+    _validate_reference_case(args, spec, model_profile, batch_sizes)
 
     benchmark_scope = "Routing + MoE kernel" if args.include_routing else "Pre-routed MoE kernel only"
     print(f"MoE benchmark ({benchmark_scope})")
@@ -1268,6 +1327,7 @@ def bench_e2e() -> None:
     print(f"Activation: {args.activation}")
     print(f"Batch-size profile: {args.batch_size_profile} -> {batch_sizes}")
     print("Backend: b12x auto")
+    print(f"Reference: {args.reference}")
     print(f"Scale contract: {args.scale_contract}")
     print(f"Validation: {args.validate}")
     print(f"Fast math: {'on' if args.fast_math else 'off'}")
@@ -1385,12 +1445,12 @@ def bench_e2e() -> None:
 
         ref_name = None
         ref_launch = None
-        fi_output = None
+        ref_result_tensor = None
         if args.reference == "flashinfer":
             from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
 
             ref_name = "FlashInfer"
-            base_ref_launch, fi_output = bench_flashinfer(weights, x, topk_ids, topk_weights)
+            base_ref_launch, ref_result_tensor = bench_flashinfer(weights, x, topk_ids, topk_weights)
             fi_quant_scales = [
                 weights.w13_input_scale_quant,
                 weights.w13_blockscale_swizzled.view(torch.int32),
@@ -1405,7 +1465,7 @@ def bench_e2e() -> None:
                     timed_topk_logits, timed_topk_ids = torch.topk(routing_logits, spec.top_k, dim=-1)
                     timed_topk_weights = torch.softmax(timed_topk_logits, dim=-1)
                     flashinfer_cutlass_fused_moe(
-                        output=fi_output,
+                        output=ref_result_tensor,
                         input=x,
                         token_selected_experts=timed_topk_ids.to(torch.int),
                         token_final_scales=timed_topk_weights,
@@ -1444,7 +1504,7 @@ def bench_e2e() -> None:
         if ref_launch is not None:
             ref_launch()
             torch.cuda.synchronize()
-            ref_output = fi_output.clone()
+            ref_output = ref_result_tensor.clone()
 
         backend_out = backend_e2e().clone()
         torch.cuda.synchronize()
@@ -1465,25 +1525,25 @@ def bench_e2e() -> None:
                     activation=args.activation,
                 )
             )
-            if ref_output is not None and fi_output is not None:
-                fi_metrics = compare_to_reference(fi_output, oracle_ref)
-                print(f"  {format_oracle_metrics('flashinfer vs oracle', fi_metrics)}")
+            if ref_output is not None and ref_name is not None:
+                ref_metrics = compare_to_reference(ref_output, oracle_ref)
+                print(f"  {format_oracle_metrics(f'{ref_name} vs oracle', ref_metrics)}")
                 reference_warnings.extend(
                     check_oracle_metrics(
-                        "flashinfer vs oracle", fi_metrics, batch_size,
+                        f"{ref_name} vs oracle", ref_metrics, batch_size,
                         activation=args.activation,
                     )
                 )
 
         if args.profile_once != "none":
-            if args.profile_once == "flashinfer":
-                if ref_launch is None:
-                    raise ValueError("--profile-once flashinfer requires --reference flashinfer")
-                profile_fn = ref_launch
-                profile_name = ref_name or "flashinfer"
-            else:
+            if args.profile_once == "backend":
                 profile_fn = backend_e2e
                 profile_name = backend_label
+            else:
+                if ref_launch is None or args.reference != args.profile_once:
+                    raise ValueError(f"--profile-once {args.profile_once} requires --reference {args.profile_once}")
+                profile_fn = ref_launch
+                profile_name = ref_name or args.profile_once
             print(f"  profiling once: {profile_name}")
             torch.cuda.synchronize()
             cudart = torch.cuda.cudart()

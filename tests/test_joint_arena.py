@@ -284,5 +284,5 @@ def test_shared_moe_workspace_resets_overlaid_barrier_state() -> None:
     moe_ws.barrier_count.fill_(123)
     moe_ws.barrier_epoch.fill_(456)
     tp_moe._prepare_workspace_for_launch(moe_ws)
-    assert int(moe_ws.barrier_count.item()) == 0
-    assert int(moe_ws.barrier_epoch.item()) == 0
+    assert int(moe_ws.barrier_count[0].item()) == 0
+    assert int(moe_ws.barrier_epoch[0].item()) == 0

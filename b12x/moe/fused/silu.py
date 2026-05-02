@@ -34,6 +34,18 @@ class MoEMicroKernelSilu(MoEMicroKernelBackend):
             single_token=single_token,
         )
 
+    @classmethod
+    def is_supported(
+        cls,
+        m: int,
+        k: int,
+        n: int,
+        num_topk: int,
+        weight_E: int,
+        input_scales_are_reciprocal: bool,
+    ) -> bool:
+        return super().is_supported(m, k, n, num_topk, weight_E, input_scales_are_reciprocal)
+
 
 class MoEStaticKernelSilu(MoEStaticKernelBackend):
     def __init__(
@@ -45,6 +57,9 @@ class MoEStaticKernelSilu(MoEStaticKernelBackend):
         exact_mma_m_tiles: bool = False,
         input_scales_are_reciprocal: bool = False,
         fast_math: bool = False,
+        single_token: bool = False,
+        share_input_across_experts: bool = False,
+        share_expert_scales: bool = False,
     ):
         super().__init__(
             sf_vec_size,
@@ -54,6 +69,9 @@ class MoEStaticKernelSilu(MoEStaticKernelBackend):
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             activation="silu",
+            single_token=single_token,
+            share_input_across_experts=share_input_across_experts,
+            share_expert_scales=share_expert_scales,
         )
 
 
