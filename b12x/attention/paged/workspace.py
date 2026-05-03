@@ -1063,9 +1063,7 @@ class PagedAttentionWorkspace:
             device=self.device,
         )
         self._decode_graph_max_chunks_per_req = int(max_chunks_per_req)
-        self._use_regular_decode_graph_replay = (
-            self.kv_dtype in (torch.bfloat16, torch.float8_e4m3fn) and batch >= 4
-        )
+        self._use_regular_decode_graph_replay = False
         capacity_cache_seqlen = worst_page_count * self.page_size
         if window_left >= 0:
             capacity_cache_seqlen = max_cache_page_count * self.page_size - 1
@@ -1726,32 +1724,6 @@ class PagedAttentionWorkspace:
         assert self.block_valid_mask is not None
 
         self._use_regular_decode_graph_replay = False
-        if (
-            self.kv_dtype in (torch.bfloat16, torch.float8_e4m3fn)
-            and int(plan.page_table_shape[0]) >= 4
-            and self.use_cuda_graph
-            and self._decode_graph_chunk_pages_lut is not None
-            and self._plan_has_regular_decode_graph_grid(plan)
-        ):
-            batch = int(plan.page_table_shape[0])
-            work_items_capacity = int(self.request_indices.shape[0])
-            if work_items_capacity % batch != 0:
-                raise RuntimeError(
-                    "decode graph workspace request_indices shape is incompatible with the batch bucket"
-                )
-            capture_max_chunks_per_req = work_items_capacity // batch
-            current_max_chunks_per_req = len(plan.request_indices) // batch
-            if self._decode_graph_max_chunks_per_req is None:
-                self._decode_graph_max_chunks_per_req = int(capture_max_chunks_per_req)
-            elif current_max_chunks_per_req > self._decode_graph_max_chunks_per_req:
-                raise RuntimeError(
-                    "decode graph replay plan exceeds the captured fixed-grid capacity"
-                )
-            if current_max_chunks_per_req < capture_max_chunks_per_req:
-                self._use_regular_decode_graph_replay = True
-                self._copy_regular_decode_graph_plan_metadata(plan)
-                return
-            self._use_regular_decode_graph_replay = True
 
         with record_function("paged_workspace.plan_metadata_to_device"):
             request_indices = _copy_int_metadata(

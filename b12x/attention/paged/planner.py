@@ -742,7 +742,8 @@ def create_paged_plan(
             )
         else:
             max_batch_size_if_split = max(total_num_qo_tiles, 1) * max(max(effective_kv_len_arr), 1)
-    regularized_decode_graph = bool(enable_cuda_graph and mode == "decode" and total_num_qo_tiles == batch and batch == 16)
+    # Keep decode graph replay on the metadata-driven single-qtile path for now.
+    regularized_decode_graph = False
     padded_batch_size = max(max_batch_size_if_split, total_num_qo_tiles) if enable_cuda_graph else 0
     if regularized_decode_graph:
         padded_batch_size = _align_up(padded_batch_size, max(batch, 1))
