@@ -48,12 +48,14 @@ from b12x.cute.fp4 import (
     st_shared_u8,
     shared_ptr_to_u32,
     threadfence,
+    warp_reduce,
 )
 from b12x.cute.fp4 import scatter_add_bf16x2
 
 
 _SF_VEC_SIZE = 16
 _COMPACT_STATIC_TILE_M = 128
+_FC2_TILE_AMAX_GS_RCP = 1.0 / (6.0 * 448.0)
 
 
 class _MoEStaticKernelBase:
@@ -67,6 +69,7 @@ class _MoEStaticKernelBase:
         input_scales_are_reciprocal: bool = False,
         fast_math: bool = False,
         activation: str = "silu",
+        dynamic_down_scale: bool = False,
     ):
         if activation not in {"silu", "relu2"}:
             raise ValueError(f"unsupported activation {activation!r}")
@@ -78,6 +81,7 @@ class _MoEStaticKernelBase:
         self.fast_math = fast_math
         self.activation = activation
         self.is_gated = activation == "silu"
+        self.dynamic_down_scale = dynamic_down_scale
         tile_k = sf_vec_size * 8
         self.tile_shape_mnk = (mma_tiler_mn[0], mma_tiler_mn[1], tile_k)
         self.sa_tile_shape_mk = (max(128, mma_tiler_mn[0]), tile_k)
@@ -362,6 +366,7 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
         single_token: bool = False,
         share_input_across_experts: bool = False,
         share_expert_scales: bool = False,
+        dynamic_down_scale: bool = False,
     ):
         super().__init__(
             sf_vec_size,
@@ -371,6 +376,7 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             activation=activation,
+            dynamic_down_scale=dynamic_down_scale,
         )
         self.single_token = single_token
         self.share_input_across_experts = share_input_across_experts
@@ -608,6 +614,7 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
                 cute.struct.MemRange[cutlass.BFloat16, cute.cosize(epi_smem_staged)],
                 self.buffer_align_bytes,
             ]
+            reduce_scratch: cute.struct.MemRange[cutlass.Float32, 5]
 
         @cute.struct
         class StorageRelu2:
@@ -636,6 +643,7 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
                 cute.struct.MemRange[cutlass.BFloat16, cute.cosize(epi_smem_staged)],
                 self.buffer_align_bytes,
             ]
+            reduce_scratch: cute.struct.MemRange[cutlass.Float32, 5]
 
         storage = smem.allocate(StorageGated if self.is_gated else StorageRelu2)
 
@@ -693,6 +701,7 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
             epi_smem_staged.outer, swizzle=epi_smem_staged.inner,
         )
         sfa_base_addr = shared_ptr_to_u32(storage.sSFA.data_ptr())
+        reduce_scratch_addr = shared_ptr_to_u32(storage.reduce_scratch.data_ptr())
         ctrl_base_addr = shared_ptr_to_u32(storage.ctrl.data_ptr())
         scatter_tok_base_addr = shared_ptr_to_u32(storage.scatter_tok_cache.data_ptr())
         scatter_weight_base_addr = shared_ptr_to_u32(storage.scatter_weight_cache.data_ptr())
@@ -1325,6 +1334,8 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
                         gs_value = rcp_approx_ftz(gs_value)
                     else:
                         gs_value = cutlass.Float32(1.0) / gs_value
+                if cutlass.const_expr(self.dynamic_down_scale):
+                    fc2_down_alpha_value = down_alpha_value
 
                 for epi_m in cutlass.range_constexpr(epi_rest_m):
                     epi_m_valid = valid_rows - tile_m_base - Int32(epi_m) * Int32(self.epi_tile[0])
@@ -1368,6 +1379,39 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
                         epi_rows = Int32(self.epi_tile[0])
                     if epi_rows < Int32(0):
                         epi_rows = Int32(0)
+                    quant_gs_value = gs_value
+                    if cutlass.const_expr(self.dynamic_down_scale):
+                        if epi_rows > Int32(0):
+                            local_max = cutlass.Float32(0.0)
+                            scan_idx = Int32(tidx)
+                            scan_total = epi_rows * sf_blocks_per_row * Int32(16)
+                            while scan_idx < scan_total:
+                                sr = scan_idx // (sf_blocks_per_row * Int32(16))
+                                sc = scan_idx % (sf_blocks_per_row * Int32(16))
+                                local_max = fmax_f32(local_max, fabs_f32(
+                                    cutlass.Float32(sC[sr, sc, epi_buffer])
+                                ))
+                                scan_idx += Int32(self.num_mma_warps * self.num_threads_per_warp)
+                            warp_amax = warp_reduce(local_max, fmax_f32)
+                            lane_id = Int32(tidx) & Int32(31)
+                            if lane_id == Int32(0):
+                                st_shared_f32(reduce_scratch_addr + warp_idx * Int32(4), warp_amax)
+                            self.epilog_sync_barrier.arrive_and_wait()
+                            if warp_idx == 0:
+                                tile_amax = cutlass.Float32(0.0)
+                                if lane_id < Int32(self.num_mma_warps):
+                                    tile_amax = ld_shared_f32(reduce_scratch_addr + lane_id * Int32(4))
+                                tile_amax = warp_reduce(tile_amax, fmax_f32)
+                                if lane_id == Int32(0):
+                                    st_shared_f32(reduce_scratch_addr, tile_amax)
+                            self.epilog_sync_barrier.arrive_and_wait()
+                            tile_amax = ld_shared_f32(reduce_scratch_addr)
+                            tile_gs_value = tile_amax * cutlass.Float32(_FC2_TILE_AMAX_GS_RCP)
+                            tile_gs_value = fmax_f32(tile_gs_value, cutlass.Float32(1.0e-12))
+                            if gs_value != cutlass.Float32(0.0):
+                                fc2_down_alpha_value = down_alpha_value * (tile_gs_value / gs_value)
+                            quant_gs_value = tile_gs_value
+                            self.epilog_sync_barrier.arrive_and_wait()
                     quant_idx = Int32(tidx)
                     while quant_idx < epi_rows * sf_blocks_per_row:
                         local_row = quant_idx // sf_blocks_per_row
@@ -1388,11 +1432,11 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
                         scale_byte = Uint8(0)
                         if cutlass.const_expr(self.is_gated):
                             if self.fast_math:
-                                packed64, scale_byte = quantize_block_fp4_fast(values, block_max, gs_value)
+                                packed64, scale_byte = quantize_block_fp4_fast(values, block_max, quant_gs_value)
                             else:
-                                packed64, scale_byte = quantize_block_fp4(values, block_max, gs_value)
+                                packed64, scale_byte = quantize_block_fp4(values, block_max, quant_gs_value)
                         else:
-                            packed64, scale_byte = quantize_block_fp4(values, block_max, gs_value)
+                            packed64, scale_byte = quantize_block_fp4(values, block_max, quant_gs_value)
                         packed_base = sf_block << Int32(3)
                         dst_pcol = row & Int32(63)
                         xor_bits = ((dst_pcol >> Int32(1)) & Int32(0x3)) << Int32(4)
@@ -1517,7 +1561,10 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
                                 tRS_rD_slice = tRS_rD[(None, mma_m_in_epi, mma_n_in_epi)]
                                 down_epi_acc_slice = down_acc[(None, mma_m, mma_n)]
                                 for elem_idx in cutlass.range_constexpr(cute.size(tRS_rD_slice)):
-                                    tRS_rD_slice[elem_idx] = down_alpha_value * down_epi_acc_slice[elem_idx]
+                                    if cutlass.const_expr(self.dynamic_down_scale):
+                                        tRS_rD_slice[elem_idx] = fc2_down_alpha_value * down_epi_acc_slice[elem_idx]
+                                    else:
+                                        tRS_rD_slice[elem_idx] = down_alpha_value * down_epi_acc_slice[elem_idx]
 
                         acc_vec = tRS_rD.load()
                         acc_vec = acc_vec.to(cutlass.BFloat16)

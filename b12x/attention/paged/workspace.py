@@ -138,7 +138,6 @@ class PagedAttentionWorkspaceContract:
     head_dim_qk: int
     head_dim_vo: int
     num_cache_pages: int
-    qkv_weight_dtype: torch.dtype | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "max_total_q", max(int(self.max_total_q), 1))
@@ -155,12 +154,6 @@ class PagedAttentionWorkspaceContract:
         object.__setattr__(self, "head_dim_qk", max(int(self.head_dim_qk), 1))
         object.__setattr__(self, "head_dim_vo", max(int(self.head_dim_vo), 1))
         object.__setattr__(self, "num_cache_pages", max(int(self.num_cache_pages), 1))
-        if self.qkv_weight_dtype is not None and self.qkv_weight_dtype not in (
-            torch.bfloat16,
-            torch.float16,
-            torch.float8_e4m3fn,
-        ):
-            raise TypeError(f"unsupported qkv_weight_dtype {self.qkv_weight_dtype}")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -410,7 +403,6 @@ class PagedAttentionArena:
             num_kv_heads=contract.num_kv_heads,
             head_dim_qk=contract.head_dim_qk,
             head_dim_vo=contract.head_dim_vo,
-            qkv_weight_dtype=contract.qkv_weight_dtype,
             page_size=self.caps.page_size,
             use_cuda_graph=use_cuda_graph,
             fixed_capacity=True,
@@ -449,7 +441,6 @@ class PagedAttentionWorkspace:
     num_kv_heads: int
     head_dim_qk: int
     head_dim_vo: int
-    qkv_weight_dtype: torch.dtype | None = None
     page_size: int = 64
     use_cuda_graph: bool = False
     fixed_capacity: bool = False
@@ -524,7 +515,6 @@ class PagedAttentionWorkspace:
         max_total_q: int,
         num_cache_pages: int,
         use_cuda_graph: bool = False,
-        qkv_weight_dtype: torch.dtype | None = None,
     ) -> PagedAttentionWorkspace:
         device = _canonical_device(device)
         if max_total_q <= 0:
@@ -560,7 +550,6 @@ class PagedAttentionWorkspace:
             num_kv_heads=num_kv_heads,
             head_dim_qk=head_dim_qk,
             head_dim_vo=head_dim_vo,
-            qkv_weight_dtype=qkv_weight_dtype,
             page_size=page_size,
             use_cuda_graph=use_cuda_graph,
             _plan_q=plan_q,
@@ -589,7 +578,6 @@ class PagedAttentionWorkspace:
         max_partial_rows: int,
         num_cache_pages: int,
         use_cuda_graph: bool = False,
-        qkv_weight_dtype: torch.dtype | None = None,
     ) -> PagedAttentionWorkspace:
         device = _canonical_device(device)
         caps = PagedAttentionArenaCaps(
@@ -620,7 +608,6 @@ class PagedAttentionWorkspace:
             head_dim_qk=head_dim_qk,
             head_dim_vo=head_dim_vo,
             num_cache_pages=num_cache_pages,
-            qkv_weight_dtype=qkv_weight_dtype,
         )
         return arena.make_workspace(contract, use_cuda_graph=use_cuda_graph)
 
@@ -642,7 +629,6 @@ class PagedAttentionWorkspace:
         max_page_table_width: int,
         num_cache_pages: int,
         use_cuda_graph: bool = False,
-        qkv_weight_dtype: torch.dtype | None = None,
     ) -> PagedAttentionWorkspace:
         return cls.for_fixed_capacity(
             mode=mode,
@@ -665,7 +651,6 @@ class PagedAttentionWorkspace:
             max_partial_rows=0,
             num_cache_pages=num_cache_pages,
             use_cuda_graph=use_cuda_graph,
-            qkv_weight_dtype=qkv_weight_dtype,
         )
 
     @classmethod
@@ -677,7 +662,6 @@ class PagedAttentionWorkspace:
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         use_cuda_graph: bool = False,
-        qkv_weight_dtype: torch.dtype | None = None,
     ) -> PagedAttentionWorkspace:
         if q.ndim != 3:
             raise ValueError(
@@ -698,7 +682,6 @@ class PagedAttentionWorkspace:
             max_total_q=int(q.shape[0]),
             num_cache_pages=int(k_cache.shape[0]),
             use_cuda_graph=use_cuda_graph,
-            qkv_weight_dtype=qkv_weight_dtype,
         )
 
     @property
@@ -1074,7 +1057,11 @@ class PagedAttentionWorkspace:
         if window_left >= 0:
             max_effective_kv_pages = min(
                 max_effective_kv_pages,
-                max(1, (int(window_left) + self.page_size + self.page_size - 1) // self.page_size),
+                max(
+                    1,
+                    (int(window_left) + self.page_size + self.page_size - 1)
+                    // self.page_size,
+                ),
             )
         try:
             decode_chunk_pages_lut = build_decode_chunk_pages_lut(
@@ -1720,8 +1707,12 @@ class PagedAttentionWorkspace:
         ]
         if not active_work_items:
             raise RuntimeError("prefill graph replay plan contains no active work")
-        max_q_tiles_per_req = max(q_tile_idx for _, q_tile_idx, _ in active_work_items) + 1
-        max_chunks_per_q_tile = max(kv_tile_idx for _, _, kv_tile_idx in active_work_items) + 1
+        max_q_tiles_per_req = (
+            max(q_tile_idx for _, q_tile_idx, _ in active_work_items) + 1
+        )
+        max_chunks_per_q_tile = (
+            max(kv_tile_idx for _, _, kv_tile_idx in active_work_items) + 1
+        )
         max_q_rows_per_req = max(
             1,
             (

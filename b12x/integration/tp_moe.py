@@ -341,6 +341,7 @@ _MICRO_COMPACT_CUTOVER_PAIRS_CACHE: int | None = None
 _STATIC_COMPACT_CUTOVER_PAIRS_CACHE: int | None = None
 _DYNAMIC_MULTICTA_CACHE: bool | None = None
 _DYNAMIC_CHUNK_MULTIPLIER_CACHE: int | None = None
+_DYNAMIC_DOWN_SCALE_CACHE: bool | None = None
 _LAST_WEIGHTS: Tuple = (None, None)  # (cache_key, views)
 _LAST_KERNEL: Tuple = (None, None)  # (cache_key, (compiled, mac))
 _EXACT_RELU2_BS1_NEMOTRON_CACHE: Dict[Tuple, _ExactRelu2Bs1NemotronLauncher] = {}
@@ -372,6 +373,7 @@ def clear_tp_moe_caches() -> None:
     global _STATIC_COMPACT_CUTOVER_PAIRS_CACHE
     global _DYNAMIC_MULTICTA_CACHE
     global _DYNAMIC_CHUNK_MULTIPLIER_CACHE
+    global _DYNAMIC_DOWN_SCALE_CACHE
     _WEIGHT_CACHE.clear()
     _MICRO_KERNEL_CACHE.clear()
     _STATIC_KERNEL_CACHE.clear()
@@ -383,6 +385,7 @@ def clear_tp_moe_caches() -> None:
     _STATIC_COMPACT_CUTOVER_PAIRS_CACHE = None
     _DYNAMIC_MULTICTA_CACHE = None
     _DYNAMIC_CHUNK_MULTIPLIER_CACHE = None
+    _DYNAMIC_DOWN_SCALE_CACHE = None
     _LAST_WEIGHTS = (None, None)
     _LAST_KERNEL = (None, None)
     _LAST_EXACT_RELU2_BS1_NEMOTRON = (None, None)
@@ -446,6 +449,13 @@ def _dynamic_multicta_enabled() -> bool:
             multicta_env = "1"
         _DYNAMIC_MULTICTA_CACHE = multicta_env == "1"
     return _DYNAMIC_MULTICTA_CACHE
+
+
+def _dynamic_down_scale_enabled() -> bool:
+    global _DYNAMIC_DOWN_SCALE_CACHE
+    if _DYNAMIC_DOWN_SCALE_CACHE is None:
+        _DYNAMIC_DOWN_SCALE_CACHE = _env_flag("B12X_ENABLE_DYNAMIC_DOWN_SCALE", default=False)
+    return _DYNAMIC_DOWN_SCALE_CACHE
 
 
 def _get_dynamic_chunk_multiplier() -> int:
@@ -1760,6 +1770,7 @@ def _get_static_kernel(
     mac = mac_override if mac_override is not None else _get_impl_mac("static")
     routed_rows = m * num_topk
     mma_tiler_mn = (128, 128)
+    dynamic_down_scale = _dynamic_down_scale_enabled()
     if num_topk > 1:
         mma_tiler_mn = _select_micro_mma_tiler_mn(routed_rows, n, resident_clusters=mac)
 
@@ -1768,6 +1779,7 @@ def _get_static_kernel(
         "static", state_E, weight_E, m, k, n, num_topk, max_rows, mac, mma_tiler_mn, topk_ids_dtype,
         input_scales_are_reciprocal, fast_math, activation,
         single_token, share_input_across_experts, share_expert_scales,
+        dynamic_down_scale,
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
@@ -1791,6 +1803,7 @@ def _get_static_kernel(
         output_tile_count_n=max(1, (n + mma_tiler_mn[1] - 1) // mma_tiler_mn[1]),
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
+        dynamic_down_scale=dynamic_down_scale,
     )
     kernel = activation_spec.make_static_kernel(
         **kernel_kwargs,
@@ -1913,12 +1926,13 @@ def _get_micro_kernel(
 ):
     activation_spec = _get_activation_kernel_spec(activation)
     mac = mac_override if mac_override is not None else _get_impl_mac("micro")
+    dynamic_down_scale = _dynamic_down_scale_enabled()
 
     global _LAST_KERNEL
     cache_key = (
         "micro_direct", m, k, n, num_topk, weight_E, topk_ids_dtype,
         input_scales_are_reciprocal, fast_math, share_input_across_experts,
-        share_expert_scales, single_token, activation,
+        share_expert_scales, single_token, activation, dynamic_down_scale,
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
@@ -1939,6 +1953,7 @@ def _get_micro_kernel(
         share_input_across_experts=share_input_across_experts,
         share_expert_scales=share_expert_scales,
         single_token=single_token,
+        dynamic_down_scale=dynamic_down_scale,
     )
     kernel.configure(m, k, n, num_topk, weight_E, max_active_ctas=mac, device=device)
 
@@ -2109,11 +2124,12 @@ def _get_dynamic_kernel(
     activation_spec = _get_activation_kernel_spec(activation)
     sf_vec_size = 16
     mac = mac_override if mac_override is not None else _get_impl_mac("dynamic")
+    dynamic_down_scale = _dynamic_down_scale_enabled()
 
     global _LAST_KERNEL
     cache_key = (
         "dynamic", E, k, n, num_topk, mac, topk_ids_dtype,
-        input_scales_are_reciprocal, fast_math, activation,
+        input_scales_are_reciprocal, fast_math, activation, dynamic_down_scale,
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
@@ -2138,6 +2154,7 @@ def _get_dynamic_kernel(
         mma_tiler_mn=(_LEVEL_TILE_M, _LEVEL_TILE_N),
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
+        dynamic_down_scale=dynamic_down_scale,
     )
     kernel = activation_spec.make_dynamic_kernel(**kernel_kwargs)
     launch = _DynamicMoELaunch(kernel, k=k, num_topk=num_topk)

@@ -118,10 +118,6 @@ def _resolve_kv_dtype(name: str, q_dtype: torch.dtype) -> torch.dtype:
     return _dtype_from_name(name)
 
 
-def _resolve_qkv_weight_dtype(name: str) -> torch.dtype:
-    return _dtype_from_name(name)
-
-
 def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
     a_f = a.to(torch.float32).reshape(-1)
     b_f = b.to(torch.float32).reshape(-1)
@@ -766,7 +762,6 @@ def _capture_backend_graph(
     k_descale: torch.Tensor | None,
     v_descale: torch.Tensor | None,
     warmup: int,
-    qkv_weight_dtype: torch.dtype | None,
     graph_ctas_per_sm: int | None,
 ) -> BackendCapture:
     output = torch.empty_like(q)
@@ -777,7 +772,6 @@ def _capture_backend_graph(
         k_cache=k_cache,
         v_cache=v_cache,
         use_cuda_graph=False,
-        qkv_weight_dtype=qkv_weight_dtype,
     )
     replay_plan = _build_backend_graph_plan(
         workspace=workspace,
@@ -976,7 +970,6 @@ def _capture_b12x_decode_graph_bucket(
     capture_fixed_split_pages: int | None,
     replay_fixed_split_pages: int | None,
     warmup: int,
-    qkv_weight_dtype: torch.dtype | None,
     graph_ctas_per_sm: int | None,
 ) -> B12xDecodeGraphBucket:
     workspace = PagedAttentionWorkspace.for_tensors(
@@ -985,7 +978,6 @@ def _capture_b12x_decode_graph_bucket(
         k_cache=shared.k_cache,
         v_cache=shared.v_cache,
         use_cuda_graph=False,
-        qkv_weight_dtype=qkv_weight_dtype,
     )
     capture_plan = _build_backend_graph_plan(
         workspace=workspace,
@@ -1132,7 +1124,6 @@ def _decode_reference_output(
 def _run_legacy_matrix(args: argparse.Namespace) -> None:
     dtype = _dtype_from_name(args.dtype)
     kv_dtype = _resolve_kv_dtype(args.kv_dtype, dtype)
-    qkv_weight_dtype = _resolve_qkv_weight_dtype(args.qkv_weight_dtype)
     flashinfer_workspace_bytes = args.flashinfer_workspace_mb * 1024 * 1024
     l2_flush = make_l2_flush_fn(args.flush_l2, args.l2_flush_bytes)
     q_seqlens = _parse_csv_ints(args.q_seqlens)
@@ -1156,7 +1147,6 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
             "head_dim": args.head_dim,
             "q_dtype": str(dtype),
             "kv_dtype": str(kv_dtype),
-            "qkv_weight_dtype": str(qkv_weight_dtype),
             "fixed_split_pages": args.fixed_split_pages,
             "capture_cache_seqlen": args.capture_cache_seqlen,
             "graph_ctas_per_sm": args.graph_ctas_per_sm,
@@ -1213,7 +1203,6 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
             k_descale=k_descale,
             v_descale=v_descale,
             warmup=args.warmup,
-            qkv_weight_dtype=qkv_weight_dtype,
             graph_ctas_per_sm=args.graph_ctas_per_sm if args.graph_ctas_per_sm > 0 else None,
         )
         backend_times_ms = _bench_graph(
@@ -1320,7 +1309,6 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
         raise ValueError("decode-graph-buckets mode only supports --q-seqlens 1")
     dtype = _dtype_from_name(args.dtype)
     kv_dtype = _resolve_kv_dtype(args.kv_dtype, dtype)
-    qkv_weight_dtype = _resolve_qkv_weight_dtype(args.qkv_weight_dtype)
     flashinfer_workspace_bytes = args.flashinfer_workspace_mb * 1024 * 1024
     l2_flush = make_l2_flush_fn(args.flush_l2, args.l2_flush_bytes)
     batch_buckets = _parse_csv_ints(args.batch_buckets)
@@ -1343,7 +1331,6 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
             "head_dim": args.head_dim,
             "q_dtype": str(dtype),
             "kv_dtype": str(kv_dtype),
-            "qkv_weight_dtype": str(qkv_weight_dtype),
             "fixed_split_pages": args.fixed_split_pages,
             "graph_ctas_per_sm": args.graph_ctas_per_sm,
             "replays": args.replays,
@@ -1382,7 +1369,6 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                 capture_fixed_split_pages=bucket_policy.capture_fixed_split_pages,
                 replay_fixed_split_pages=bucket_policy.replay_fixed_split_pages,
                 warmup=args.warmup,
-                qkv_weight_dtype=qkv_weight_dtype,
                 graph_ctas_per_sm=bucket_policy.graph_ctas_per_sm,
             )
         except Exception as exc:
@@ -1399,7 +1385,6 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                 capture_fixed_split_pages=bucket_policy.capture_fixed_split_pages,
                 replay_fixed_split_pages=bucket_policy.replay_fixed_split_pages,
                 warmup=args.warmup,
-                qkv_weight_dtype=qkv_weight_dtype,
                 graph_ctas_per_sm=bucket_policy.graph_ctas_per_sm,
             )
         print(
@@ -1570,7 +1555,6 @@ def main() -> None:
     parser.add_argument("--head-dim", type=int, default=256)
     parser.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
     parser.add_argument("--kv-dtype", choices=["same", "bf16", "fp16", "fp8_e4m3fn"], default="same")
-    parser.add_argument("--qkv-weight-dtype", choices=["bf16", "fp16", "fp8_e4m3fn"], default="bf16")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--replays", type=int, default=1000)
     parser.add_argument("--flashinfer-workspace-mb", type=int, default=512)

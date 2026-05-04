@@ -36,11 +36,13 @@ from b12x.cute.fp4 import (
     st_global_i32,
     st_global_release_i32,
     threadfence,
+    warp_reduce,
 )
 
 
 _BLOCK_SIZE = 16
 _FP8_E4M3_MAX = 448.0
+_FC2_TILE_AMAX_GS_RCP = 1.0 / (6.0 * _FP8_E4M3_MAX)
 _NUM_WARPS = 16
 _BLOCK_DIM = _NUM_WARPS * 32
 _K_PER_CTA = 16
@@ -271,6 +273,7 @@ class MoEMicroKernelBackend:
         share_input_across_experts: bool = False,
         share_expert_scales: bool = False,
         single_token: bool = False,
+        dynamic_down_scale: bool = False,
     ):
         if activation not in {"silu", "relu2"}:
             raise ValueError(f"unsupported activation {activation!r}")
@@ -282,6 +285,7 @@ class MoEMicroKernelBackend:
         self.share_input_across_experts = share_input_across_experts
         self.share_expert_scales = share_expert_scales
         self.single_token = single_token
+        self.dynamic_down_scale = dynamic_down_scale
         self._cfg = None
         self.m_const = 0
         self.m1_fc2_onepass = False
@@ -790,6 +794,8 @@ class MoEMicroKernelBackend:
             smem_xh = cute.make_tensor(smem_xh_ptr, cute.make_layout(cfg.smem_xh_size))
         smem_int_ptr = cute.arch.alloc_smem(Float32, cfg.i_chunk)
         smem_int = cute.make_tensor(smem_int_ptr, cute.make_layout(cfg.i_chunk))
+        reduce_scratch_ptr = cute.arch.alloc_smem(Float32, _NUM_WARPS)
+        reduce_scratch = cute.make_tensor(reduce_scratch_ptr, cute.make_layout(_NUM_WARPS))
 
         warp_id = tidx // Int32(32)
         lane = tidx % Int32(32)
@@ -1073,6 +1079,37 @@ class MoEMicroKernelBackend:
 
             cute.arch.sync_threads()
 
+            gs_fc2_eff = gs_fc2
+            if cutlass.const_expr(self.dynamic_down_scale):
+                local_max = Float32(0.0)
+                scan_idx = Int32(tidx)
+                while scan_idx < Int32(cfg.i_chunk):
+                    v = smem_int[scan_idx]
+                    abs_v = v
+                    if v < Float32(0.0):
+                        abs_v = -v
+                    local_max = fmax_f32(local_max, abs_v)
+                    scan_idx += Int32(_BLOCK_DIM)
+                warp_max = warp_reduce(local_max, fmax_f32)
+                if lane == Int32(0):
+                    reduce_scratch[warp_id] = warp_max
+                cute.arch.sync_threads()
+                tile_amax = Float32(0.0)
+                if warp_id == Int32(0):
+                    if lane < Int32(_NUM_WARPS):
+                        tile_amax = reduce_scratch[lane]
+                    tile_amax = warp_reduce(tile_amax, fmax_f32)
+                    if lane == Int32(0):
+                        reduce_scratch[Int32(0)] = tile_amax
+                cute.arch.sync_threads()
+                gs_fc2_eff = fmax_f32(
+                    reduce_scratch[Int32(0)] * Float32(_FC2_TILE_AMAX_GS_RCP),
+                    Float32(1.0e-12),
+                )
+            fc2_rescale = Float32(1.0)
+            if cutlass.const_expr(self.dynamic_down_scale):
+                if gs_fc2 != Float32(0.0):
+                    fc2_rescale = gs_fc2_eff / gs_fc2
             if tidx < Int32(cfg.inter_blocks):
                 mid_blk = tidx
                 blk_peak = Float32(0.0)
@@ -1083,11 +1120,11 @@ class MoEMicroKernelBackend:
                         abs_v = -v
                     if abs_v > blk_peak:
                         blk_peak = abs_v
-                q_scale = blk_peak / (Float32(6.0) * gs_fc2)
+                q_scale = blk_peak / (Float32(6.0) * gs_fc2_eff)
                 if q_scale > Float32(_FP8_E4M3_MAX):
                     q_scale = Float32(_FP8_E4M3_MAX)
                 sf_val = cvt_e4m3_to_f32_via_f16(cvt_f32_to_e4m3(q_scale))
-                eff_scale = sf_val * gs_fc2
+                eff_scale = sf_val * gs_fc2_eff
                 if eff_scale < Float32(1e-30):
                     eff_scale = Float32(1e-30)
                 inv_eff = Float32(1.0) / eff_scale
@@ -1095,6 +1132,8 @@ class MoEMicroKernelBackend:
                     v0 = smem_int[mid_blk * Int32(_BLOCK_SIZE) + Int32(i * 2)]
                     v1 = smem_int[mid_blk * Int32(_BLOCK_SIZE) + Int32(i * 2 + 1)]
                     f0, f1 = quant_dequant_2(v0, v1, sf_val, inv_eff)
+                    f0 = f0 * fc2_rescale
+                    f1 = f1 * fc2_rescale
                     half_base = chunk_idx * Int32(cfg.i_chunk // 2) + mid_blk * Int32(_BLOCK_SIZE // 2)
                     n_blk = half_base // Int32(128)
                     h_local = half_base - n_blk * Int32(128)

@@ -134,7 +134,6 @@ def _make_workspace(
     v_cache: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     use_cuda_graph: bool = False,
-    qkv_weight_dtype: torch.dtype | None = None,
 ) -> PagedAttentionWorkspace:
     return PagedAttentionWorkspace.for_tensors(
         mode=infer_paged_attention_mode(cu_seqlens_q),
@@ -142,7 +141,6 @@ def _make_workspace(
         k_cache=k_cache,
         v_cache=v_cache,
         use_cuda_graph=use_cuda_graph,
-        qkv_weight_dtype=qkv_weight_dtype,
     )
 
 
@@ -235,46 +233,28 @@ def test_paged_workspace_exposes_primary_backend_metadata() -> None:
     assert plan.page_table_shape == tuple(page_table.shape)
 
 
-def test_paged_workspace_preserves_qkv_weight_dtype() -> None:
-    require_sm120()
-    clear_attention_caches()
-
-    q, k_cache, v_cache, _page_table, _cache_seqlens_t, cu_seqlens_q = _make_paged_inputs(
-        q_seqlens=[1, 1, 1, 1],
-        cache_seqlens=[64, 64, 64, 64],
-        page_size=64,
-        seed=31,
-    )
-    workspace = _make_workspace(
-        q=q,
-        k_cache=k_cache,
-        v_cache=v_cache,
-        cu_seqlens_q=cu_seqlens_q,
-        use_cuda_graph=True,
-        qkv_weight_dtype=torch.float8_e4m3fn,
-    )
-
-    assert workspace.qkv_weight_dtype == torch.float8_e4m3fn
-    assert workspace.use_cuda_graph is True
-
-
 @pytest.mark.parametrize(
-    ("qkv_weight_dtype", "batch", "cache_len", "expect_native_fp8_qk"),
+    ("turbo_value", "batch", "cache_len", "expect_native_fp8_qk"),
     [
-        (torch.float8_e4m3fn, 2, 16384, True),
-        (torch.float8_e4m3fn, 4, 16384, False),
-        (torch.bfloat16, 2, 16384, False),
         (None, 2, 16384, False),
+        ("true", 2, 16384, False),
+        ("1", 2, 16384, True),
+        ("1", 4, 16384, False),
     ],
 )
-def test_decode_native_fp8_attention_dispatch_tracks_weight_dtype_batch_and_chunk_regime_eager(
-    qkv_weight_dtype: torch.dtype | None,
+def test_decode_native_fp8_attention_dispatch_tracks_turbo_gate_batch_and_chunk_regime_eager(
+    monkeypatch: pytest.MonkeyPatch,
+    turbo_value: str | None,
     batch: int,
     cache_len: int,
     expect_native_fp8_qk: bool,
 ) -> None:
     require_sm120()
     clear_attention_caches()
+    if turbo_value is None:
+        monkeypatch.delenv("B12X_TURBO_ATTN", raising=False)
+    else:
+        monkeypatch.setenv("B12X_TURBO_ATTN", turbo_value)
 
     q, k_cache, v_cache, page_table, cache_seqlens_t, cu_seqlens_q = _make_paged_inputs(
         q_seqlens=[1] * batch,
@@ -295,12 +275,10 @@ def test_decode_native_fp8_attention_dispatch_tracks_weight_dtype_batch_and_chun
         v_cache=v_fp8,
         cu_seqlens_q=cu_seqlens_q,
         use_cuda_graph=False,
-        qkv_weight_dtype=qkv_weight_dtype,
     )
     workspace.prepare(page_table, cache_seqlens_t, cu_seqlens_q)
 
     use_native_fp8_qk, use_native_fp8_pv, decode_runtime_chunk_guard = _resolve_native_fp8_attention_mma_flags(
-        qkv_weight_dtype=workspace.qkv_weight_dtype,
         plan=workspace.plan,
     )
 

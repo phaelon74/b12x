@@ -31,14 +31,12 @@ def _make_workspace(
     v_cache: torch.Tensor,
     *,
     mode: str,
-    qkv_weight_dtype: torch.dtype | None = None,
 ) -> PagedAttentionWorkspace:
     return PagedAttentionWorkspace.for_tensors(
         mode=mode,
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
-        qkv_weight_dtype=qkv_weight_dtype,
     )
 
 
@@ -46,7 +44,6 @@ def _run_decode_graph_check(
     *,
     batch: int = 8,
     cache_seqlen: int,
-    qkv_weight_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, str]:
     (
         q,
@@ -88,7 +85,6 @@ def _run_decode_graph_check(
         k_descale=k_descale,
         v_descale=v_descale,
         warmup=1,
-        qkv_weight_dtype=qkv_weight_dtype,
         graph_ctas_per_sm=None,
     )
     _fa2_graph, fa2_out = _capture_flashinfer_fa2_graph(
@@ -118,7 +114,6 @@ def _run_decode_reference_check(
     *,
     batch: int = 8,
     cache_seqlen: int,
-    qkv_weight_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, str]:
     (
         q,
@@ -160,7 +155,6 @@ def _run_decode_reference_check(
         k_descale=k_descale,
         v_descale=v_descale,
         warmup=1,
-        qkv_weight_dtype=qkv_weight_dtype,
         graph_ctas_per_sm=None,
     )
     backend.graph.replay()
@@ -374,12 +368,12 @@ def test_paged_forward_attention_sink_affects_denominator_only() -> None:
 
 
 @torch.inference_mode()
-def test_paged_forward_native_fp8_qkv_matches_reference_fp8_decode_short_context_batch8() -> None:
+def test_paged_forward_native_fp8_qkv_matches_reference_fp8_decode_short_context_batch8(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     require_sm120()
-    output, ref_out, plan_desc = _run_decode_reference_check(
-        cache_seqlen=64,
-        qkv_weight_dtype=torch.float8_e4m3fn,
-    )
+    monkeypatch.setenv("B12X_TURBO_ATTN", "1")
+    output, ref_out, plan_desc = _run_decode_reference_check(cache_seqlen=64)
     assert plan_desc.endswith(",split")
     assert (output - ref_out).abs().max().item() <= 0.02
     assert _cosine_similarity(output, ref_out) >= 0.995
@@ -519,12 +513,12 @@ def test_paged_forward_matches_reference_with_split_fp8_decode() -> None:
 
 
 @torch.inference_mode()
-def test_paged_forward_native_fp8_qkv_matches_reference_with_split_fp8_decode() -> None:
+def test_paged_forward_native_fp8_qkv_matches_reference_with_split_fp8_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     require_sm120()
-    output, ref_out, plan_desc = _run_decode_reference_check(
-        cache_seqlen=8192,
-        qkv_weight_dtype=torch.float8_e4m3fn,
-    )
+    monkeypatch.setenv("B12X_TURBO_ATTN", "1")
+    output, ref_out, plan_desc = _run_decode_reference_check(cache_seqlen=8192)
     assert plan_desc.endswith(",split")
     assert (output - ref_out).abs().max().item() <= 0.01
     assert _cosine_similarity(output, ref_out) >= 0.995

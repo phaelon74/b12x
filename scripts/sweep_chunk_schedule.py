@@ -37,7 +37,6 @@ from benchmarks.benchmark_paged_attention import (
     _mean_ci,
     _quantize_paged_kv_cache_global_e4m3,
     _resolve_kv_dtype,
-    _resolve_qkv_weight_dtype,
     clear_attention_caches,
     require_sm120,
 )
@@ -292,7 +291,6 @@ def _capture_shared_graph(
         k_cache=k_cache,
         v_cache=v_cache,
         use_cuda_graph=True,
-        qkv_weight_dtype=_resolve_qkv_weight_dtype(args.qkv_weight_dtype),
     )
     workspace.prepare(
         page_table,
@@ -751,7 +749,6 @@ def main() -> None:
     parser.add_argument("--candidate-splits", type=str, default="1,512")
     parser.add_argument("--mode", choices=["decode", "extend"], default="decode")
     parser.add_argument("--q-seqlen", type=int, default=6)
-    parser.add_argument("--qkv-weight-dtype", choices=["bf16", "fp16", "fp8_e4m3fn"], default="bf16")
     parser.add_argument("--kv-dtype", choices=["bf16", "fp16", "fp8_e4m3fn"], default="bf16")
     parser.add_argument("--parallel-workers", type=int, default=0)
     parser.add_argument("--output", type=str, default="")

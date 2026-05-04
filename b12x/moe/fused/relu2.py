@@ -21,6 +21,7 @@ class MoEMicroKernelRelu2(MoEMicroKernelBackend):
         share_input_across_experts: bool = False,
         share_expert_scales: bool = False,
         single_token: bool = False,
+        dynamic_down_scale: bool = False,
     ):
         super().__init__(
             sf_vec_size,
@@ -32,6 +33,7 @@ class MoEMicroKernelRelu2(MoEMicroKernelBackend):
             share_input_across_experts=share_input_across_experts,
             share_expert_scales=share_expert_scales,
             single_token=single_token,
+            dynamic_down_scale=dynamic_down_scale,
         )
 
     @classmethod
@@ -60,6 +62,7 @@ class MoEStaticKernelRelu2(MoEStaticKernelBackend):
         single_token: bool = False,
         share_input_across_experts: bool = False,
         share_expert_scales: bool = False,
+        dynamic_down_scale: bool = False,
     ):
         super().__init__(
             sf_vec_size,
@@ -72,6 +75,7 @@ class MoEStaticKernelRelu2(MoEStaticKernelBackend):
             single_token=single_token,
             share_input_across_experts=share_input_across_experts,
             share_expert_scales=share_expert_scales,
+            dynamic_down_scale=dynamic_down_scale,
         )
 
 
@@ -83,6 +87,7 @@ class MoEDynamicKernelRelu2(MoEDynamicKernelBackend):
         *,
         input_scales_are_reciprocal: bool = False,
         fast_math: bool = False,
+        dynamic_down_scale: bool = False,
     ):
         super().__init__(
             sf_vec_size,
@@ -90,6 +95,7 @@ class MoEDynamicKernelRelu2(MoEDynamicKernelBackend):
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             activation="relu2",
+            dynamic_down_scale=dynamic_down_scale,
         )
 
 
