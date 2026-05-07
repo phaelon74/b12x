@@ -29,7 +29,6 @@ class MoEMicroKernelBackend(_DirectMoEMicroKernelBackend):
         n: int,
         num_topk: int,
         weight_E: int,
-        input_scales_are_reciprocal: bool,
     ) -> bool:
         if m not in (1, 2, 4, 8, 10, 12, 16, 24, 32):
             return False
@@ -48,8 +47,7 @@ class MoEMicroKernelBackend(_DirectMoEMicroKernelBackend):
             return False
         k_segments = k // (32 * 16)
         return (
-            not input_scales_are_reciprocal
-            and _direct_k_segments_supported(k_segments)
+            _direct_k_segments_supported(k_segments)
             and 0 < num_topk <= 32
             and weight_E > 0
         )
@@ -60,7 +58,6 @@ class MoEMicroKernelBackend(_DirectMoEMicroKernelBackend):
         mma_tiler_mn: Tuple[int, int],
         output_tile_count_n: int,
         *,
-        input_scales_are_reciprocal: bool = False,
         fast_math: bool = False,
         activation: str = "silu",
         share_input_across_experts: bool = False,
@@ -72,7 +69,6 @@ class MoEMicroKernelBackend(_DirectMoEMicroKernelBackend):
             sf_vec_size,
             mma_tiler_mn,
             output_tile_count_n,
-            input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             activation=activation,
             share_input_across_experts=share_input_across_experts,

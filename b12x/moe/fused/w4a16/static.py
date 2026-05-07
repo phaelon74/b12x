@@ -71,7 +71,6 @@ class _MoEStaticKernelBase:
         output_tile_count_n: int,
         *,
         exact_mma_m_tiles: bool = False,
-        input_scales_are_reciprocal: bool = False,
         fast_math: bool = False,
         activation: str = "silu",
         dynamic_down_scale: bool = False,
@@ -82,7 +81,6 @@ class _MoEStaticKernelBase:
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
         self.exact_mma_m_tiles = exact_mma_m_tiles
-        self.input_scales_are_reciprocal = input_scales_are_reciprocal
         self.fast_math = fast_math
         self.activation = activation
         self.is_gated = activation == "silu"
@@ -321,7 +319,6 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
         output_tile_count_n: int,
         *,
         exact_mma_m_tiles: bool = False,
-        input_scales_are_reciprocal: bool = False,
         fast_math: bool = False,
         activation: str = "silu",
         single_token: bool = False,
@@ -334,7 +331,6 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
             mma_tiler_mn,
             output_tile_count_n,
             exact_mma_m_tiles=exact_mma_m_tiles,
-            input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             activation=activation,
             dynamic_down_scale=dynamic_down_scale,

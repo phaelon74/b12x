@@ -153,7 +153,6 @@ def test_w4a16_direct_micro_supports_static_decode_batches() -> None:
             n=256,
             num_topk=8,
             weight_E=256,
-            input_scales_are_reciprocal=False,
         )
 
     for batch_size in (1, 2, 4, 8):
@@ -163,7 +162,6 @@ def test_w4a16_direct_micro_supports_static_decode_batches() -> None:
             n=768,
             num_topk=8,
             weight_E=256,
-            input_scales_are_reciprocal=False,
         )
 
     for batch_size in (10, 12, 16, 24, 32):
@@ -173,7 +171,6 @@ def test_w4a16_direct_micro_supports_static_decode_batches() -> None:
             n=256,
             num_topk=10,
             weight_E=512,
-            input_scales_are_reciprocal=False,
         )
 
     for batch_size in (1, 2, 4, 8):
@@ -183,7 +180,6 @@ def test_w4a16_direct_micro_supports_static_decode_batches() -> None:
             n=256,
             num_topk=8,
             weight_E=256,
-            input_scales_are_reciprocal=False,
         )
 
     assert not MoEMicroKernelBackend.is_supported(
@@ -192,5 +188,4 @@ def test_w4a16_direct_micro_supports_static_decode_batches() -> None:
         n=256,
         num_topk=10,
         weight_E=512,
-        input_scales_are_reciprocal=False,
     )

@@ -161,7 +161,6 @@ def test_mimo_v25_moe_shape_matches_oracle_with_sglang_reciprocal_scales() -> No
         topk_weights,
         topk_ids,
         workspace=workspace,
-        input_scales_are_reciprocal=True,
         input_scales_static=True,
     )
     reference = moe_reference_nvfp4(
@@ -172,8 +171,8 @@ def test_mimo_v25_moe_shape_matches_oracle_with_sglang_reciprocal_scales() -> No
         w2_fp4,
         w2_blockscale,
         w2_alphas,
-        w13_input_scale,
-        w2_input_scale,
+        1.0 / w13_input_scale,
+        1.0 / w2_input_scale,
         topk_ids,
         topk_weights,
         num_experts,
@@ -230,20 +229,20 @@ def _run_single_expert_case(
     try:
         workspace = allocate_tp_moe_workspace(
             x,
-            weights.w13_input_scale_per_expert,
+            weights.w13_input_scale_quant_per_expert,
             weights.w13_weight,
-            weights.w2_input_scale_per_expert,
+            weights.w2_input_scale_quant_per_expert,
             weights.w2_weight,
             topk_ids,
             input_scales_static=True,
         )
         actual = b12x_moe_fp4(
             x,
-            weights.w13_input_scale_per_expert,
+            weights.w13_input_scale_quant_per_expert,
             weights.w13_weight,
             weights.w13_blockscale_swizzled,
             weights.g1_alphas_per_expert,
-            weights.w2_input_scale_per_expert,
+            weights.w2_input_scale_quant_per_expert,
             weights.w2_weight,
             weights.w2_blockscale_swizzled,
             weights.g2_alphas_per_expert,
@@ -266,8 +265,8 @@ def _run_single_expert_case(
         weights.w2_weight,
         weights.w2_blockscale_swizzled,
         weights.g2_alphas_per_expert,
-        weights.w13_input_scale_per_expert,
-        weights.w2_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         topk_ids,
         topk_weights,
         spec.num_experts,
@@ -296,9 +295,9 @@ def test_workspace_pool_handles_chunked_calls(monkeypatch: pytest.MonkeyPatch) -
 
     exact_workspace = allocate_tp_moe_workspace(
         x,
-        weights.w13_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
         weights.w13_weight,
-        weights.w2_input_scale_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         weights.w2_weight,
         topk_ids,
         input_scales_static=True,
@@ -306,11 +305,11 @@ def test_workspace_pool_handles_chunked_calls(monkeypatch: pytest.MonkeyPatch) -
     assert isinstance(exact_workspace, tp_moe.TPDynamicWorkspace)
     expected = b12x_moe_fp4(
         x,
-        weights.w13_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
         weights.w13_weight,
         weights.w13_blockscale_swizzled,
         weights.g1_alphas_per_expert,
-        weights.w2_input_scale_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         weights.w2_weight,
         weights.w2_blockscale_swizzled,
         weights.g2_alphas_per_expert,
@@ -326,11 +325,11 @@ def test_workspace_pool_handles_chunked_calls(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(tp_moe, "_dynamic_token_chunk_limit", lambda *_args: 13)
     actual = b12x_moe_fp4(
         x,
-        weights.w13_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
         weights.w13_weight,
         weights.w13_blockscale_swizzled,
         weights.g1_alphas_per_expert,
-        weights.w2_input_scale_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         weights.w2_weight,
         weights.w2_blockscale_swizzled,
         weights.g2_alphas_per_expert,
@@ -344,11 +343,11 @@ def test_workspace_pool_handles_chunked_calls(monkeypatch: pytest.MonkeyPatch) -
     with pytest.raises(ValueError, match="chunked requests require a TPMoEWorkspacePool"):
         b12x_moe_fp4(
             x,
-            weights.w13_input_scale_per_expert,
+            weights.w13_input_scale_quant_per_expert,
             weights.w13_weight,
             weights.w13_blockscale_swizzled,
             weights.g1_alphas_per_expert,
-            weights.w2_input_scale_per_expert,
+            weights.w2_input_scale_quant_per_expert,
             weights.w2_weight,
             weights.w2_blockscale_swizzled,
             weights.g2_alphas_per_expert,
@@ -376,9 +375,9 @@ def test_cuda_graph_capture_requires_output_buffer() -> None:
     x, topk_ids, topk_weights = make_routed_inputs(spec, 1, seed=654, device=device)
     workspace = allocate_tp_moe_workspace(
         x,
-        weights.w13_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
         weights.w13_weight,
-        weights.w2_input_scale_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         weights.w2_weight,
         topk_ids,
         input_scales_static=True,
@@ -389,11 +388,11 @@ def test_cuda_graph_capture_requires_output_buffer() -> None:
         with torch.cuda.graph(graph):
             b12x_moe_fp4(
                 x,
-                weights.w13_input_scale_per_expert,
+                weights.w13_input_scale_quant_per_expert,
                 weights.w13_weight,
                 weights.w13_blockscale_swizzled,
                 weights.g1_alphas_per_expert,
-                weights.w2_input_scale_per_expert,
+                weights.w2_input_scale_quant_per_expert,
                 weights.w2_weight,
                 weights.w2_blockscale_swizzled,
                 weights.g2_alphas_per_expert,
@@ -418,9 +417,9 @@ def test_static_workspace_accepts_smaller_logical_requests() -> None:
 
     large_workspace = allocate_tp_moe_workspace(
         x_large,
-        weights.w13_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
         weights.w13_weight,
-        weights.w2_input_scale_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         weights.w2_weight,
         topk_ids_large,
         input_scales_static=True,
@@ -430,11 +429,11 @@ def test_static_workspace_accepts_smaller_logical_requests() -> None:
 
     expected = b12x_moe_fp4(
         x_small,
-        weights.w13_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
         weights.w13_weight,
         weights.w13_blockscale_swizzled,
         weights.g1_alphas_per_expert,
-        weights.w2_input_scale_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         weights.w2_weight,
         weights.w2_blockscale_swizzled,
         weights.g2_alphas_per_expert,
@@ -442,9 +441,9 @@ def test_static_workspace_accepts_smaller_logical_requests() -> None:
         topk_ids_small,
         workspace=allocate_tp_moe_workspace(
             x_small,
-            weights.w13_input_scale_per_expert,
+            weights.w13_input_scale_quant_per_expert,
             weights.w13_weight,
-            weights.w2_input_scale_per_expert,
+            weights.w2_input_scale_quant_per_expert,
             weights.w2_weight,
             topk_ids_small,
             input_scales_static=True,
@@ -453,11 +452,11 @@ def test_static_workspace_accepts_smaller_logical_requests() -> None:
     ).clone()
     actual = b12x_moe_fp4(
         x_small,
-        weights.w13_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
         weights.w13_weight,
         weights.w13_blockscale_swizzled,
         weights.g1_alphas_per_expert,
-        weights.w2_input_scale_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         weights.w2_weight,
         weights.w2_blockscale_swizzled,
         weights.g2_alphas_per_expert,
@@ -488,11 +487,11 @@ def test_static_workspace_pool_reuses_largest_capacity() -> None:
 
     expected_large = b12x_moe_fp4(
         x_large,
-        weights.w13_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
         weights.w13_weight,
         weights.w13_blockscale_swizzled,
         weights.g1_alphas_per_expert,
-        weights.w2_input_scale_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         weights.w2_weight,
         weights.w2_blockscale_swizzled,
         weights.g2_alphas_per_expert,
@@ -500,9 +499,9 @@ def test_static_workspace_pool_reuses_largest_capacity() -> None:
         topk_ids_large,
         workspace=allocate_tp_moe_workspace(
             x_large,
-            weights.w13_input_scale_per_expert,
+            weights.w13_input_scale_quant_per_expert,
             weights.w13_weight,
-            weights.w2_input_scale_per_expert,
+            weights.w2_input_scale_quant_per_expert,
             weights.w2_weight,
             topk_ids_large,
             input_scales_static=True,
@@ -511,11 +510,11 @@ def test_static_workspace_pool_reuses_largest_capacity() -> None:
     ).clone()
     expected_small = b12x_moe_fp4(
         x_small,
-        weights.w13_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
         weights.w13_weight,
         weights.w13_blockscale_swizzled,
         weights.g1_alphas_per_expert,
-        weights.w2_input_scale_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         weights.w2_weight,
         weights.w2_blockscale_swizzled,
         weights.g2_alphas_per_expert,
@@ -523,9 +522,9 @@ def test_static_workspace_pool_reuses_largest_capacity() -> None:
         topk_ids_small,
         workspace=allocate_tp_moe_workspace(
             x_small,
-            weights.w13_input_scale_per_expert,
+            weights.w13_input_scale_quant_per_expert,
             weights.w13_weight,
-            weights.w2_input_scale_per_expert,
+            weights.w2_input_scale_quant_per_expert,
             weights.w2_weight,
             topk_ids_small,
             input_scales_static=True,
@@ -535,11 +534,11 @@ def test_static_workspace_pool_reuses_largest_capacity() -> None:
 
     actual_large = b12x_moe_fp4(
         x_large,
-        weights.w13_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
         weights.w13_weight,
         weights.w13_blockscale_swizzled,
         weights.g1_alphas_per_expert,
-        weights.w2_input_scale_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         weights.w2_weight,
         weights.w2_blockscale_swizzled,
         weights.g2_alphas_per_expert,
@@ -550,11 +549,11 @@ def test_static_workspace_pool_reuses_largest_capacity() -> None:
     ).clone()
     actual_small = b12x_moe_fp4(
         x_small,
-        weights.w13_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
         weights.w13_weight,
         weights.w13_blockscale_swizzled,
         weights.g1_alphas_per_expert,
-        weights.w2_input_scale_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         weights.w2_weight,
         weights.w2_blockscale_swizzled,
         weights.g2_alphas_per_expert,
@@ -633,9 +632,9 @@ def test_dynamic_workspace_uses_compact_storage() -> None:
 
     workspace = allocate_tp_moe_workspace(
         x,
-        weights.w13_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
         weights.w13_weight,
-        weights.w2_input_scale_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         weights.w2_weight,
         topk_ids,
         input_scales_static=True,
@@ -729,20 +728,20 @@ def test_micro_uniform10_edge_sizes_match_oracle() -> None:
         try:
             workspace = allocate_tp_moe_workspace(
                 x,
-                weights.w13_input_scale_per_expert,
+                weights.w13_input_scale_quant_per_expert,
                 weights.w13_weight,
-                weights.w2_input_scale_per_expert,
+                weights.w2_input_scale_quant_per_expert,
                 weights.w2_weight,
                 topk_ids,
                 input_scales_static=True,
             )
             actual = b12x_moe_fp4(
                 x,
-                weights.w13_input_scale_per_expert,
+                weights.w13_input_scale_quant_per_expert,
                 weights.w13_weight,
                 weights.w13_blockscale_swizzled,
                 weights.g1_alphas_per_expert,
-                weights.w2_input_scale_per_expert,
+                weights.w2_input_scale_quant_per_expert,
                 weights.w2_weight,
                 weights.w2_blockscale_swizzled,
                 weights.g2_alphas_per_expert,
@@ -764,8 +763,8 @@ def test_micro_uniform10_edge_sizes_match_oracle() -> None:
             weights.w2_weight,
             weights.w2_blockscale_swizzled,
             weights.g2_alphas_per_expert,
-            weights.w13_input_scale_per_expert,
-            weights.w2_input_scale_per_expert,
+            weights.w13_input_scale_quant_per_expert,
+            weights.w2_input_scale_quant_per_expert,
             topk_ids,
             topk_weights,
             spec.num_experts,
@@ -796,9 +795,9 @@ def test_dynamic_uniform10_edge_sizes_match_oracle(m: int) -> None:
 
     workspace = allocate_tp_moe_workspace(
         x,
-        weights.w13_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
         weights.w13_weight,
-        weights.w2_input_scale_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         weights.w2_weight,
         topk_ids,
         input_scales_static=True,
@@ -807,11 +806,11 @@ def test_dynamic_uniform10_edge_sizes_match_oracle(m: int) -> None:
 
     actual = b12x_moe_fp4(
         x,
-        weights.w13_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
         weights.w13_weight,
         weights.w13_blockscale_swizzled,
         weights.g1_alphas_per_expert,
-        weights.w2_input_scale_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         weights.w2_weight,
         weights.w2_blockscale_swizzled,
         weights.g2_alphas_per_expert,
@@ -830,8 +829,8 @@ def test_dynamic_uniform10_edge_sizes_match_oracle(m: int) -> None:
         weights.w2_weight,
         weights.w2_blockscale_swizzled,
         weights.g2_alphas_per_expert,
-        weights.w13_input_scale_per_expert,
-        weights.w2_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         topk_ids,
         topk_weights,
         spec.num_experts,
@@ -891,20 +890,20 @@ def test_dynamic_workspace_pool_uses_eager_routing_geometry() -> None:
 
     exact_workspace = allocate_tp_moe_workspace(
         x,
-        weights.w13_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
         weights.w13_weight,
-        weights.w2_input_scale_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         weights.w2_weight,
         topk_ids,
         input_scales_static=True,
     )
     expected = b12x_moe_fp4(
         x,
-        weights.w13_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
         weights.w13_weight,
         weights.w13_blockscale_swizzled,
         weights.g1_alphas_per_expert,
-        weights.w2_input_scale_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         weights.w2_weight,
         weights.w2_blockscale_swizzled,
         weights.g2_alphas_per_expert,
@@ -917,11 +916,11 @@ def test_dynamic_workspace_pool_uses_eager_routing_geometry() -> None:
     pool = allocate_tp_moe_workspace_pool()
     actual = b12x_moe_fp4(
         x,
-        weights.w13_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
         weights.w13_weight,
         weights.w13_blockscale_swizzled,
         weights.g1_alphas_per_expert,
-        weights.w2_input_scale_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         weights.w2_weight,
         weights.w2_blockscale_swizzled,
         weights.g2_alphas_per_expert,

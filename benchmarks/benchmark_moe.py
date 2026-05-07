@@ -360,6 +360,8 @@ class ExpertWeights:
     w2_input_scale_quant: torch.Tensor
     w13_input_scale_per_expert: torch.Tensor
     w2_input_scale_per_expert: torch.Tensor
+    w13_input_scale_quant_per_expert: torch.Tensor
+    w2_input_scale_quant_per_expert: torch.Tensor
     g1_alphas: torch.Tensor
     g2_alphas: torch.Tensor
     g1_alphas_per_expert: torch.Tensor
@@ -585,6 +587,8 @@ def load_expert_weights(
     g2_alphas_per_expert = (down_is * down_gs).to(torch.float32)
     w13_input_scale_quant = (1.0 / w13_input_scale).to(torch.float32)
     w2_input_scale_quant = (1.0 / w2_input_scale).to(torch.float32)
+    w13_input_scale_quant_per_expert = (1.0 / w13_input_scale_per_expert).to(torch.float32).contiguous()
+    w2_input_scale_quant_per_expert = (1.0 / down_is).to(torch.float32).contiguous()
 
     return ExpertWeights(
         layer_idx=layer_idx,
@@ -603,6 +607,8 @@ def load_expert_weights(
         w2_input_scale_quant=w2_input_scale_quant,
         w13_input_scale_per_expert=w13_input_scale_per_expert,
         w2_input_scale_per_expert=down_is,
+        w13_input_scale_quant_per_expert=w13_input_scale_quant_per_expert,
+        w2_input_scale_quant_per_expert=w2_input_scale_quant_per_expert,
         g1_alphas=g1_alphas,
         g2_alphas=g2_alphas,
         g1_alphas_per_expert=g1_alphas_per_expert,
@@ -753,15 +759,15 @@ def make_multilayer_routing_case(
 def get_scale_contract_params(weights: ExpertWeights, scale_contract: str) -> ScaleContractParams:
     if scale_contract == "per-expert":
         return ScaleContractParams(
-            a1_gscale=weights.w13_input_scale_per_expert,
-            a2_gscale=weights.w2_input_scale_per_expert,
+            a1_gscale=weights.w13_input_scale_quant_per_expert,
+            a2_gscale=weights.w2_input_scale_quant_per_expert,
             g1_alphas=weights.g1_alphas_per_expert,
             g2_alphas=weights.g2_alphas_per_expert,
         )
     if scale_contract == "shared":
         return ScaleContractParams(
-            a1_gscale=weights.w13_input_scale,
-            a2_gscale=weights.w2_input_scale,
+            a1_gscale=weights.w13_input_scale_quant,
+            a2_gscale=weights.w2_input_scale_quant,
             g1_alphas=weights.g1_alphas,
             g2_alphas=weights.g2_alphas,
         )
@@ -784,8 +790,8 @@ def get_quant_mode_params(
         return ScaleContractParams(
             a1_gscale=params.a1_gscale,
             a2_gscale=params.a2_gscale,
-            g1_alphas=(params.g1_alphas / params.a1_gscale).to(torch.float32).contiguous(),
-            g2_alphas=(params.g2_alphas / params.a2_gscale).to(torch.float32).contiguous(),
+            g1_alphas=(params.g1_alphas * params.a1_gscale).to(torch.float32).contiguous(),
+            g2_alphas=(params.g2_alphas * params.a2_gscale).to(torch.float32).contiguous(),
         )
     raise ValueError(f"Unsupported quant mode: {quant_mode}")
 

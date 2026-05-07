@@ -68,11 +68,11 @@ def _run_once(
 ) -> torch.Tensor:
     return b12x_moe_fp4(
         a=x,
-        a1_gscale=weights.w13_input_scale,
+        a1_gscale=weights.w13_input_scale_quant,
         w1_fp4=weights.w13_weight,
         w1_blockscale=weights.w13_blockscale_swizzled,
         w1_alphas=weights.g1_alphas,
-        a2_gscale=weights.w2_input_scale,
+        a2_gscale=weights.w2_input_scale_quant,
         w2_fp4=weights.w2_weight,
         w2_blockscale=weights.w2_blockscale_swizzled,
         w2_alphas=weights.g2_alphas,
@@ -94,11 +94,11 @@ def _launch_with_alias_consumer(
     with torch.cuda.stream(stream):
         alias = b12x_moe_fp4(
             a=x,
-            a1_gscale=weights.w13_input_scale,
+            a1_gscale=weights.w13_input_scale_quant,
             w1_fp4=weights.w13_weight,
             w1_blockscale=weights.w13_blockscale_swizzled,
             w1_alphas=weights.g1_alphas,
-            a2_gscale=weights.w2_input_scale,
+            a2_gscale=weights.w2_input_scale_quant,
             w2_fp4=weights.w2_weight,
             w2_blockscale=weights.w2_blockscale_swizzled,
             w2_alphas=weights.g2_alphas,

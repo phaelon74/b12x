@@ -78,8 +78,8 @@ def _run_parameter_launch_case(case: str) -> subprocess.CompletedProcess[str]:
         weights = load_expert_weights(pathlib.Path({str(MODEL_PATH)!r}), spec)
         x, topk_ids, topk_weights = make_routed_inputs(spec, 8, seed=123, device=device)
 
-        a1_gscale = weights.w13_input_scale_per_expert.clone()
-        a2_gscale = weights.w2_input_scale_per_expert.clone()
+        a1_gscale = weights.w13_input_scale_quant_per_expert.clone()
+        a2_gscale = weights.w2_input_scale_quant_per_expert.clone()
         w1_alphas = weights.g1_alphas_per_expert.clone()
         w2_alphas = weights.g2_alphas_per_expert.clone()
 
@@ -115,7 +115,6 @@ def _run_parameter_launch_case(case: str) -> subprocess.CompletedProcess[str]:
             topk_ids,
             workspace=workspace,
             output=out,
-            input_scales_are_reciprocal=True,
             input_scales_static=True,
         )
         torch.cuda.synchronize()
@@ -134,7 +133,15 @@ def _run_parameter_launch_case(case: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _w4a16_direct_micro_launchable(m: int, n: int) -> bool:
+def _direct_micro_launchable(
+    quant_mode: str,
+    m: int,
+    n: int,
+    *,
+    weight_E: int = 256,
+    k: int = 4096,
+    num_topk: int = 10,
+) -> bool:
     from b12x.integration.tp_moe import (
         _DIRECT_MICRO_BLOCK_DIM,
         _compiled_direct_micro_accepts_block_dim,
@@ -145,16 +152,15 @@ def _w4a16_direct_micro_launchable(m: int, n: int) -> bool:
     clear_tp_moe_caches()
     torch.empty(1, device="cuda")
     compiled, _ = _get_micro_kernel(
-        256,
+        weight_E,
         m,
-        4096,
+        k,
         n,
-        10,
+        num_topk,
         topk_ids_dtype=torch.int32,
-        input_scales_are_reciprocal=False,
         fast_math=True,
         activation="silu",
-        quant_mode="w4a16",
+        quant_mode=quant_mode,
         device=torch.device("cuda"),
     )
     return _compiled_direct_micro_accepts_block_dim(compiled, _DIRECT_MICRO_BLOCK_DIM)
@@ -163,9 +169,15 @@ def _w4a16_direct_micro_launchable(m: int, n: int) -> bool:
 def test_w4a16_direct_micro_resource_gate_rejects_wide_m4() -> None:
     _skip_if_no_sm120()
 
-    assert _w4a16_direct_micro_launchable(4, 256)
-    assert _w4a16_direct_micro_launchable(2, 4096)
-    assert not _w4a16_direct_micro_launchable(4, 4096)
+    assert _direct_micro_launchable("w4a16", 4, 256)
+    assert _direct_micro_launchable("w4a16", 2, 4096)
+    assert not _direct_micro_launchable("w4a16", 4, 4096)
+
+
+def test_nvfp4_direct_micro_resource_gate_rejects_qwen_bs8_shape() -> None:
+    _skip_if_no_sm120()
+
+    assert not _direct_micro_launchable("nvfp4", 8, 256, weight_E=512)
 
 
 @pytest.mark.parametrize("case", ["alphas", "scales"])

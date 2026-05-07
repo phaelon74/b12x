@@ -126,7 +126,6 @@ def test_sparse_moe_fp4_accepts_precomputed_router_logits() -> None:
         *,
         workspace,
         output=None,
-        input_scales_are_reciprocal=False,
         input_scales_static=False,
         fast_math=None,
         activation="silu",
@@ -134,7 +133,7 @@ def test_sparse_moe_fp4_accepts_precomputed_router_logits() -> None:
     ):
         del a1_gscale, w1_fp4, w1_blockscale, w1_alphas
         del a2_gscale, w2_fp4, w2_blockscale, w2_alphas
-        del input_scales_are_reciprocal, input_scales_static, fast_math, activation, quant_mode
+        del input_scales_static, fast_math, activation, quant_mode
         captured["a"] = a
         captured["topk_weights"] = topk_weights
         captured["topk_ids"] = topk_ids
@@ -183,7 +182,6 @@ def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
         *args,
         workspace,
         output=None,
-        input_scales_are_reciprocal=False,
         input_scales_static=False,
         fast_math=None,
         activation="silu",
@@ -192,7 +190,6 @@ def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
         del args
         captured["workspace"] = workspace
         captured["output"] = output
-        captured["input_scales_are_reciprocal"] = input_scales_are_reciprocal
         captured["input_scales_static"] = input_scales_static
         captured["fast_math"] = fast_math
         captured["activation"] = activation
@@ -210,7 +207,6 @@ def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
             workspace=workspace,
             routing=routing,
             output=output,
-            input_scales_are_reciprocal=True,
             input_scales_static=True,
             fast_math=False,
             quant_mode="w4a16",
@@ -220,7 +216,6 @@ def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
     assert captured == {
         "workspace": workspace,
         "output": output,
-        "input_scales_are_reciprocal": True,
         "input_scales_static": True,
         "fast_math": False,
         "activation": "silu",
@@ -243,14 +238,13 @@ def test_sparse_moe_fp4_env_defaults_to_w4a16(monkeypatch) -> None:
         *args,
         workspace,
         output=None,
-        input_scales_are_reciprocal=False,
         input_scales_static=False,
         fast_math=None,
         activation="silu",
         quant_mode=None,
     ):
         del args, workspace, output
-        del input_scales_are_reciprocal, input_scales_static, fast_math, activation
+        del input_scales_static, fast_math, activation
         captured.append(quant_mode)
         return torch.ones_like(hidden_states)
 

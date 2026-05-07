@@ -32,7 +32,7 @@ from b12x.cute.fp4 import (
     ld_global_acquire_i32,
     ld_global_nc_u32,
     ld_global_nc_v4_u32,
-    nvfp4_raw_scale_from_amax,
+    nvfp4_scale_from_amax,
     pack_f32x2_to_f16x2,
     quant_dequant_2,
     spin_wait_global_eq_i32,
@@ -45,7 +45,7 @@ from b12x.cute.fp4 import (
 
 _BLOCK_SIZE = 16
 _FP8_E4M3_MAX = 448.0
-_FC2_TILE_AMAX_GS_RCP = 1.0 / (6.0 * _FP8_E4M3_MAX)
+_FC2_TILE_RECIP_GS_NUM = 6.0 * _FP8_E4M3_MAX
 _NUM_WARPS = 16
 _BLOCK_DIM = _NUM_WARPS * 32
 _K_PER_CTA = 16
@@ -345,7 +345,6 @@ class MoEMicroKernelBackend:
         mma_tiler_mn: Tuple[int, int],
         output_tile_count_n: int,
         *,
-        input_scales_are_reciprocal: bool = False,
         fast_math: bool = False,
         activation: str = "silu",
         share_input_across_experts: bool = False,
@@ -357,7 +356,6 @@ class MoEMicroKernelBackend:
         if activation not in {"silu", "relu2"}:
             raise ValueError(f"unsupported activation {activation!r}")
         self.sf_vec_size = sf_vec_size
-        self.input_scales_are_reciprocal = input_scales_are_reciprocal
         self.fast_math = fast_math
         self.activation = activation
         self.is_gated = activation == "silu"
@@ -441,7 +439,6 @@ class MoEMicroKernelBackend:
         n: int,
         num_topk: int,
         weight_E: int,
-        input_scales_are_reciprocal: bool,
     ) -> bool:
         if m not in (1, 2, 4, 8):
             return False
@@ -459,8 +456,7 @@ class MoEMicroKernelBackend:
             return False
         k_segments = k // (32 * _BLOCK_SIZE)
         return (
-            not input_scales_are_reciprocal
-            and _direct_k_segments_supported(k_segments)
+            _direct_k_segments_supported(k_segments)
             and 0 < num_topk <= 32
             and weight_E > 0
         )
@@ -973,11 +969,13 @@ class MoEMicroKernelBackend:
                                 abs_v = -v
                             if abs_v > blk_peak:
                                 blk_peak = abs_v
-                        q_scale = nvfp4_raw_scale_from_amax(blk_peak, gs_fc1_0)
+                        q_scale = nvfp4_scale_from_amax(blk_peak, gs_fc1_0)
                         if q_scale > Float32(_FP8_E4M3_MAX):
                             q_scale = Float32(_FP8_E4M3_MAX)
                         sf_val = cvt_e4m3_to_f32_via_f16(cvt_f32_to_e4m3(q_scale))
-                        eff_scale = sf_val * gs_fc1_0
+                        eff_scale = Float32(0.0)
+                        if gs_fc1_0 != Float32(0.0):
+                            eff_scale = sf_val / gs_fc1_0
                         if eff_scale < Float32(1e-30):
                             eff_scale = Float32(1e-30)
                         for i in cutlass.range_constexpr(_BLOCK_SIZE // 2):
@@ -1027,11 +1025,13 @@ class MoEMicroKernelBackend:
                                     abs_v = -v
                                 if abs_v > blk_peak:
                                     blk_peak = abs_v
-                            q_scale = nvfp4_raw_scale_from_amax(blk_peak, gs_fc1)
+                            q_scale = nvfp4_scale_from_amax(blk_peak, gs_fc1)
                             if q_scale > Float32(_FP8_E4M3_MAX):
                                 q_scale = Float32(_FP8_E4M3_MAX)
                             sf_val = cvt_e4m3_to_f32_via_f16(cvt_f32_to_e4m3(q_scale))
-                            eff_scale = sf_val * gs_fc1
+                            eff_scale = Float32(0.0)
+                            if gs_fc1 != Float32(0.0):
+                                eff_scale = sf_val / gs_fc1
                             if eff_scale < Float32(1e-30):
                                 eff_scale = Float32(1e-30)
                             for i in cutlass.range_constexpr(_BLOCK_SIZE // 2):
@@ -1452,11 +1452,13 @@ class MoEMicroKernelBackend:
                                     abs_v = -v
                                 if abs_v > blk_peak:
                                     blk_peak = abs_v
-                            q_scale = nvfp4_raw_scale_from_amax(blk_peak, gs_fc1_next)
+                            q_scale = nvfp4_scale_from_amax(blk_peak, gs_fc1_next)
                             if q_scale > Float32(_FP8_E4M3_MAX):
                                 q_scale = Float32(_FP8_E4M3_MAX)
                             sf_val = cvt_e4m3_to_f32_via_f16(cvt_f32_to_e4m3(q_scale))
-                            eff_scale = sf_val * gs_fc1_next
+                            eff_scale = Float32(0.0)
+                            if gs_fc1_next != Float32(0.0):
+                                eff_scale = sf_val / gs_fc1_next
                             if eff_scale < Float32(1e-30):
                                 eff_scale = Float32(1e-30)
                             for i in cutlass.range_constexpr(_BLOCK_SIZE // 2):
@@ -1491,14 +1493,14 @@ class MoEMicroKernelBackend:
                     if lane == Int32(0):
                         reduce_scratch[Int32(0)] = tile_amax
                 cute.arch.sync_threads()
-                gs_fc2_eff = fmax_f32(
-                    reduce_scratch[Int32(0)] * Float32(_FC2_TILE_AMAX_GS_RCP),
-                    Float32(1.0e-12),
-                )
+                gs_fc2_eff = Float32(0.0)
+                if reduce_scratch[Int32(0)] > Float32(0.0):
+                    gs_fc2_eff = Float32(_FC2_TILE_RECIP_GS_NUM) / reduce_scratch[Int32(0)]
+                gs_fc2_eff = fmax_f32(gs_fc2_eff, Float32(1.0e-12))
             fc2_rescale = Float32(1.0)
             if cutlass.const_expr(self.dynamic_down_scale):
-                if gs_fc2 != Float32(0.0):
-                    fc2_rescale = gs_fc2_eff / gs_fc2
+                if gs_fc2_eff != Float32(0.0):
+                    fc2_rescale = gs_fc2 / gs_fc2_eff
             if tidx < Int32(cfg.inter_blocks):
                 mid_blk = tidx
                 if cutlass.const_expr(self.w4a16_mode):
@@ -1526,11 +1528,13 @@ class MoEMicroKernelBackend:
                             abs_v = -v
                         if abs_v > blk_peak:
                             blk_peak = abs_v
-                    q_scale = nvfp4_raw_scale_from_amax(blk_peak, gs_fc2_eff)
+                    q_scale = nvfp4_scale_from_amax(blk_peak, gs_fc2_eff)
                     if q_scale > Float32(_FP8_E4M3_MAX):
                         q_scale = Float32(_FP8_E4M3_MAX)
                     sf_val = cvt_e4m3_to_f32_via_f16(cvt_f32_to_e4m3(q_scale))
-                    eff_scale = sf_val * gs_fc2_eff
+                    eff_scale = Float32(0.0)
+                    if gs_fc2_eff != Float32(0.0):
+                        eff_scale = sf_val / gs_fc2_eff
                     if eff_scale < Float32(1e-30):
                         eff_scale = Float32(1e-30)
                     for i in cutlass.range_constexpr(_BLOCK_SIZE // 2):

@@ -31,7 +31,6 @@ from b12x.cute.fp4 import (
     atomic_cas_global_i32,
     fabs_f32,
     fmax_f32,
-    rcp_approx_ftz,
     quantize_block_fp4,
     quantize_block_fp4_fast,
     get_ptr_as_int64,
@@ -55,7 +54,7 @@ from b12x.cute.fp4 import scatter_add_bf16x2
 
 _SF_VEC_SIZE = 16
 _COMPACT_STATIC_TILE_M = 128
-_FC2_TILE_AMAX_GS_RCP = 1.0 / (6.0 * 448.0)
+_FC2_TILE_RECIP_GS_NUM = 6.0 * 448.0
 
 
 class _MoEStaticKernelBase:
@@ -66,7 +65,6 @@ class _MoEStaticKernelBase:
         output_tile_count_n: int,
         *,
         exact_mma_m_tiles: bool = False,
-        input_scales_are_reciprocal: bool = False,
         fast_math: bool = False,
         activation: str = "silu",
         dynamic_down_scale: bool = False,
@@ -77,7 +75,6 @@ class _MoEStaticKernelBase:
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
         self.exact_mma_m_tiles = exact_mma_m_tiles
-        self.input_scales_are_reciprocal = input_scales_are_reciprocal
         self.fast_math = fast_math
         self.activation = activation
         self.is_gated = activation == "silu"
@@ -360,7 +357,6 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
         output_tile_count_n: int,
         *,
         exact_mma_m_tiles: bool = False,
-        input_scales_are_reciprocal: bool = False,
         fast_math: bool = False,
         activation: str = "silu",
         single_token: bool = False,
@@ -373,7 +369,6 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
             mma_tiler_mn,
             output_tile_count_n,
             exact_mma_m_tiles=exact_mma_m_tiles,
-            input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             activation=activation,
             dynamic_down_scale=dynamic_down_scale,
@@ -817,11 +812,6 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
             if should_quantize > Int32(0):
                 scale_idx = Int32(0) if cutlass.const_expr(self.share_expert_scales) else quant_expert_id
                 gs_value = input_global_scale[scale_idx].to(cutlass.Float32)
-                if self.input_scales_are_reciprocal and gs_value != cutlass.Float32(0.0):
-                    if self.fast_math:
-                        gs_value = rcp_approx_ftz(gs_value)
-                    else:
-                        gs_value = cutlass.Float32(1.0) / gs_value
                 sf_idx = Int32(tidx)
                 while sf_idx < sf_blocks_per_row:
                     block_start = sf_idx * Int32(16)
@@ -1329,11 +1319,6 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
                 sf_blocks_per_row = Int32(self.tile_shape_mnk[2] // 16)
                 scale_idx = Int32(0) if cutlass.const_expr(self.share_expert_scales) else weight_expert_idx
                 gs_value = global_scale[scale_idx].to(cutlass.Float32)
-                if self.input_scales_are_reciprocal and gs_value != cutlass.Float32(0.0):
-                    if self.fast_math:
-                        gs_value = rcp_approx_ftz(gs_value)
-                    else:
-                        gs_value = cutlass.Float32(1.0) / gs_value
                 if cutlass.const_expr(self.dynamic_down_scale):
                     fc2_down_alpha_value = down_alpha_value
 
@@ -1406,10 +1391,12 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
                                     st_shared_f32(reduce_scratch_addr, tile_amax)
                             self.epilog_sync_barrier.arrive_and_wait()
                             tile_amax = ld_shared_f32(reduce_scratch_addr)
-                            tile_gs_value = tile_amax * cutlass.Float32(_FC2_TILE_AMAX_GS_RCP)
+                            tile_gs_value = cutlass.Float32(0.0)
+                            if tile_amax > cutlass.Float32(0.0):
+                                tile_gs_value = cutlass.Float32(_FC2_TILE_RECIP_GS_NUM) / tile_amax
                             tile_gs_value = fmax_f32(tile_gs_value, cutlass.Float32(1.0e-12))
-                            if gs_value != cutlass.Float32(0.0):
-                                fc2_down_alpha_value = down_alpha_value * (tile_gs_value / gs_value)
+                            if tile_gs_value != cutlass.Float32(0.0):
+                                fc2_down_alpha_value = down_alpha_value * (gs_value / tile_gs_value)
                             quant_gs_value = tile_gs_value
                             self.epilog_sync_barrier.arrive_and_wait()
                     quant_idx = Int32(tidx)

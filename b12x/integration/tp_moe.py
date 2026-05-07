@@ -172,11 +172,11 @@ class TPMoEWorkspacePool:
 class B12XFP4ExpertWeights:
     """Packaged FP4 expert tensors for routed-expert MoE entrypoints."""
 
-    a1_gscale: torch.Tensor
+    a1_gscale: torch.Tensor  # reciprocal activation global scale for FC1 input
     w1_fp4: torch.Tensor
     w1_blockscale: torch.Tensor
     w1_alphas: torch.Tensor
-    a2_gscale: torch.Tensor
+    a2_gscale: torch.Tensor  # reciprocal activation global scale for FC2 input
     w2_fp4: torch.Tensor
     w2_blockscale: torch.Tensor
     w2_alphas: torch.Tensor
@@ -608,14 +608,11 @@ def _w4a16_default_alpha(
     alpha: torch.Tensor,
     input_scale: torch.Tensor,
     weight_E: int,
-    *,
-    input_scales_are_reciprocal: bool,
 ) -> torch.Tensor:
     key = (
         _tensor_cache_key(alpha),
         _tensor_cache_key(input_scale),
         weight_E,
-        input_scales_are_reciprocal,
     )
     cached = _W4A16_ALPHA_CACHE.get(key)
     if cached is not None:
@@ -624,10 +621,7 @@ def _w4a16_default_alpha(
     alpha_plain = _get_plain_cuda_tensor(alpha, dtype=torch.float32)
     scale_plain = _prepare_expert_scale(input_scale, weight_E)
     adjusted = torch.empty_like(alpha_plain)
-    if input_scales_are_reciprocal:
-        torch.mul(alpha_plain, scale_plain, out=adjusted)
-    else:
-        torch.div(alpha_plain, scale_plain, out=adjusted)
+    torch.mul(alpha_plain, scale_plain, out=adjusted)
     _W4A16_ALPHA_CACHE[key] = adjusted
     return adjusted
 
@@ -1974,7 +1968,6 @@ def _get_static_kernel(
     max_rows: int,
     *,
     topk_ids_dtype: torch.dtype,
-    input_scales_are_reciprocal: bool,
     fast_math: bool,
     mac_override: int | None = None,
     activation: str = "silu",
@@ -1985,8 +1978,6 @@ def _get_static_kernel(
 ):
     quant_mode = _normalize_quant_mode(quant_mode)
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
-    if quant_mode == "w4a16":
-        input_scales_are_reciprocal = False
     sf_vec_size = 16
     mac = mac_override if mac_override is not None else _get_impl_mac("static")
     routed_rows = m * num_topk
@@ -2004,7 +1995,7 @@ def _get_static_kernel(
     global _LAST_KERNEL
     cache_key = (
         quant_mode, "static", state_E, weight_E, m, k, n, num_topk, max_rows, mac, mma_tiler_mn, topk_ids_dtype,
-        input_scales_are_reciprocal, fast_math, activation,
+        fast_math, activation,
         single_token, share_input_across_experts, share_expert_scales,
         dynamic_down_scale,
     )
@@ -2029,7 +2020,6 @@ def _get_static_kernel(
         sf_vec_size=sf_vec_size,
         mma_tiler_mn=mma_tiler_mn,
         output_tile_count_n=max(1, (n + mma_tiler_mn[1] - 1) // mma_tiler_mn[1]),
-        input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
         dynamic_down_scale=dynamic_down_scale,
     )
@@ -2148,7 +2138,6 @@ def _get_w4a16_micro_compact_kernel(
     max_rows: int,
     *,
     topk_ids_dtype: torch.dtype,
-    input_scales_are_reciprocal: bool,
     fast_math: bool,
     mac_override: int | None = None,
     activation: str = "silu",
@@ -2158,7 +2147,6 @@ def _get_w4a16_micro_compact_kernel(
 ):
     quant_mode = "w4a16"
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
-    input_scales_are_reciprocal = False
     sf_vec_size = 16
     mac = mac_override if mac_override is not None else _get_impl_mac("micro")
     routed_rows = m * num_topk
@@ -2168,7 +2156,7 @@ def _get_w4a16_micro_compact_kernel(
     global _LAST_KERNEL
     cache_key = (
         quant_mode, "micro_compact", state_E, weight_E, m, k, n, num_topk,
-        max_rows, mac, mma_tiler_mn, topk_ids_dtype, input_scales_are_reciprocal,
+        max_rows, mac, mma_tiler_mn, topk_ids_dtype,
         fast_math, activation, single_token, share_input_across_experts,
         share_expert_scales, dynamic_down_scale,
     )
@@ -2191,7 +2179,6 @@ def _get_w4a16_micro_compact_kernel(
         sf_vec_size=sf_vec_size,
         mma_tiler_mn=mma_tiler_mn,
         output_tile_count_n=max(1, (n + mma_tiler_mn[1] - 1) // mma_tiler_mn[1]),
-        input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
         share_input_across_experts=share_input_across_experts,
         share_expert_scales=share_expert_scales,
@@ -2303,7 +2290,6 @@ def _get_micro_kernel(
     num_topk: int,
     *,
     topk_ids_dtype: torch.dtype,
-    input_scales_are_reciprocal: bool,
     fast_math: bool,
     share_input_across_experts: bool = False,
     share_expert_scales: bool = False,
@@ -2315,8 +2301,6 @@ def _get_micro_kernel(
 ):
     quant_mode = _normalize_quant_mode(quant_mode)
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
-    if quant_mode == "w4a16":
-        input_scales_are_reciprocal = False
     mac = mac_override if mac_override is not None else _get_impl_mac("micro")
     if (
         mac_override is None
@@ -2332,7 +2316,7 @@ def _get_micro_kernel(
     global _LAST_KERNEL
     cache_key = (
         quant_mode, "micro_direct", m, k, n, num_topk, weight_E, topk_ids_dtype,
-        input_scales_are_reciprocal, fast_math, share_input_across_experts,
+        fast_math, share_input_across_experts,
         share_expert_scales, single_token, activation, dynamic_down_scale,
     )
     last_kkey, last_kval = _LAST_KERNEL
@@ -2349,7 +2333,6 @@ def _get_micro_kernel(
         sf_vec_size=16,
         mma_tiler_mn=(64, 128),
         output_tile_count_n=1,
-        input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
         share_input_across_experts=share_input_across_experts,
         share_expert_scales=share_expert_scales,
@@ -2566,7 +2549,6 @@ def _get_dynamic_kernel(
     max_rows: int,
     *,
     topk_ids_dtype: torch.dtype,
-    input_scales_are_reciprocal: bool,
     fast_math: bool,
     mac_override: int | None = None,
     activation: str = "silu",
@@ -2574,8 +2556,6 @@ def _get_dynamic_kernel(
 ):
     quant_mode = _normalize_quant_mode(quant_mode)
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
-    if quant_mode == "w4a16":
-        input_scales_are_reciprocal = False
     sf_vec_size = 16
     mac = mac_override if mac_override is not None else _get_impl_mac("dynamic")
     dynamic_down_scale = False if quant_mode == "w4a16" else _dynamic_down_scale_enabled()
@@ -2587,7 +2567,7 @@ def _get_dynamic_kernel(
     global _LAST_KERNEL
     cache_key = (
         quant_mode, "dynamic", E, k, n, num_topk, mac, mma_tiler_mn, topk_ids_dtype,
-        input_scales_are_reciprocal, fast_math, activation, dynamic_down_scale,
+        fast_math, activation, dynamic_down_scale,
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
@@ -2611,7 +2591,6 @@ def _get_dynamic_kernel(
     kernel_kwargs = dict(
         sf_vec_size=sf_vec_size,
         mma_tiler_mn=mma_tiler_mn,
-        input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
         dynamic_down_scale=dynamic_down_scale,
     )
@@ -2766,7 +2745,6 @@ def _get_exact_relu2_bs1_nemotron_launcher(
     w2_blockscale: torch.Tensor,
     w2_alphas: torch.Tensor,
     topk_ids_dtype: torch.dtype,
-    input_scales_are_reciprocal: bool,
     fast_math: bool,
 ) -> _ExactRelu2Bs1NemotronLauncher:
     global _LAST_EXACT_RELU2_BS1_NEMOTRON
@@ -2778,7 +2756,6 @@ def _get_exact_relu2_bs1_nemotron_launcher(
         plan.device.index or 0,
         plan.dtype,
         topk_ids_dtype,
-        input_scales_are_reciprocal,
         fast_math,
         num_tokens,
         w1_fp4.data_ptr(),
@@ -2826,7 +2803,6 @@ def _get_exact_relu2_bs1_nemotron_launcher(
         plan.num_topk,
         plan.max_rows,
         topk_ids_dtype=topk_ids_dtype,
-        input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
         share_input_across_experts=True,
         share_expert_scales=False,
@@ -2887,7 +2863,6 @@ def _launch_exact_relu2_bs1_nemotron(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     scatter_output: torch.Tensor,
-    input_scales_are_reciprocal: bool,
     fast_math: bool,
     input_scales_static: bool,
 ) -> torch.Tensor:
@@ -2904,7 +2879,6 @@ def _launch_exact_relu2_bs1_nemotron(
         w2_blockscale=w2_blockscale,
         w2_alphas=w2_alphas,
         topk_ids_dtype=flat_ids.dtype,
-        input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
     )
     resolved = _resolve_workspace(
@@ -2947,22 +2921,18 @@ def _launch_dynamic(
     routed_rows: int,
     max_rows: int,
     topk_ids_dtype: torch.dtype,
-    input_scales_are_reciprocal: bool,
     fast_math: bool,
     stream,
     activation: str = "silu",
     quant_mode: str = "nvfp4",
 ) -> None:
     quant_mode = _normalize_quant_mode(quant_mode)
-    if quant_mode == "w4a16":
-        input_scales_are_reciprocal = False
     effective_mac = _get_impl_mac("dynamic", routed_rows=routed_rows)
     if not _dynamic_multicta_enabled():
         effective_mac = 1
     compiled, mac = _get_dynamic_kernel(
         E, m, k, n, num_topk, max_rows,
         topk_ids_dtype=topk_ids_dtype,
-        input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
         mac_override=effective_mac,
         activation=activation,
@@ -3023,7 +2993,6 @@ def _launch_compact_static(
     num_topk: int,
     routed_rows: int,
     topk_ids_dtype: torch.dtype,
-    input_scales_are_reciprocal: bool,
     fast_math: bool,
     stream,
     share_input_across_experts: bool = False,
@@ -3032,14 +3001,11 @@ def _launch_compact_static(
     quant_mode: str = "nvfp4",
 ) -> None:
     quant_mode = _normalize_quant_mode(quant_mode)
-    if quant_mode == "w4a16":
-        input_scales_are_reciprocal = False
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
     micro_cls = activation_spec.micro_kernel_cls
     use_micro_direct = quant_mode in {"nvfp4", "w4a16"} and micro_cls.is_supported(
         m=m, k=k, n=n, num_topk=num_topk,
         weight_E=weight_E,
-        input_scales_are_reciprocal=input_scales_are_reciprocal,
     )
     use_w4a16_micro_compact = False
     if use_micro_direct:
@@ -3051,7 +3017,6 @@ def _launch_compact_static(
         compiled, grid_x = _get_micro_kernel(
             weight_E, m, k, n, num_topk,
             topk_ids_dtype=topk_ids_dtype,
-            input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             share_input_across_experts=share_input_across_experts,
             share_expert_scales=share_expert_scales,
@@ -3060,7 +3025,7 @@ def _launch_compact_static(
             device=a.device,
             quant_mode=quant_mode,
         )
-        if quant_mode != "w4a16" or _compiled_direct_micro_accepts_block_dim(
+        if _compiled_direct_micro_accepts_block_dim(
             compiled,
             _DIRECT_MICRO_BLOCK_DIM,
         ):
@@ -3094,7 +3059,6 @@ def _launch_compact_static(
         compiled, mac = _get_w4a16_micro_compact_kernel(
             workspace.state_E, weight_E, m, k, n, num_topk, workspace.max_rows,
             topk_ids_dtype=topk_ids_dtype,
-            input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             mac_override=micro_mac,
             activation=activation,
@@ -3134,7 +3098,6 @@ def _launch_compact_static(
     compiled, mac = _get_static_kernel(
         workspace.state_E, weight_E, m, k, n, num_topk, workspace.max_rows,
         topk_ids_dtype=topk_ids_dtype,
-        input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
         mac_override=static_mac,
         activation=activation,
@@ -3162,11 +3125,11 @@ def _launch_compact_static(
 @torch._dynamo.disable
 def b12x_moe_fp4(
     a: torch.Tensor,           # [m, k] bf16 activations
-    a1_gscale: torch.Tensor,   # [E] or scalar — input quant scale
+    a1_gscale: torch.Tensor,   # [E] or scalar — reciprocal input quant global scale
     w1_fp4: torch.Tensor,      # [E, 2*n, k//2] uint8
     w1_blockscale: torch.Tensor,  # [E, ...] float8_e4m3fn swizzled
     w1_alphas: torch.Tensor,   # [E] float32
-    a2_gscale: torch.Tensor,   # [E] or scalar — intermediate quant scale
+    a2_gscale: torch.Tensor,   # [E] or scalar — reciprocal intermediate quant global scale
     w2_fp4: torch.Tensor,      # [E, k, n//2] uint8
     w2_blockscale: torch.Tensor,  # [E, ...] float8_e4m3fn swizzled
     w2_alphas: torch.Tensor,   # [E] float32
@@ -3176,7 +3139,6 @@ def b12x_moe_fp4(
     *,
     workspace: TPMoEWorkspace | TPMoEWorkspacePool,
     output: torch.Tensor | None = None,
-    input_scales_are_reciprocal: bool = False,
     input_scales_static: bool = False,
     fast_math: bool | None = None,
     activation: str = "silu",
@@ -3213,13 +3175,11 @@ def b12x_moe_fp4(
             w1_alphas,
             a1_gscale,
             weight_E,
-            input_scales_are_reciprocal=input_scales_are_reciprocal,
         )
         w2_alphas = _w4a16_default_alpha(
             w2_alphas,
             a2_gscale,
             weight_E,
-            input_scales_are_reciprocal=input_scales_are_reciprocal,
         )
     # Shared scalar input scales are weight-side constants in the benchmarked
     # path, so treat them as static and avoid re-expanding them every launch.
@@ -3261,7 +3221,6 @@ def b12x_moe_fp4(
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             scatter_output=scatter_output,
-            input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             input_scales_static=effective_input_scales_static,
         )
@@ -3307,7 +3266,6 @@ def b12x_moe_fp4(
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 output=chunk_output[start:end],
                 workspace=workspace,
-                input_scales_are_reciprocal=input_scales_are_reciprocal,
                 input_scales_static=effective_input_scales_static,
                 fast_math=fast_math,
                 activation=activation,
@@ -3394,7 +3352,6 @@ def b12x_moe_fp4(
             routed_rows=routed_rows,
             max_rows=max_rows,
             topk_ids_dtype=flat_ids.dtype,
-            input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             stream=stream,
             activation=activation,
@@ -3417,7 +3374,6 @@ def b12x_moe_fp4(
             num_topk=num_topk,
             routed_rows=routed_rows,
             topk_ids_dtype=flat_ids.dtype,
-            input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             stream=stream,
             share_input_across_experts=(
@@ -3912,7 +3868,6 @@ def b12x_sparse_moe_fp4(
     routed_scaling_factor: float = 1.0,
     output: torch.Tensor | None = None,
     return_routing: bool = False,
-    input_scales_are_reciprocal: bool = False,
     input_scales_static: bool = False,
     fast_math: bool | None = None,
     activation: str = "silu",
@@ -3963,7 +3918,6 @@ def b12x_sparse_moe_fp4(
         selected.topk_ids,
         workspace=workspace,
         output=output,
-        input_scales_are_reciprocal=input_scales_are_reciprocal,
         input_scales_static=input_scales_static,
         fast_math=fast_math,
         activation=activation,

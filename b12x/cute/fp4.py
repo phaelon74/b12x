@@ -128,7 +128,7 @@ def quantize_grouped_nvfp4_torch(
     row_counts: torch.Tensor,
     global_scale: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pure-Torch grouped NVFP4 quantization for tests and benchmarks."""
+    """Pure-Torch grouped NVFP4 quantization with reciprocal global scales."""
     num_groups, rows, cols = input_tensor.shape
     if cols % SF_VEC_SIZE != 0:
         raise ValueError(f"cols must be divisible by {SF_VEC_SIZE}, got {cols}")
@@ -1852,8 +1852,8 @@ def cvt_f32_to_e4m3(a: Float32, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
-def nvfp4_raw_scale_from_amax(block_amax: Float32, global_scale: Float32, *, loc=None, ip=None) -> Float32:
-    """Compute block_amax / (6 * global_scale) with CUDA tensor-scalar semantics."""
+def nvfp4_scale_from_amax(block_amax: Float32, global_scale: Float32, *, loc=None, ip=None) -> Float32:
+    """Compute block_amax * reciprocal_global_scale / 6 with CUDA tensor-scalar semantics."""
     return Float32(
         llvm.inline_asm(
             T.f32(),
@@ -1863,12 +1863,12 @@ def nvfp4_raw_scale_from_amax(block_amax: Float32, global_scale: Float32, *, loc
             ],
             """
             {
-                .reg .f64 amax_d, gs_d, denom_d, q_d, six_d;
+                .reg .f64 amax_d, gs_d, q_d, six_d;
                 cvt.f64.f32 amax_d, $1;
                 cvt.f64.f32 gs_d, $2;
                 mov.f64 six_d, 0d4018000000000000;
-                mul.rn.f64 denom_d, gs_d, six_d;
-                div.rn.f64 q_d, amax_d, denom_d;
+                mul.rn.f64 q_d, amax_d, gs_d;
+                div.rn.f64 q_d, q_d, six_d;
                 cvt.rn.f32.f64 $0, q_d;
             }
             """,
@@ -3049,14 +3049,14 @@ def quantize_block_fp4(
     scale, quantizes to FP4, and packs into a uint64.  Returns
     (packed_fp4_u64, scale_byte).  The caller handles storage writes.
     """
-    scale_float = max_abs / (Float32(FLOAT4_E2M1_MAX) * global_scale_val)
+    scale_float = max_abs * global_scale_val / Float32(FLOAT4_E2M1_MAX)
     scale_float = fmin_f32(scale_float, Float32(FLOAT8_E4M3_MAX))
     scale_u32 = cvt_f32_to_e4m3(scale_float)
     scale_byte = cutlass.Uint8(scale_u32 & Uint32(0xFF))
     quantized_scale = fp8_e4m3_to_f32(scale_u32)
     packed64 = Uint64(0)
     if quantized_scale != Float32(0.0) and global_scale_val != Float32(0.0):
-        packed64 = quantize_and_pack_16(values, quantized_scale * global_scale_val)
+        packed64 = quantize_and_pack_16(values, quantized_scale / global_scale_val)
     return packed64, scale_byte
 
 
@@ -3070,14 +3070,13 @@ def quantize_block_fp4_fast(
     packed64 = Uint64(0)
     if global_scale_val != Float32(0.0):
         fp4_max_rcp = rcp_approx_ftz(Float32(FLOAT4_E2M1_MAX))
-        gs_recip = rcp_approx_ftz(global_scale_val)
-        scale_float = gs_recip * (max_abs * fp4_max_rcp)
+        scale_float = global_scale_val * (max_abs * fp4_max_rcp)
         scale_float = fmin_f32(scale_float, Float32(FLOAT8_E4M3_MAX))
         scale_u32 = cvt_f32_to_e4m3(scale_float)
         scale_byte = cutlass.Uint8(scale_u32 & Uint32(0xFF))
         inv_quantized_scale = fp8_e4m3_to_f32_and_rcp(scale_u32)
         if inv_quantized_scale != Float32(0.0):
-            packed64 = quantize_and_pack_16_fast(values, inv_quantized_scale * gs_recip)
+            packed64 = quantize_and_pack_16_fast(values, inv_quantized_scale * global_scale_val)
     return packed64, scale_byte
 
 

@@ -242,7 +242,6 @@ class MoEDynamicKernelBackend:
         sf_vec_size: int,
         mma_tiler_mn: Tuple[int, int],
         *,
-        input_scales_are_reciprocal: bool = False,
         fast_math: bool = False,
         activation: str = "silu",
         dynamic_down_scale: bool = False,
@@ -252,7 +251,6 @@ class MoEDynamicKernelBackend:
         self._dense_cls = DenseGemmKernel
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
-        self.input_scales_are_reciprocal = input_scales_are_reciprocal
         self.fast_math = fast_math
         self.activation = activation
         self.is_gated = activation == "silu"
