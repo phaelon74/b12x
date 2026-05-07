@@ -43,9 +43,9 @@ from b12x.cute.fp4 import (
 _BLOCK_SIZE = 16
 _FP8_E4M3_MAX = 448.0
 _FC2_TILE_AMAX_GS_RCP = 1.0 / (6.0 * _FP8_E4M3_MAX)
-_NUM_WARPS = 16
+_NUM_WARPS = 8
 _BLOCK_DIM = _NUM_WARPS * 32
-_K_PER_CTA = 16
+_K_PER_CTA = _NUM_WARPS
 
 
 def _align_up(value: int, align: int) -> int:
@@ -54,7 +54,14 @@ def _align_up(value: int, align: int) -> int:
 
 def _fc1_chunks_for_m(m: int, n: int) -> int:
     rows_per_warp = max(1, int(m))
-    return max(1, int(n) // (_NUM_WARPS * rows_per_warp))
+    rows_per_chunk = max(_BLOCK_SIZE, _NUM_WARPS * rows_per_warp)
+    chunks = max(1, int(n) // rows_per_chunk)
+    while chunks > 1:
+        i_chunk = int(n) // chunks
+        if int(n) % chunks == 0 and i_chunk % _BLOCK_SIZE == 0:
+            return chunks
+        chunks -= 1
+    return 1
 
 
 @dataclass(frozen=True)
@@ -306,12 +313,11 @@ class MoEMicroKernelBackend:
             return False
         if k <= 0 or k % (32 * _BLOCK_SIZE) != 0 or k % 128 != 0:
             return False
-        if k // _BLOCK_SIZE > _BLOCK_DIM:
+        if k // _BLOCK_SIZE > 32 * 12:
             return False
         if n <= 0 or n % _BLOCK_SIZE != 0:
             return False
-        rows_per_warp = max(1, m)
-        fc1_chunks = max(1, n // (_NUM_WARPS * rows_per_warp))
+        fc1_chunks = _fc1_chunks_for_m(m, n)
         if n % fc1_chunks != 0:
             return False
         i_chunk = n // fc1_chunks
@@ -320,7 +326,7 @@ class MoEMicroKernelBackend:
         k_segments = k // (32 * _BLOCK_SIZE)
         return (
             not input_scales_are_reciprocal
-            and k_segments in (2, 8)
+            and k_segments in (2, 8, 12)
             and 0 < num_topk <= 32
             and weight_E > 0
         )
@@ -814,8 +820,8 @@ class MoEMicroKernelBackend:
                 t0 = route_idx_0 // Int32(cfg.num_topk)
                 eid_addr_0 = t0 * Int32(cfg.num_topk) + (route_idx_0 - t0 * Int32(cfg.num_topk))
                 gs_fc1_0 = input_gs[Int32(topk_ids[eid_addr_0])]
-                if tidx < Int32(cfg.k_dim // _BLOCK_SIZE):
-                    in_blk = tidx
+                in_blk = tidx
+                while in_blk < Int32(cfg.k_dim // _BLOCK_SIZE):
                     x_base = t0 * Int32(cfg.k_dim) + in_blk * Int32(_BLOCK_SIZE)
                     pad_off = in_blk // Int32(8)
                     phys_base = in_blk * Int32(_BLOCK_SIZE // 2) + pad_off
@@ -846,6 +852,7 @@ class MoEMicroKernelBackend:
                             v1 = Float32(a_input[x_base + Int32(i * 2 + 1)])
                             f0, f1 = quant_dequant_2(v0, v1, sf_val, inv_eff)
                             smem_xh[phys_base + Int32(i)] = pack_f32x2_to_f16x2(f0, f1)
+                    in_blk += Int32(_BLOCK_DIM)
                 cute.arch.sync_threads()
         else:
             prev_t = Int32(-1)
@@ -863,13 +870,13 @@ class MoEMicroKernelBackend:
             gs_fc2 = down_input_scale[eid]
 
             # ---- Input quantization ----
-            if cutlass.const_expr(cfg.k_segments == 8):
+            if cutlass.const_expr(cfg.k_segments == 8 or cfg.k_segments == 12):
                 need_quant = Int32(1)
                 if cutlass.const_expr(self.share_input_across_experts):
                     need_quant = Int32(1) if t != prev_t else Int32(0)
                 if need_quant > Int32(0):
-                    if tidx < Int32(cfg.k_dim // _BLOCK_SIZE):
-                        in_blk = tidx
+                    in_blk = tidx
+                    while in_blk < Int32(cfg.k_dim // _BLOCK_SIZE):
                         x_base = t * Int32(cfg.k_dim) + in_blk * Int32(_BLOCK_SIZE)
                         pad_off = in_blk // Int32(8)
                         phys_base = in_blk * Int32(_BLOCK_SIZE // 2) + pad_off
@@ -900,6 +907,7 @@ class MoEMicroKernelBackend:
                                 v1 = Float32(a_input[x_base + Int32(i * 2 + 1)])
                                 f0, f1 = quant_dequant_2(v0, v1, sf_val, inv_eff)
                                 smem_xh[phys_base + Int32(i)] = pack_f32x2_to_f16x2(f0, f1)
+                        in_blk += Int32(_BLOCK_DIM)
                     if cutlass.const_expr(self.share_input_across_experts):
                         prev_t = t
                 cute.arch.sync_threads()
@@ -911,7 +919,13 @@ class MoEMicroKernelBackend:
             xh_buf_base = Int32(0)
             if cutlass.const_expr(cfg.k_segments == 2):
                 xh_buf_base = buf_idx * Int32(cfg.smem_xh_size)
-            xh_base_t = xh_buf_base + lane * Int32(cfg.smem_xh_stride)
+            lane_seg_base = lane * Int32(cfg.k_segments)
+            lane_pad_base = lane_seg_base // Int32(8)
+            xh_base_t = (
+                xh_buf_base
+                + lane_seg_base * Int32(_BLOCK_SIZE // 2)
+                + lane_pad_base
+            )
 
             for r_iter in cutlass.range_constexpr(cfg.rows_per_warp_fc1):
                 i_local = warp_id * Int32(cfg.rows_per_warp_fc1) + Int32(r_iter)
@@ -999,6 +1013,105 @@ class MoEMicroKernelBackend:
                             sf_g6 * dot_g6 +
                             sf_g7 * dot_g7
                         )
+                elif cutlass.const_expr(cfg.k_segments == 12):
+                    xh_off0 = Int32(0)
+                    xh_off1 = Int32(8) + ((lane_seg_base + Int32(1)) // Int32(8) - lane_pad_base)
+                    xh_off2 = Int32(16) + ((lane_seg_base + Int32(2)) // Int32(8) - lane_pad_base)
+                    xh_off3 = Int32(24) + ((lane_seg_base + Int32(3)) // Int32(8) - lane_pad_base)
+                    xh_off4 = Int32(32) + ((lane_seg_base + Int32(4)) // Int32(8) - lane_pad_base)
+                    xh_off5 = Int32(40) + ((lane_seg_base + Int32(5)) // Int32(8) - lane_pad_base)
+                    xh_off6 = Int32(48) + ((lane_seg_base + Int32(6)) // Int32(8) - lane_pad_base)
+                    xh_off7 = Int32(56) + ((lane_seg_base + Int32(7)) // Int32(8) - lane_pad_base)
+                    xh_off8 = Int32(64) + ((lane_seg_base + Int32(8)) // Int32(8) - lane_pad_base)
+                    xh_off9 = Int32(72) + ((lane_seg_base + Int32(9)) // Int32(8) - lane_pad_base)
+                    xh_off10 = Int32(80) + ((lane_seg_base + Int32(10)) // Int32(8) - lane_pad_base)
+                    xh_off11 = Int32(88) + ((lane_seg_base + Int32(11)) // Int32(8) - lane_pad_base)
+
+                    if cutlass.const_expr(self.is_gated):
+                        uw_a0, uw_a1, uw_a2, uw_a3 = ld_global_nc_v4_u32(up_byte_addr)
+                        uw_b0, uw_b1, uw_b2, uw_b3 = ld_global_nc_v4_u32(up_byte_addr + Int64(16))
+                        uw_c0, uw_c1, uw_c2, uw_c3 = ld_global_nc_v4_u32(up_byte_addr + Int64(32))
+                        uw_d0, uw_d1, uw_d2, uw_d3 = ld_global_nc_v4_u32(up_byte_addr + Int64(48))
+                        uw_e0, uw_e1, uw_e2, uw_e3 = ld_global_nc_v4_u32(up_byte_addr + Int64(64))
+                        uw_f0, uw_f1, uw_f2, uw_f3 = ld_global_nc_v4_u32(up_byte_addr + Int64(80))
+
+                        bsf_addr_u_a = w1s_base_addr + ebase_sf + bsf_base_u + col_blk_off
+                        bsf_addr_u_b = bsf_addr_u_a + Int64(512)
+                        bsf_addr_u_c = bsf_addr_u_a + Int64(1024)
+                        sf_u0, sf_u1, sf_u2, sf_u3 = cvt_e4m3x4_to_f32x4(ld_global_nc_u32(bsf_addr_u_a))
+                        sf_u4, sf_u5, sf_u6, sf_u7 = cvt_e4m3x4_to_f32x4(ld_global_nc_u32(bsf_addr_u_b))
+                        sf_u8, sf_u9, sf_u10, sf_u11 = cvt_e4m3x4_to_f32x4(ld_global_nc_u32(bsf_addr_u_c))
+
+                    gw_a0, gw_a1, gw_a2, gw_a3 = ld_global_nc_v4_u32(gate_byte_addr)
+                    gw_b0, gw_b1, gw_b2, gw_b3 = ld_global_nc_v4_u32(gate_byte_addr + Int64(16))
+                    gw_c0, gw_c1, gw_c2, gw_c3 = ld_global_nc_v4_u32(gate_byte_addr + Int64(32))
+                    gw_d0, gw_d1, gw_d2, gw_d3 = ld_global_nc_v4_u32(gate_byte_addr + Int64(48))
+                    gw_e0, gw_e1, gw_e2, gw_e3 = ld_global_nc_v4_u32(gate_byte_addr + Int64(64))
+                    gw_f0, gw_f1, gw_f2, gw_f3 = ld_global_nc_v4_u32(gate_byte_addr + Int64(80))
+
+                    bsf_addr_g_a = w1s_base_addr + ebase_sf + bsf_base_g + col_blk_off
+                    bsf_addr_g_b = bsf_addr_g_a + Int64(512)
+                    bsf_addr_g_c = bsf_addr_g_a + Int64(1024)
+                    sf_g0, sf_g1, sf_g2, sf_g3 = cvt_e4m3x4_to_f32x4(ld_global_nc_u32(bsf_addr_g_a))
+                    sf_g4, sf_g5, sf_g6, sf_g7 = cvt_e4m3x4_to_f32x4(ld_global_nc_u32(bsf_addr_g_b))
+                    sf_g8, sf_g9, sf_g10, sf_g11 = cvt_e4m3x4_to_f32x4(ld_global_nc_u32(bsf_addr_g_c))
+
+                    if cutlass.const_expr(not self.is_gated):
+                        partial_gate = (
+                            sf_g0 * _block_dot_hfma2(gw_a0, gw_a1, smem_xh, xh_base_t + xh_off0) +
+                            sf_g1 * _block_dot_hfma2(gw_a2, gw_a3, smem_xh, xh_base_t + xh_off1) +
+                            sf_g2 * _block_dot_hfma2(gw_b0, gw_b1, smem_xh, xh_base_t + xh_off2) +
+                            sf_g3 * _block_dot_hfma2(gw_b2, gw_b3, smem_xh, xh_base_t + xh_off3) +
+                            sf_g4 * _block_dot_hfma2(gw_c0, gw_c1, smem_xh, xh_base_t + xh_off4) +
+                            sf_g5 * _block_dot_hfma2(gw_c2, gw_c3, smem_xh, xh_base_t + xh_off5) +
+                            sf_g6 * _block_dot_hfma2(gw_d0, gw_d1, smem_xh, xh_base_t + xh_off6) +
+                            sf_g7 * _block_dot_hfma2(gw_d2, gw_d3, smem_xh, xh_base_t + xh_off7) +
+                            sf_g8 * _block_dot_hfma2(gw_e0, gw_e1, smem_xh, xh_base_t + xh_off8) +
+                            sf_g9 * _block_dot_hfma2(gw_e2, gw_e3, smem_xh, xh_base_t + xh_off9) +
+                            sf_g10 * _block_dot_hfma2(gw_f0, gw_f1, smem_xh, xh_base_t + xh_off10) +
+                            sf_g11 * _block_dot_hfma2(gw_f2, gw_f3, smem_xh, xh_base_t + xh_off11)
+                        )
+                    elif cutlass.const_expr(self.is_gated):
+                        dot_u0, dot_g0 = _block_dot_hfma2_pair(uw_a0, uw_a1, gw_a0, gw_a1, smem_xh, xh_base_t + xh_off0)
+                        dot_u1, dot_g1 = _block_dot_hfma2_pair(uw_a2, uw_a3, gw_a2, gw_a3, smem_xh, xh_base_t + xh_off1)
+                        dot_u2, dot_g2 = _block_dot_hfma2_pair(uw_b0, uw_b1, gw_b0, gw_b1, smem_xh, xh_base_t + xh_off2)
+                        dot_u3, dot_g3 = _block_dot_hfma2_pair(uw_b2, uw_b3, gw_b2, gw_b3, smem_xh, xh_base_t + xh_off3)
+                        dot_u4, dot_g4 = _block_dot_hfma2_pair(uw_c0, uw_c1, gw_c0, gw_c1, smem_xh, xh_base_t + xh_off4)
+                        dot_u5, dot_g5 = _block_dot_hfma2_pair(uw_c2, uw_c3, gw_c2, gw_c3, smem_xh, xh_base_t + xh_off5)
+                        dot_u6, dot_g6 = _block_dot_hfma2_pair(uw_d0, uw_d1, gw_d0, gw_d1, smem_xh, xh_base_t + xh_off6)
+                        dot_u7, dot_g7 = _block_dot_hfma2_pair(uw_d2, uw_d3, gw_d2, gw_d3, smem_xh, xh_base_t + xh_off7)
+                        dot_u8, dot_g8 = _block_dot_hfma2_pair(uw_e0, uw_e1, gw_e0, gw_e1, smem_xh, xh_base_t + xh_off8)
+                        dot_u9, dot_g9 = _block_dot_hfma2_pair(uw_e2, uw_e3, gw_e2, gw_e3, smem_xh, xh_base_t + xh_off9)
+                        dot_u10, dot_g10 = _block_dot_hfma2_pair(uw_f0, uw_f1, gw_f0, gw_f1, smem_xh, xh_base_t + xh_off10)
+                        dot_u11, dot_g11 = _block_dot_hfma2_pair(uw_f2, uw_f3, gw_f2, gw_f3, smem_xh, xh_base_t + xh_off11)
+                        partial_up = (
+                            sf_u0 * dot_u0 +
+                            sf_u1 * dot_u1 +
+                            sf_u2 * dot_u2 +
+                            sf_u3 * dot_u3 +
+                            sf_u4 * dot_u4 +
+                            sf_u5 * dot_u5 +
+                            sf_u6 * dot_u6 +
+                            sf_u7 * dot_u7 +
+                            sf_u8 * dot_u8 +
+                            sf_u9 * dot_u9 +
+                            sf_u10 * dot_u10 +
+                            sf_u11 * dot_u11
+                        )
+                        partial_gate = (
+                            sf_g0 * dot_g0 +
+                            sf_g1 * dot_g1 +
+                            sf_g2 * dot_g2 +
+                            sf_g3 * dot_g3 +
+                            sf_g4 * dot_g4 +
+                            sf_g5 * dot_g5 +
+                            sf_g6 * dot_g6 +
+                            sf_g7 * dot_g7 +
+                            sf_g8 * dot_g8 +
+                            sf_g9 * dot_g9 +
+                            sf_g10 * dot_g10 +
+                            sf_g11 * dot_g11
+                        )
                 elif cutlass.const_expr(cfg.k_segments == 2):
                     if cutlass.const_expr(self.is_gated):
                         uw_a0, uw_a1, uw_a2, uw_a3 = ld_global_nc_v4_u32(up_byte_addr)
@@ -1061,8 +1174,8 @@ class MoEMicroKernelBackend:
                     next_eid_addr = t_next * Int32(cfg.num_topk) + (next_route - t_next * Int32(cfg.num_topk))
                     gs_fc1_next = input_gs[Int32(topk_ids[next_eid_addr])]
                     next_buf_base = (Int32(1) - buf_idx) * Int32(cfg.smem_xh_size)
-                    if tidx < Int32(cfg.k_dim // _BLOCK_SIZE):
-                        in_blk = tidx
+                    in_blk = tidx
+                    while in_blk < Int32(cfg.k_dim // _BLOCK_SIZE):
                         x_base = t_next * Int32(cfg.k_dim) + in_blk * Int32(_BLOCK_SIZE)
                         pad_off = in_blk // Int32(8)
                         phys_base = in_blk * Int32(_BLOCK_SIZE // 2) + pad_off
@@ -1093,6 +1206,7 @@ class MoEMicroKernelBackend:
                                 v1 = Float32(a_input[x_base + Int32(i * 2 + 1)])
                                 f0, f1 = quant_dequant_2(v0, v1, sf_val, inv_eff)
                                 smem_xh[next_buf_base + phys_base + Int32(i)] = pack_f32x2_to_f16x2(f0, f1)
+                        in_blk += Int32(_BLOCK_DIM)
 
             cute.arch.sync_threads()
 

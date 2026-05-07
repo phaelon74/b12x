@@ -45,7 +45,7 @@ class MoEMicroKernelBackend(_DirectMoEMicroKernelBackend):
         k_segments = k // (32 * 16)
         return (
             not input_scales_are_reciprocal
-            and k_segments in (2, 8)
+            and k_segments in (2, 8, 12)
             and 0 < num_topk <= 32
             and weight_E > 0
         )

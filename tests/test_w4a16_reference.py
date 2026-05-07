@@ -156,6 +156,16 @@ def test_w4a16_direct_micro_supports_static_decode_batches() -> None:
             input_scales_are_reciprocal=False,
         )
 
+    for batch_size in (1, 2, 4, 8):
+        assert MoEMicroKernelBackend.is_supported(
+            m=batch_size,
+            k=6144,
+            n=256,
+            num_topk=8,
+            weight_E=256,
+            input_scales_are_reciprocal=False,
+        )
+
     assert not MoEMicroKernelBackend.is_supported(
         m=40,
         k=4096,

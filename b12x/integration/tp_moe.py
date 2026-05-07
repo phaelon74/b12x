@@ -925,7 +925,7 @@ def _plan_core_workspace(
         and n % _NVFP4_BLOCK_SIZE == 0
         and k % (32 * _NVFP4_BLOCK_SIZE) == 0
         and k % 128 == 0
-        and (k // (32 * _NVFP4_BLOCK_SIZE)) in (2, 8)
+        and (k // (32 * _NVFP4_BLOCK_SIZE)) in (2, 8, 12)
         and 0 < num_topk <= 32
         and weight_E > 0
         and routed_rows <= 8 * num_topk
