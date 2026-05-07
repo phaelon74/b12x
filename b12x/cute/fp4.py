@@ -2158,7 +2158,8 @@ def quant_dequant_2(
     v0: Float32, v1: Float32, sf_f32: Float32, eff_scale: Float32
 ) -> Tuple[Float32, Float32]:
     """Quantize-dequantize pair roundtrip through FP4."""
-    fp4_byte = cvt_fp32x2_to_e2m1x2(v0 / eff_scale, v1 / eff_scale)
+    inv_scale = Float32(1.0) / eff_scale
+    fp4_byte = cvt_fp32x2_to_e2m1x2(v0 * inv_scale, v1 * inv_scale)
     h2 = fp4_decode_2(fp4_byte)
     f0, f1 = f16x2_to_f32x2(h2)
     return f0 * sf_f32, f1 * sf_f32
