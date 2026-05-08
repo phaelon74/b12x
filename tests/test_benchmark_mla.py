@@ -261,6 +261,46 @@ def test_select_paged_topk_matches_full_topk_set_on_cpu() -> None:
     assert torch.equal(torch.sort(actual, dim=1).values, torch.sort(expected, dim=1).values)
 
 
+def test_select_paged_topk_uses_forced_persistent_backend(monkeypatch) -> None:
+    logits = torch.randn((2, 8), dtype=torch.float32)
+    page_table = torch.arange(16, dtype=torch.int32).reshape(2, 8)
+    seqlens = torch.full((2,), 8, dtype=torch.int32)
+    expected = torch.full((2, 2048), 7, dtype=torch.int32)
+    calls: dict[str, object] = {}
+
+    def fake_supports(logits_arg, lengths_arg, *, topk, page_table_1):
+        calls["supports"] = (logits_arg, lengths_arg, topk, page_table_1)
+        return True
+
+    def fake_run(logits_arg, lengths_arg, *, page_table_1, max_seq_len):
+        calls["run"] = (logits_arg, lengths_arg, page_table_1, max_seq_len)
+        return expected
+
+    monkeypatch.setattr(benchmark_mla, "supports_persistent_topk2048", fake_supports)
+    monkeypatch.setattr(benchmark_mla, "run_persistent_topk2048", fake_run)
+
+    actual = benchmark_mla._select_paged_topk_from_logits(
+        logits=logits,
+        page_table_1=page_table,
+        seqlens=seqlens,
+        topk=2048,
+        backend="cute_persistent",
+    )
+
+    assert actual is expected
+    supports_call = calls["supports"]
+    assert isinstance(supports_call, tuple)
+    assert supports_call[0] is logits
+    assert supports_call[2] == 2048
+    run_call = calls["run"]
+    assert isinstance(run_call, tuple)
+    assert run_call[0] is logits
+    assert torch.equal(run_call[1], seqlens)
+    assert run_call[1].data_ptr() == seqlens.data_ptr()
+    assert run_call[2] is page_table
+    assert run_call[3] == logits.shape[1]
+
+
 def test_select_paged_topk_uses_base_page_table_mapping_for_topk_set_on_cpu() -> None:
     logits = torch.tensor(
         [

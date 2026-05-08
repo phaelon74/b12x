@@ -36,6 +36,7 @@ from .tiled_topk import (
     merge_tiled_topk_candidates,
     run_tiled_topk,
 )
+from .persistent_topk import clear_persistent_topk2048_kernel_cache
 
 
 _INDEX_HEAD_DIM = 128
@@ -131,6 +132,7 @@ def clear_nsa_indexer_caches() -> None:
     """Clear any cached NSA indexer runtime state."""
     clear_sparse_nsa_indexer_kernel_cache()
     clear_tiled_topk_kernel_cache()
+    clear_persistent_topk2048_kernel_cache()
     _cached_width_cap_tensor.cache_clear()
 
 
@@ -312,6 +314,8 @@ def sparse_nsa_index_decode_logits_paged(
     page_size: int = 64,
     contract_phantoms: dict[str, torch.Tensor] | None = None,
     workspace=None,
+    preinitialize_invalid_logits: bool = True,
+    active_width_override: torch.Tensor | None = None,
 ) -> torch.Tensor:
     weights_f = _validate_paged_decode_inputs(
         q_fp8=q_fp8,
@@ -345,7 +349,24 @@ def sparse_nsa_index_decode_logits_paged(
         seqlens_valid = metadata.cache_seqlens_int32
     else:
         seqlens_valid = metadata.cache_seqlens_int32.contiguous()
-    active_width = _make_active_width_tensor(seqlens_per_query=seqlens_valid, width=width_tokens)
+    if active_width_override is None:
+        active_width = _make_active_width_tensor(seqlens_per_query=seqlens_valid, width=width_tokens)
+    else:
+        if active_width_override.shape != (1,):
+            raise ValueError(
+                f"active_width_override must have shape (1,), got {tuple(active_width_override.shape)}"
+            )
+        if active_width_override.dtype != torch.int32:
+            raise ValueError(
+                "active_width_override must have dtype torch.int32, got "
+                f"{active_width_override.dtype}"
+            )
+        if active_width_override.device != q_fp8.device:
+            raise ValueError(
+                "active_width_override device "
+                f"{active_width_override.device} does not match q_fp8 device {q_fp8.device}"
+            )
+        active_width = active_width_override
 
     validate_page_ids = q_fp8.device.type != "cuda" or (
         _VALIDATE_PAGE_IDS and not _is_cuda_graph_capture_active(q_fp8.device)
@@ -414,6 +435,7 @@ def sparse_nsa_index_decode_logits_paged(
         page_size=page_size,
         contract_phantoms=contract_phantoms,
         workspace=workspace,
+        preinitialize_invalid_logits=preinitialize_invalid_logits,
     )
     if valid_q_rows == full_q_rows:
         return logits_valid

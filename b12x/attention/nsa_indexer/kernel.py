@@ -43,7 +43,7 @@ _PAGED_TOKENS_PER_GROUP = 8
 PAGED_MQA_LOGITS_SCHEDULE_PAGES_PER_SPLIT = 4
 _SCHEDULE_MIN_PAGES = 1024
 _ENABLE_MULTI_ROW_SCHEDULE = True
-_SCHEDULE_SINGLE_ROW_PARALLEL_CTAS = 2
+_SCHEDULE_SINGLE_ROW_PARALLEL_CTAS = 4
 _SCHEDULE_MULTI_ROW_PARALLEL_CTAS = 4
 _SCHEDULE_MULTI_ROW_MAX_Q_ROWS = 8
 _MAX_SUPPORTED_Q_HEADS = 64
@@ -1490,6 +1490,7 @@ def run_sparse_nsa_paged_logits_kernel(
     page_size: int = _PAGE_SIZE,
     contract_phantoms: dict[str, torch.Tensor] | None = None,
     workspace=None,
+    preinitialize_invalid_logits: bool = True,
 ) -> torch.Tensor:
     if not supports_sparse_nsa_paged_logits_kernel(
         q_fp8=q_fp8,
@@ -1559,12 +1560,15 @@ def run_sparse_nsa_paged_logits_kernel(
         seqlens_per_query_kernel = seqlens_per_query.contiguous()
         active_width_kernel = active_width.contiguous()
         schedule_metadata_kernel = None
-        logits = torch.full(
-            (rows, width_tokens),
-            float("-inf"),
-            dtype=torch.float32,
-            device=q_fp8.device,
-        )
+        if preinitialize_invalid_logits:
+            logits = torch.full(
+                (rows, width_tokens),
+                float("-inf"),
+                dtype=torch.float32,
+                device=q_fp8.device,
+            )
+        else:
+            logits = torch.empty((rows, width_tokens), dtype=torch.float32, device=q_fp8.device)
         logits_view = logits
     _cp = contract_phantoms or {}
     common_args = (

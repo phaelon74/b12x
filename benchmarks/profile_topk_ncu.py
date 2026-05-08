@@ -15,6 +15,7 @@ from b12x.attention.nsa_indexer.tiled_topk import (
     _tensor_meta_key,
     _to_kernel_tensor,
 )
+from b12x.attention.nsa_indexer.persistent_topk import run_persistent_topk2048
 from b12x.cute.utils import current_cuda_stream
 
 
@@ -29,8 +30,10 @@ def _make_inputs(rows: int, cols: int, topk: int, seed: int):
 
 def _make_cute_runner(scores: torch.Tensor, lengths: torch.Tensor, row_starts: torch.Tensor, topk: int):
     rows, cols = scores.shape
+    values = torch.empty((rows, topk), dtype=torch.float32, device=scores.device)
     output = torch.empty((rows, topk), dtype=torch.int32, device=scores.device)
     flat_scores = scores.reshape(-1).contiguous()
+    flat_values = values.reshape(-1).contiguous()
     flat_output = output.reshape(-1).contiguous()
     kernel = SparseNSATiledTopkKernel(is_tiled=False)
 
@@ -39,23 +42,46 @@ def _make_cute_runner(scores: torch.Tensor, lengths: torch.Tensor, row_starts: t
             _to_kernel_tensor(flat_scores, cutlass.Float32, assumed_align=4),
             _to_kernel_tensor(row_starts, cutlass.Int32, assumed_align=4),
             _to_kernel_tensor(lengths, cutlass.Int32, assumed_align=4),
+            _to_kernel_tensor(flat_values, cutlass.Float32, assumed_align=4),
             _to_kernel_tensor(flat_output, cutlass.Int32, assumed_align=4),
             Int32(rows),
             Int32(cols),
             Int32(0),
+            Int32(0),
             Int32(1),
             Int32(cols),
             Int32(topk),
+            Int32(0),
+            Int32(0),
+            Int32(0),
             current_cuda_stream(),
         )
         cache_key = (
             _tensor_meta_key(flat_scores),
             _tensor_meta_key(row_starts),
             _tensor_meta_key(lengths),
+            _tensor_meta_key(flat_values),
             _tensor_meta_key(flat_output),
             ("profile_topk_ncu_row", rows, cols, topk),
         )
         _run_cached_host_launcher(kernel, cache_key, args)
+
+    return run, output
+
+
+def _make_persistent_runner(scores: torch.Tensor, lengths: torch.Tensor, row_starts: torch.Tensor, topk: int):
+    del row_starts
+    if topk != 2048:
+        raise ValueError("persistent mode supports topk=2048")
+    output = torch.empty((scores.shape[0], topk), dtype=torch.int32, device=scores.device)
+
+    def run():
+        run_persistent_topk2048(
+            scores,
+            lengths,
+            output_indices=output,
+            max_seq_len=scores.shape[1],
+        )
 
     return run, output
 
@@ -103,7 +129,7 @@ def _time_graph(graph: torch.cuda.CUDAGraph, replays: int) -> list[float]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("cute", "sgl"), required=True)
+    parser.add_argument("--mode", choices=("cute", "sgl", "persistent"), required=True)
     parser.add_argument("--rows", type=int, default=1)
     parser.add_argument("--cols", type=int, default=8192)
     parser.add_argument("--topk", type=int, default=2048)
@@ -120,6 +146,8 @@ def main() -> None:
     scores, lengths, row_starts = _make_inputs(args.rows, args.cols, args.topk, args.seed)
     if args.mode == "cute":
         run, _ = _make_cute_runner(scores, lengths, row_starts, args.topk)
+    elif args.mode == "persistent":
+        run, _ = _make_persistent_runner(scores, lengths, row_starts, args.topk)
     else:
         run, _ = _make_sgl_runner(scores, lengths, row_starts, args.topk)
 

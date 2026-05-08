@@ -725,6 +725,26 @@ def atomic_add_global_i32(addr: Int64, val: Int32, *, loc=None, ip=None) -> Int3
 
 
 @dsl_user_op
+def red_add_global_release_i32(addr: Int64, val: Int32, *, loc=None, ip=None):
+    """No-return global int32 add with a GPU-scope release fence."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            Int32(val).ir_value(loc=loc, ip=ip),
+        ],
+        "fence.acq_rel.gpu;\n"
+        "red.relaxed.gpu.global.add.s32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def atomic_cas_global_i32(addr: Int64, compare: Int32, value: Int32, *, loc=None, ip=None) -> Int32:
     """Global memory int32 atomic compare-and-swap. Returns old value."""
     return Int32(
@@ -959,6 +979,32 @@ def spin_wait_global_eq_i32(addr: Int64, expected: Int32, *, loc=None, ip=None):
         "  ld.global.acquire.gpu.s32 %val, [$0];\n"
         "  setp.eq.s32 %p0, %val, $1;\n"
         "  @%p0 bra spin_loop;\n"
+        "}",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def spin_wait_global_ge_i32(addr: Int64, target: Int32, *, loc=None, ip=None):
+    """Spin-wait until *addr >= target using acquire loads."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            Int32(target).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n"
+        ".reg .pred %p0;\n"
+        ".reg .s32 %val;\n"
+        "spin_loop_ge:\n"
+        "  ld.global.acquire.gpu.s32 %val, [$0];\n"
+        "  setp.lt.s32 %p0, %val, $1;\n"
+        "  @%p0 bra spin_loop_ge;\n"
         "}",
         "l,r",
         has_side_effects=True,

@@ -41,6 +41,10 @@ from b12x.attention.nsa_indexer.extend_kernel import (
     _PREFILL_BLOCK_Q,
 )
 from b12x.attention.nsa_indexer.tiled_topk import run_tiled_supertile_topk
+from b12x.attention.nsa_indexer.persistent_topk import (
+    run_persistent_topk2048,
+    supports_persistent_topk2048,
+)
 from b12x.integration.nsa_indexer import (
     NSAIndexerExtendLogitsMetadata,
     NSAIndexerPagedDecodeMetadata,
@@ -94,6 +98,7 @@ _MLA_STRATEGY_ENV = "B12X_MLA_PREFILL_STRATEGY"
 _MLA_FORCE_SINGLE_PASS_ENV = "B12X_MLA_FORCE_SINGLE_PASS"
 _MLA_FORCE_SPLIT_ENV = "B12X_MLA_FORCE_SPLIT"
 _NSA_PREFILL_BLOCK_K_ENV = "B12X_NSA_EXTEND_PREFILL_BLOCK_K"
+_NSA_DECODE_TOPK_BACKEND_ENV = "B12X_NSA_DECODE_TOPK_BACKEND"
 _MLA_SINGLE_PASS_TARGET_Q_ROWS = 2048
 _MLA_SINGLE_PASS_TARGET_TOPK = 2048
 
@@ -197,6 +202,7 @@ class CaseReport:
     num_chunks: int = 0
     indexer_logits_fill: bool = True
     indexer_tiled_topk: bool = False
+    indexer_topk_path: str = ""
     indexer_prefill_block_k: int | None = None
     mla_sanity: SanityMetrics = field(
         default_factory=lambda: SanityMetrics(max_abs=0.0, rmse=0.0, cos=1.0)
@@ -465,9 +471,32 @@ def _select_paged_topk_from_logits(
     topk: int,
     cu_seqlens_q: torch.Tensor | None = None,
     query_row_to_batch: torch.Tensor | None = None,
+    backend: str = "auto",
 ) -> torch.Tensor:
+    backend = backend.replace("_", "-")
+    if backend not in {"auto", "sgl", "torch", "cute-persistent"}:
+        raise ValueError(f"unsupported decode topk backend {backend!r}")
+
     if (
-        _sgl_fast_topk_transform_fused is not None
+        backend == "cute-persistent"
+        and query_row_to_batch is None
+        and supports_persistent_topk2048(
+            logits,
+            seqlens.reshape(-1),
+            topk=topk,
+            page_table_1=page_table_1,
+        )
+    ):
+        return run_persistent_topk2048(
+            logits,
+            seqlens.reshape(-1),
+            page_table_1=page_table_1,
+            max_seq_len=logits.shape[1],
+        )
+
+    if (
+        backend in {"auto", "sgl"}
+        and _sgl_fast_topk_transform_fused is not None
         and logits.is_cuda
         and topk == 2048
         and cu_seqlens_q is not None
@@ -481,7 +510,11 @@ def _select_paged_topk_from_logits(
                 topk=topk,
             )
         except Exception:
-            pass
+            if backend == "sgl":
+                raise
+
+    if backend == "sgl":
+        raise RuntimeError("SGL fused topk backend is unavailable for this decode topk call")
 
     rows = logits.shape[0]
     output = torch.full((rows, topk), -1, dtype=torch.int32, device=logits.device)
@@ -835,8 +868,8 @@ def _run_decode_case(
     graph_width: int,
     l2_flush,
     skip_indexer_logits_fill: bool,
+    decode_topk_backend: str,
 ) -> CaseReport:
-    del skip_indexer_logits_fill
     if pool_factor <= 0:
         raise ValueError(f"pool_factor must be positive, got {pool_factor}")
     graph_width = _resolve_graph_width(cache_len=case.cache_len, graph_width=graph_width)
@@ -902,6 +935,13 @@ def _run_decode_case(
     )
     graph_cache_seqlens = torch.empty_like(full_cache_seqlens)
     graph_nsa_cache_seqlens = torch.empty_like(nsa_cache_seqlens)
+    graph_active_width_override = None
+    if case.batch_size == 1 and case.q_len == 1 and case.cache_len == aligned_graph_width:
+        graph_active_width_override = torch.tensor(
+            [aligned_graph_width],
+            dtype=torch.int32,
+            device=device,
+        )
     use_graph_schedule_metadata = uses_paged_mqa_schedule_metadata(
         q_rows=case.batch_size,
         max_pages=graph_real_page_table.shape[1],
@@ -933,6 +973,12 @@ def _run_decode_case(
         cache_seqlens_int32=graph_cache_seqlens,
         paged_mqa_schedule_metadata=graph_schedule_metadata,
     )
+    preinitialize_indexer_logits = not (
+        skip_indexer_logits_fill
+        and case.batch_size == 1
+        and case.q_len == 1
+        and case.cache_len == aligned_graph_width
+    )
 
     def run_indexer():
         logits = sparse_nsa_index_decode_logits_paged(
@@ -941,12 +987,15 @@ def _run_decode_case(
             index_k_cache=index_k_cache,
             metadata=indexer_metadata,
             page_size=cfg.page_size,
+            preinitialize_invalid_logits=preinitialize_indexer_logits,
+            active_width_override=graph_active_width_override,
         )
         return _select_paged_topk_from_logits(
             logits=logits,
             page_table_1=graph_candidate_page_table,
             seqlens=graph_cache_seqlens,
             topk=case.topk,
+            backend=decode_topk_backend,
         )
 
     def run_indexer_logits():
@@ -956,6 +1005,8 @@ def _run_decode_case(
             index_k_cache=index_k_cache,
             metadata=indexer_metadata,
             page_size=cfg.page_size,
+            preinitialize_invalid_logits=preinitialize_indexer_logits,
+            active_width_override=graph_active_width_override,
         )
 
     clear_nsa_indexer_caches()
@@ -975,6 +1026,7 @@ def _run_decode_case(
         page_table_1=graph_candidate_page_table,
         seqlens=graph_cache_seqlens,
         topk=case.topk,
+        backend="torch",
     )
     torch.cuda.synchronize()
     _assert_decode_contract_match(
@@ -1021,29 +1073,32 @@ def _run_decode_case(
         )
 
     def run_step():
-            topk_indices = _select_paged_topk_from_logits(
-                logits=sparse_nsa_index_decode_logits_paged(
-                    q_fp8=q_fp8,
-                    weights=weights,
-                    index_k_cache=index_k_cache,
-                    metadata=indexer_metadata,
-                    page_size=cfg.page_size,
-                ),
-                page_table_1=graph_candidate_page_table,
-                seqlens=graph_cache_seqlens,
-                topk=case.topk,
-            )
-            return sparse_mla_decode_forward(
-                q_all=q_all,
+        topk_indices = _select_paged_topk_from_logits(
+            logits=sparse_nsa_index_decode_logits_paged(
+                q_fp8=q_fp8,
+                weights=weights,
+                index_k_cache=index_k_cache,
+                metadata=indexer_metadata,
+                page_size=cfg.page_size,
+                preinitialize_invalid_logits=preinitialize_indexer_logits,
+                active_width_override=graph_active_width_override,
+            ),
+            page_table_1=graph_candidate_page_table,
+            seqlens=graph_cache_seqlens,
+            topk=case.topk,
+            backend=decode_topk_backend,
+        )
+        return sparse_mla_decode_forward(
+            q_all=q_all,
             kv_cache=kv_cache,
-                metadata=MLASparseDecodeMetadata(
-                    page_table_1=topk_indices,
-                    cache_seqlens_int32=graph_cache_seqlens,
-                    nsa_cache_seqlens_int32=graph_nsa_cache_seqlens,
-                    max_seq_len_k=aligned_graph_width,
-                ),
-                workspace=mla_workspace,
-                sm_scale=cfg.sm_scale,
+            metadata=MLASparseDecodeMetadata(
+                page_table_1=topk_indices,
+                cache_seqlens_int32=graph_cache_seqlens,
+                nsa_cache_seqlens_int32=graph_nsa_cache_seqlens,
+                max_seq_len_k=aligned_graph_width,
+            ),
+            workspace=mla_workspace,
+            sm_scale=cfg.sm_scale,
             v_head_dim=cfg.kv_lora_rank,
         )
 
@@ -1103,6 +1158,7 @@ def _run_decode_case(
             page_table_1=graph_candidate_page_table,
             seqlens=graph_cache_seqlens,
             topk=case.topk,
+            backend=decode_topk_backend,
         )
 
     indexer_topk_stats = _capture_and_bench_cuda_graph(
@@ -1145,7 +1201,8 @@ def _run_decode_case(
         split_enabled=split_cfg is not None,
         chunk_size=0 if split_cfg is None else split_cfg.chunk_size,
         num_chunks=0 if split_cfg is None else split_cfg.num_chunks,
-        indexer_logits_fill=True,
+        indexer_logits_fill=preinitialize_indexer_logits,
+        indexer_topk_path=decode_topk_backend.replace("_", "-"),
         mla_sanity=mla_sanity,
     )
 
@@ -1770,6 +1827,7 @@ def _run_prefill_or_verify_case(
         num_chunks=0 if split_cfg is None else split_cfg.num_chunks,
         indexer_logits_fill=True if case.mode == "verify" else not skip_indexer_logits_fill,
         indexer_tiled_topk=_use_tiled_output if case.mode == "prefill" else False,
+        indexer_topk_path="tiled" if _use_tiled_output and case.mode == "prefill" else "scatter",
         indexer_prefill_block_k=indexer_prefill_block_k,
         mla_sanity=mla_sanity,
     )
@@ -1809,6 +1867,7 @@ def collect_case_reports(
                 graph_width=args.graph_width,
                 l2_flush=l2_flush,
                 skip_indexer_logits_fill=args.skip_indexer_logits_fill,
+                decode_topk_backend=args.decode_topk_backend,
             )
             if case.mode == "decode"
             else _run_prefill_or_verify_case(
@@ -1832,7 +1891,7 @@ def collect_case_reports(
 def _render_case_line(report: CaseReport) -> str:
     split_flag = "on" if report.split_enabled else "off"
     fill_flag = "fill" if report.indexer_logits_fill else "skipfill"
-    topk_path = "tiled" if report.indexer_tiled_topk else "scatter"
+    topk_path = report.indexer_topk_path or ("tiled" if report.indexer_tiled_topk else "scatter")
     if report.indexer_prefill_block_k is not None:
         idx_bk = str(report.indexer_prefill_block_k)
     else:
@@ -1932,6 +1991,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="prefill/verify chunk q lengths, default 16384",
     )
     parser.add_argument("--topk-cap", type=int, default=2048)
+    parser.add_argument(
+        "--decode-topk-backend",
+        choices=("auto", "sgl", "torch", "cute-persistent"),
+        default=os.getenv(_NSA_DECODE_TOPK_BACKEND_ENV, "auto").replace("_", "-"),
+        help=(
+            "decode topk selector backend; cute-persistent enables the experimental "
+            "large-N CuTe persistent TopK=2048 path"
+        ),
+    )
     parser.add_argument("--tp-size", type=int, default=DEFAULT_TP_SIZE)
     parser.add_argument("--tp-rank", type=int, default=DEFAULT_TP_RANK)
     parser.add_argument("--warmup", type=int, default=10)
