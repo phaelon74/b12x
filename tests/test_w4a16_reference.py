@@ -138,7 +138,7 @@ def test_w4a16_dynamic_geometry_uses_bf16_tile_contract() -> None:
 
     assert tile_n == 64
     assert gate_tile_cnt == 4
-    assert max_tasks == max_tiles * 2
+    assert max_tasks == max_tiles * 4
     assert tp_moe._dynamic_rows_padded_limit(
         4096,
         quant_mode="w4a16",

@@ -49,8 +49,8 @@ _NVFP4_BLOCK_SIZE = 16
 _RUNTIME_MEMREF_LIMIT = (1 << 31) - 1
 _LEVEL_TILE_M = 128
 _LEVEL_TILE_N = 128
-_W4A16_LEVEL_TILE_N = 64
-_DYNAMIC_SLICE_CHUNK = 2
+_W4A16_LEVEL_TILE_N = 32
+_DYNAMIC_SLICE_CHUNK = 1
 _MOE_FORCE_A16_ENV = "B12X_MOE_FORCE_A16"
 
 
@@ -2588,7 +2588,7 @@ def _get_dynamic_kernel(
             _LAST_KERNEL = (cache_key, cached)
             return cached
 
-    weight_dtype = cutlass.Float4E2M1FN
+    weight_dtype = cutlass.Uint8 if quant_mode == "w4a16" else cutlass.Float4E2M1FN
     a_scratch_dtype = cutlass.BFloat16 if quant_mode == "w4a16" else weight_dtype
     sf_dtype = cutlass.Float8E4M3FN
     a_dtype = cutlass.BFloat16
@@ -2647,12 +2647,14 @@ def _get_dynamic_kernel(
     task_valid_rows_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
     tile_write_count_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
     w1_n = activation_spec.w1_rows(n)
+    w1_fake_cols = k // 2 if quant_mode == "w4a16" else k
+    w2_fake_cols = n // 2 if quant_mode == "w4a16" else n
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
-        weight_dtype, (w1_n, k, E), stride_order=(1, 0, 2), assumed_align=16,
+        weight_dtype, (w1_n, w1_fake_cols, E), stride_order=(1, 0, 2), assumed_align=16,
     )
     sfb_w13_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     b_down_fake = cute.runtime.make_fake_compact_tensor(
-        weight_dtype, (k, n, E), stride_order=(1, 0, 2), assumed_align=16,
+        weight_dtype, (k, w2_fake_cols, E), stride_order=(1, 0, 2), assumed_align=16,
     )
     sfb_down_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     row_counts_fake = cute.runtime.make_fake_compact_tensor(
