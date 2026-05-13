@@ -19,6 +19,8 @@ from b12x.moe.fused.micro import (
     MoEMicroKernelBackend as _DirectMoEMicroKernelBackend,
 )
 
+_MAX_DIRECT_MICRO_TOKENS = 32
+
 
 class MoEMicroKernelBackend(_DirectMoEMicroKernelBackend):
     """Low-latency direct W4A16 path for micro routed batches."""
@@ -32,7 +34,7 @@ class MoEMicroKernelBackend(_DirectMoEMicroKernelBackend):
         num_topk: int,
         weight_E: int,
     ) -> bool:
-        if m not in (1, 2, 4, 8, 10, 12, 16, 24, 32):
+        if m <= 0 or m > _MAX_DIRECT_MICRO_TOKENS:
             return False
         if k <= 0 or k % 16 != 0 or k % 128 != 0:
             return False

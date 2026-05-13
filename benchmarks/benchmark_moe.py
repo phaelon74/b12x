@@ -35,6 +35,7 @@ from b12x.cute.utils import get_hardware_info
 
 
 LEGACY_BATCH_SIZES = [1, 2, 4, 8]
+NANO35_MTP_BATCH_SIZES = [1, 4, 9]
 # Observed in the live single-request sglang probe:
 # - prefill m=23 for the prompt itself
 # - larger prefill chunk m=80 during the same request path
@@ -49,6 +50,7 @@ CHUNKED_PREFILL_BATCH_SIZES = [8192, 16384, 24576, 32768]
 BATCH_SIZE_PROFILES = {
     "eager-prefill": EAGER_PREFILL_BATCH_SIZES,
     "micro": LEGACY_BATCH_SIZES,
+    "nano35-mtp": NANO35_MTP_BATCH_SIZES,
     "sglang-single-request": RECORDED_SGLANG_SINGLE_REQUEST_BATCH_SIZES,
     "chunked-prefill": CHUNKED_PREFILL_BATCH_SIZES,
 }
@@ -276,6 +278,16 @@ MODEL_PROFILES = {
         hf_repo_id="nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
     ),
     "nano35-w4a16": ModelProfile(
+        label="NVIDIA Nano3.5 BF16 NVFP4 W4A16",
+        checkpoint_family="nano35_w4a16",
+        default_layer_idx=1,
+        tp_size=1,
+        hf_repo_id="nvidia/Nano3.5-BF16-NVFP4-W4A16-LMHEAD-CT",
+        default_activation="relu2",
+        default_quant_mode="w4a16",
+        default_validate="oracle",
+    ),
+    "nano35-w4a16-shape": ModelProfile(
         label="NVIDIA Nano3.5 BF16 NVFP4 W4A16 (shape)",
         checkpoint_family="nano35_w4a16_shape",
         default_layer_idx=1,
@@ -439,6 +451,15 @@ def build_model_spec(model_path: pathlib.Path, profile: ModelProfile, *, tp_size
             hidden_size=cfg["hidden_size"],
             intermediate_size=cfg["intermediate_size"],
             num_experts=cfg["num_local_experts"],
+            top_k=cfg["num_experts_per_tok"],
+            tp_size=tp,
+            tp_rank=tp_rank,
+        )
+    if profile.checkpoint_family == "nano35_w4a16":
+        return ModelSpec(
+            hidden_size=cfg["hidden_size"],
+            intermediate_size=cfg["moe_intermediate_size"],
+            num_experts=cfg["n_routed_experts"],
             top_k=cfg["num_experts_per_tok"],
             tp_size=tp,
             tp_rank=tp_rank,
@@ -697,6 +718,72 @@ def load_expert_weights(
         g2_alphas = (w2_input_scale * down_gs).to(torch.float32)
         w13_input_scale_per_expert = up_is
         g1_alphas_per_expert = (up_is * up_gs).to(torch.float32)
+    elif checkpoint_family == "nano35_w4a16":
+        if activation != "relu2":
+            raise ValueError("Nano3.5 W4A16 benchmark expects relu2 experts")
+        assert cfg["n_routed_experts"] == spec.num_experts
+        assert cfg["moe_intermediate_size"] == spec.intermediate_size
+        assert cfg["hidden_size"] == spec.hidden_size
+
+        prefix = f"backbone.layers.{layer_idx}.mixer.experts"
+        up_w = torch.empty(E, I_tp, K // 2, dtype=torch.uint8, device=device)
+        down_w = torch.empty(E, K, I_tp // 2, dtype=torch.uint8, device=device)
+
+        up_sf = torch.empty(E, I_tp, K // 16, dtype=torch.float8_e4m3fn, device=device)
+        down_sf = torch.empty(E, K, I_tp // 16, dtype=torch.float8_e4m3fn, device=device)
+
+        up_weight_global_scale = torch.empty(E, dtype=torch.float32, device=device)
+        down_weight_global_scale = torch.empty(E, dtype=torch.float32, device=device)
+
+        print(f"  Loading {E} CT W4A16 experts...", end="", flush=True)
+        for eid in range(E):
+            ep = f"{prefix}.{eid}"
+            tp_off = spec.tp_rank * I_tp
+            tp_off_packed = spec.tp_rank * (I_tp // 2)
+            tp_sf_cols = I_tp // 16
+            tp_sf_off = spec.tp_rank * tp_sf_cols
+
+            up_w[eid] = loader.get_tensor(f"{ep}.up_proj.weight_packed").narrow(0, tp_off, I_tp).to(device)
+            up_sf[eid] = loader.get_tensor(f"{ep}.up_proj.weight_scale").narrow(0, tp_off, I_tp).to(device)
+            up_weight_global_scale[eid] = loader.get_tensor(f"{ep}.up_proj.weight_global_scale").to(device)
+
+            down_w[eid] = loader.get_tensor(f"{ep}.down_proj.weight_packed").narrow(1, tp_off_packed, I_tp // 2).to(device)
+            down_sf[eid] = loader.get_tensor(f"{ep}.down_proj.weight_scale").narrow(1, tp_sf_off, tp_sf_cols).to(device)
+            down_weight_global_scale[eid] = loader.get_tensor(f"{ep}.down_proj.weight_global_scale").to(device)
+        print(" done.")
+
+        # The compressed-tensors W4A16 checkpoint stores per-tensor global
+        # scales as the inverse convention of the B12X W4A16 path.  vLLM's
+        # FlashInfer B12X adapter folds 1 / weight_global_scale into the FP4
+        # block scales and then launches with unit alphas; mirror that here so
+        # the benchmark exercises the same real model layer.
+        up_sf = (
+            up_sf.float() * (1.0 / up_weight_global_scale).view(E, 1, 1)
+        ).to(torch.float8_e4m3fn).contiguous()
+        down_sf = (
+            down_sf.float() * (1.0 / down_weight_global_scale).view(E, 1, 1)
+        ).to(torch.float8_e4m3fn).contiguous()
+
+        w13_weight = up_w.contiguous()
+        w13_sf = up_sf
+        w13_blockscale_swizzled = swizzle_block_scale(w13_sf)
+        w2_weight = down_w.contiguous()
+        w2_blockscale_swizzled = swizzle_block_scale(down_sf)
+
+        w13_permuted = w13_weight.permute(1, 2, 0)
+        w13_scale = as_grouped_scale_view(w13_blockscale_swizzled.view(torch.uint8), I_tp, K)
+        down_permuted = w2_weight.permute(1, 2, 0)
+        down_scale = as_grouped_scale_view(w2_blockscale_swizzled.view(torch.uint8), K, I_tp)
+
+        ones = torch.ones(E, dtype=torch.float32, device=device)
+        w13_input_scale = torch.ones((), dtype=torch.float32, device=device)
+        w2_input_scale = torch.ones((), dtype=torch.float32, device=device)
+        w13_input_scale_per_expert = ones
+        down_is = ones
+        down_gs = ones
+        g1_alphas = ones
+        g2_alphas = ones
+        g1_alphas_per_expert = ones
     else:
         raise ValueError(f"unsupported checkpoint family {checkpoint_family!r}")
 

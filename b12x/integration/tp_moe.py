@@ -433,6 +433,7 @@ _EXACT_RELU2_BS1_NEMOTRON_CACHE: Dict[Tuple, _ExactRelu2Bs1NemotronLauncher] = {
 _LAST_EXACT_RELU2_BS1_NEMOTRON: Tuple = (None, None)  # (cache_key, launcher)
 _CURRENT_DISPATCH_STAGE: str | None = None
 _DIRECT_MICRO_SHAPE_ATTR = "_b12x_direct_micro_shape"
+_W4A16_DIRECT_MICRO_MAX_TOKENS = 32
 
 
 @contextmanager
@@ -958,7 +959,9 @@ def _plan_core_workspace(
             and k % 128 == 0
             and _direct_k_segments_supported(_direct_k_segments_for_k(k))
         )
-        direct_micro_token_supported = direct_micro_tokens in (1, 2, 4, 8, 10, 12, 16, 24, 32)
+        direct_micro_token_supported = (
+            0 < direct_micro_tokens <= _W4A16_DIRECT_MICRO_MAX_TOKENS
+        )
         direct_micro_resource_supported = not (direct_micro_tokens >= 4 and n >= 4096)
     else:
         direct_micro_k_supported = (

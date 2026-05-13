@@ -177,7 +177,7 @@ def test_w4a16_direct_micro_supports_static_decode_batches() -> None:
             weight_E=256,
         )
 
-    for batch_size in (1, 2, 4, 8, 10, 12, 16):
+    for batch_size in (1, 2, 4, 8, 9, 10, 12, 16):
         assert MoEMicroKernelBackend.is_supported(
             m=batch_size,
             k=2688,
@@ -220,6 +220,24 @@ def test_w4a16_direct_micro_supports_static_decode_batches() -> None:
         num_topk=10,
         weight_E=512,
     )
+
+    plan = tp_moe._plan_core_workspace(
+        "static",
+        "w4a16",
+        state_E=128,
+        weight_E=128,
+        k=2688,
+        n=1856,
+        num_topk=6,
+        device=torch.device("cuda"),
+        dtype=torch.bfloat16,
+        routed_rows=54,
+        max_rows=54,
+    )
+    barrier_spec = next(
+        spec for spec in plan.tensor_specs if spec.name == "barrier_count"
+    )
+    assert barrier_spec.shape == (198,)
 
 
 def test_nvfp4_direct_micro_supports_partial_512_k_groups() -> None:
