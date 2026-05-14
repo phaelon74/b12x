@@ -74,6 +74,7 @@ class MoEMicroKernelBackend(_DirectMoEMicroKernelBackend):
         share_expert_scales: bool = False,
         single_token: bool = False,
         dynamic_down_scale: bool = False,
+        compile_time_phase: int = 0,
     ):
         super().__init__(
             sf_vec_size,
@@ -85,6 +86,7 @@ class MoEMicroKernelBackend(_DirectMoEMicroKernelBackend):
             share_expert_scales=share_expert_scales,
             single_token=single_token,
             dynamic_down_scale=dynamic_down_scale,
+            compile_time_phase=compile_time_phase,
             w4a16_mode=True,
         )
 

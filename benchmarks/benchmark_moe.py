@@ -999,6 +999,18 @@ def get_quant_mode_params(
     raise ValueError(f"Unsupported quant mode: {quant_mode}")
 
 
+def uses_unit_scale_contract(
+    profile: ModelProfile,
+    quant_mode: str,
+    activation: str,
+) -> bool:
+    return (
+        quant_mode.lower() == "w4a16"
+        and activation == "relu2"
+        and profile.checkpoint_family in {"nano35_w4a16", "nano35_w4a16_shape"}
+    )
+
+
 def bench_flashinfer(
     weights: ExpertWeights,
     x: torch.Tensor,
@@ -1725,6 +1737,11 @@ def bench_e2e() -> None:
         checkpoint_family=model_profile.checkpoint_family,
     )
     params = get_quant_mode_params(weights, args.scale_contract, args.quant_mode)
+    unit_scale_contract = uses_unit_scale_contract(
+        model_profile,
+        args.quant_mode,
+        args.activation,
+    )
 
     from b12x.integration.tp_moe import (
         allocate_tp_moe_workspace,
@@ -1757,6 +1774,7 @@ def bench_e2e() -> None:
         fast_math=args.fast_math,
         activation=args.activation,
         quant_mode=args.quant_mode,
+        unit_scale_contract=unit_scale_contract,
     )
     torch.cuda.synchronize()
     print(" done.")
@@ -1786,6 +1804,7 @@ def bench_e2e() -> None:
                 rp.g2_alphas, rk_weights, rk_ids,
                 workspace=ws_r, fast_math=args.fast_math, activation=args.activation,
                 quant_mode=args.quant_mode,
+                unit_scale_contract=unit_scale_contract,
             )
         torch.cuda.synchronize()
         print(f" {spec.tp_size} ranks done.")
@@ -1828,6 +1847,7 @@ def bench_e2e() -> None:
                     output=backend_output,
                     activation=args.activation,
                     quant_mode=args.quant_mode,
+                    unit_scale_contract=unit_scale_contract,
                 )
 
             def impl_e2e() -> torch.Tensor:

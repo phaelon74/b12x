@@ -364,10 +364,13 @@ class MoEMicroKernelBackend:
         share_expert_scales: bool = False,
         single_token: bool = False,
         dynamic_down_scale: bool = False,
+        compile_time_phase: int = 0,
         w4a16_mode: bool = False,
     ):
         if activation not in {"silu", "relu2"}:
             raise ValueError(f"unsupported activation {activation!r}")
+        if int(compile_time_phase) not in {0, 1}:
+            raise ValueError(f"unsupported direct micro phase {compile_time_phase!r}")
         self.sf_vec_size = sf_vec_size
         self.fast_math = fast_math
         self.activation = activation
@@ -376,6 +379,7 @@ class MoEMicroKernelBackend:
         self.share_expert_scales = share_expert_scales
         self.single_token = single_token
         self.dynamic_down_scale = dynamic_down_scale
+        self.compile_time_phase = int(compile_time_phase)
         self.w4a16_mode = w4a16_mode
         self._cfg = None
         self.m_const = 0
@@ -1896,6 +1900,9 @@ class MoEMicroKernelBackend:
                 if need_quant_next > Int32(0):
                     buf_idx = Int32(1) - buf_idx
             fc1_task += Int32(gdim_x)
+
+        if cutlass.const_expr(self.compile_time_phase == 1):
+            return
 
         if cutlass.const_expr(self.m_const == 1):
             _token_publish_fc1_ready(
