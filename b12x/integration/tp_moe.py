@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from typing import Dict, Tuple
 
@@ -15,9 +15,13 @@ import torch.nn.functional as F
 from torch.profiler import record_function
 
 from b12x.cute.fp4 import align_up, as_grouped_scale_view
-from b12x.cute.utils import current_cuda_stream, get_max_active_clusters, get_num_sm, make_ptr
+from b12x.cute.utils import (
+    current_cuda_stream,
+    get_max_active_clusters,
+    get_num_sm,
+    make_ptr,
+)
 from cutlass.cutlass_dsl import Int32
-from b12x.integration.triton_compact import compact_topk_ids as triton_compact_topk_ids
 from b12x.integration.triton_route import route_topk as triton_route_topk
 from b12x.moe.fused.relu2 import (
     MoEDynamicKernelRelu2,
@@ -54,6 +58,7 @@ _FP4_SOURCE_FORMATS = {
 @dataclass(kw_only=True)
 class TPMoEWorkspace:
     """Reusable scratch buffers for one `b12x_moe_fp4` shape family."""
+
     implementation: str
     quant_mode: str
     state_E: int
@@ -115,6 +120,32 @@ class TPDynamicWorkspace(TPMoEWorkspace):
     down_input_scale_src_ptr: int = 0
 
 
+@dataclass(kw_only=True)
+class TPW4A16Workspace:
+    implementation: str
+    quant_mode: str
+    activation: str
+    state_E: int
+    weight_E: int
+    max_rows: int
+    k: int
+    n: int
+    num_topk: int
+    device: torch.device
+    dtype: torch.dtype
+    routed_rows_capacity: int
+    intermediate_cache13: torch.Tensor
+    intermediate_cache2: torch.Tensor
+    fc1_c_tmp: torch.Tensor
+    fc2_c_tmp: torch.Tensor
+    packed_route_indices: torch.Tensor
+    block_expert_ids: torch.Tensor
+    packed_route_count: torch.Tensor
+    expert_offsets: torch.Tensor
+    route_workspace: "_TPRouteWorkspace | None" = None
+    volatile_launch_state: bool = False
+
+
 @dataclass
 class TPMoEWorkspacePool:
     """Caller-owned capacity-based workspace cache for one execution lane.
@@ -124,7 +155,7 @@ class TPMoEWorkspacePool:
     the lane pool and therefore the same scratch arena.
     """
 
-    workspaces: Dict[Tuple, TPMoEWorkspace] = field(default_factory=dict)
+    workspaces: Dict[Tuple, object] = field(default_factory=dict)
     route_workspaces: Dict[Tuple, "_TPRouteWorkspace"] = field(default_factory=dict)
     core_arenas: Dict[Tuple, "_TPCoreArena"] = field(default_factory=dict)
     shared_arena: torch.Tensor | None = None
@@ -148,7 +179,9 @@ class TPMoEWorkspacePool:
         frozen: bool = True,
     ) -> None:
         if shared_arena.dtype != torch.uint8:
-            raise TypeError(f"shared_arena must have dtype torch.uint8, got {shared_arena.dtype}")
+            raise TypeError(
+                f"shared_arena must have dtype torch.uint8, got {shared_arena.dtype}"
+            )
         route_workspace_nbytes = align_up(max(int(route_workspace_nbytes), 0), 16)
         core_workspace_nbytes = max(int(core_workspace_nbytes), 0)
         required = route_workspace_nbytes + core_workspace_nbytes
@@ -218,6 +251,7 @@ class _TensorAllocSpec:
 class _TPCoreWorkspacePlan:
     implementation: str
     quant_mode: str
+    activation: str
     state_E: int
     weight_E: int
     routed_rows: int
@@ -253,6 +287,7 @@ class TPMoEPlan:
 
     implementation: str
     quant_mode: str
+    activation: str
     state_E: int
     weight_E: int
     routed_rows: int
@@ -276,12 +311,13 @@ class _TPMoEWorkspacePolicy:
 @dataclass
 class _WeightViews:
     """Cached weight views for the concatenated expert-weight layout."""
-    w13: torch.Tensor        # [2*n, k//2, E] uint8 (permuted view, no copy)
-    down: torch.Tensor       # [k, n//2, E] uint8 (permuted view, no copy)
-    w13_sf: torch.Tensor     # 6D MMA view for concatenated w13 scale factors
-    down_sf: torch.Tensor    # [E, down_sf_rows, sf_cols] uint8 (view)
-    w1_alpha: torch.Tensor   # [E] float32 contiguous tensor in plain CUDA storage
-    w2_alpha: torch.Tensor   # [E] float32 contiguous tensor in plain CUDA storage
+
+    w13: torch.Tensor  # [2*n, k//2, E] uint8 (permuted view, no copy)
+    down: torch.Tensor  # [k, n//2, E] uint8 (permuted view, no copy)
+    w13_sf: torch.Tensor  # 6D MMA view for concatenated w13 scale factors
+    down_sf: torch.Tensor  # [E, down_sf_rows, sf_cols] uint8 (view)
+    w1_alpha: torch.Tensor  # [E] float32 contiguous tensor in plain CUDA storage
+    w2_alpha: torch.Tensor  # [E] float32 contiguous tensor in plain CUDA storage
     w1_storage: torch.Tensor  # original [E, w1_n, k//2] tensor for direct micro
     w1_scale_storage: torch.Tensor
     w2_storage: torch.Tensor  # original [E, k, n//2] tensor for direct micro
@@ -319,7 +355,7 @@ class _ActivationKernelSpec:
 
     def make_static_kernel(self, *, num_topk: int, **kernel_kwargs):
         if self.is_gated:
-            kernel_kwargs["exact_mma_m_tiles"] = (num_topk == 1)
+            kernel_kwargs["exact_mma_m_tiles"] = num_topk == 1
         return self.static_kernel_cls(**kernel_kwargs)
 
     def make_dynamic_kernel(self, **kernel_kwargs):
@@ -374,7 +410,9 @@ def _normalize_fp4_source_format(source_format: str) -> str:
         ) from exc
 
 
-def _validate_fp4_source_format_for_quant_mode(*, source_format: str, quant_mode: str) -> None:
+def _validate_fp4_source_format_for_quant_mode(
+    *, source_format: str, quant_mode: str
+) -> None:
     if source_format == "compressed_tensors" and quant_mode != "w4a16":
         raise ValueError(
             "source_format='compressed_tensors' is only supported with "
@@ -383,7 +421,9 @@ def _validate_fp4_source_format_for_quant_mode(*, source_format: str, quant_mode
         )
 
 
-def _assert_reciprocal_input_scale_contract(input_scales_are_reciprocal: bool | None) -> None:
+def _assert_reciprocal_input_scale_contract(
+    input_scales_are_reciprocal: bool | None,
+) -> None:
     assert input_scales_are_reciprocal is None or input_scales_are_reciprocal is True, (
         "input_scales_are_reciprocal is deprecated; b12x always expects reciprocal input scales"
     )
@@ -426,7 +466,10 @@ _MICRO_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 _STATIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 _DYNAMIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 _MAC_CACHE: Dict[Tuple[int, str], int] = {}  # (device_idx, impl) → max_active_clusters
-_PLAIN_PARAM_CACHE: Dict[Tuple[int, Tuple[int, ...], Tuple[int, ...], torch.dtype, torch.dtype, int], torch.Tensor] = {}
+_PLAIN_PARAM_CACHE: Dict[
+    Tuple[int, Tuple[int, ...], Tuple[int, ...], torch.dtype, torch.dtype, int],
+    torch.Tensor,
+] = {}
 _W4A16_ALPHA_CACHE: Dict[Tuple, torch.Tensor] = {}
 _MICRO_COMPACT_CUTOVER_PAIRS_DEFAULT = 20
 _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK_DEFAULT = 80
@@ -551,7 +594,9 @@ def _dynamic_multicta_enabled() -> bool:
 def _dynamic_down_scale_enabled() -> bool:
     global _DYNAMIC_DOWN_SCALE_CACHE
     if _DYNAMIC_DOWN_SCALE_CACHE is None:
-        _DYNAMIC_DOWN_SCALE_CACHE = _env_flag("B12X_ENABLE_DYNAMIC_DOWN_SCALE", default=False)
+        _DYNAMIC_DOWN_SCALE_CACHE = _env_flag(
+            "B12X_ENABLE_DYNAMIC_DOWN_SCALE", default=False
+        )
     return _DYNAMIC_DOWN_SCALE_CACHE
 
 
@@ -598,13 +643,19 @@ def _prepare_expert_scale(scale: torch.Tensor, weight_E: int) -> torch.Tensor:
     with record_function("tp_moe.prepare_expert_scale"):
         if scale.numel() == 1:
             with record_function("tp_moe.prepare_expert_scale.expand_scalar"):
-                return _get_plain_cuda_tensor(scale.expand(weight_E), dtype=torch.float32)
+                return _get_plain_cuda_tensor(
+                    scale.expand(weight_E), dtype=torch.float32
+                )
         if scale.numel() != weight_E:
-            raise ValueError(f"expected expert scale with {weight_E} elements, got {scale.numel()}")
+            raise ValueError(
+                f"expected expert scale with {weight_E} elements, got {scale.numel()}"
+            )
         return _get_plain_cuda_tensor(scale, dtype=torch.float32)
 
 
-def _get_plain_cuda_tensor(t: torch.Tensor, *, dtype: torch.dtype | None = None) -> torch.Tensor:
+def _get_plain_cuda_tensor(
+    t: torch.Tensor, *, dtype: torch.dtype | None = None
+) -> torch.Tensor:
     with record_function("tp_moe.get_plain_cuda_tensor"):
         target_dtype = t.dtype if dtype is None else dtype
         key = (
@@ -625,7 +676,9 @@ def _get_plain_cuda_tensor(t: torch.Tensor, *, dtype: torch.dtype | None = None)
         return plain
 
 
-def _tensor_cache_key(t: torch.Tensor) -> Tuple[int, Tuple[int, ...], Tuple[int, ...], torch.dtype, int]:
+def _tensor_cache_key(
+    t: torch.Tensor,
+) -> Tuple[int, Tuple[int, ...], Tuple[int, ...], torch.dtype, int]:
     return (
         t.data_ptr(),
         tuple(t.shape),
@@ -743,7 +796,9 @@ def _dynamic_token_chunk_limit(
     legacy_env = os.environ.get("B12X_DYNAMIC_CHUNK_MULTIPLIER")
     if legacy_env is None:
         return compact_limit
-    legacy_limit = _safe_token_chunk(E, k, n, num_topk) * _get_dynamic_chunk_multiplier()
+    legacy_limit = (
+        _safe_token_chunk(E, k, n, num_topk) * _get_dynamic_chunk_multiplier()
+    )
     return min(compact_limit, legacy_limit)
 
 
@@ -792,12 +847,14 @@ def _eager_dynamic_token_chunk_limit(
     legacy_env = os.environ.get("B12X_DYNAMIC_CHUNK_MULTIPLIER")
     if legacy_env is None:
         return exact_limit
-    legacy_limit = _safe_token_chunk(weight_E, k, n, num_topk) * _get_dynamic_chunk_multiplier()
+    legacy_limit = (
+        _safe_token_chunk(weight_E, k, n, num_topk) * _get_dynamic_chunk_multiplier()
+    )
     return min(exact_limit, legacy_limit)
 
 
 def _workspace_policy(
-    workspace: TPMoEWorkspace | TPMoEWorkspacePool,
+    workspace: TPMoEWorkspace | TPW4A16Workspace | TPMoEWorkspacePool,
 ) -> _TPMoEWorkspacePolicy:
     is_pool = isinstance(workspace, TPMoEWorkspacePool)
     return _TPMoEWorkspacePolicy(
@@ -833,7 +890,9 @@ def _dynamic_task_geometry(
     active_expert_upper_bound = min(E, routed_rows)
     max_m_tiles = max(1, base_m_tiles + active_expert_upper_bound - 1)
     gate_tile_cnt = max(1, (n + tile_n - 1) // tile_n)
-    slice_groups = max(1, (gate_tile_cnt + _DYNAMIC_SLICE_CHUNK - 1) // _DYNAMIC_SLICE_CHUNK)
+    slice_groups = max(
+        1, (gate_tile_cnt + _DYNAMIC_SLICE_CHUNK - 1) // _DYNAMIC_SLICE_CHUNK
+    )
     max_tasks = max_m_tiles * slice_groups
     return max_m_tiles, gate_tile_cnt, max_tasks
 
@@ -853,7 +912,9 @@ def _dynamic_task_geometry_from_routing(
     tiles_per_expert = (counts + (tile_m - 1)) // tile_m
     exact_tiles = max(1, int(tiles_per_expert.sum().item()))
     gate_tile_cnt = max(1, (n + tile_n - 1) // tile_n)
-    slice_groups = max(1, (gate_tile_cnt + _DYNAMIC_SLICE_CHUNK - 1) // _DYNAMIC_SLICE_CHUNK)
+    slice_groups = max(
+        1, (gate_tile_cnt + _DYNAMIC_SLICE_CHUNK - 1) // _DYNAMIC_SLICE_CHUNK
+    )
     max_tasks = exact_tiles * slice_groups
     return exact_tiles, gate_tile_cnt, max_tasks
 
@@ -935,10 +996,90 @@ def _plan_core_workspace(
     *,
     routed_rows: int,
     max_rows: int,
+    activation: str = "silu",
     dynamic_physical_tiles: int | None = None,
     dynamic_task_capacity: int | None = None,
 ) -> _TPCoreWorkspacePlan:
     quant_mode = _normalize_quant_mode(quant_mode)
+    activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
+    if implementation == "w4a16":
+        from b12x.moe.fused.w4a16.host import (
+            _W4A16_ALLOWED_ROUTED_SIZES,
+            max_packed_route_slots,
+            packed_gemm_scratch_elements,
+        )
+
+        routed_capacity = max(int(routed_rows), 1)
+        fc1_cols = activation_spec.w1_rows(int(n))
+        route_slots_capacity = 1
+        route_blocks_capacity = 1
+        fc1_c_tmp_elements = 1
+        fc2_c_tmp_elements = 1
+        sms = max(1, int(get_num_sm(device)))
+        for block_size in _W4A16_ALLOWED_ROUTED_SIZES:
+            route_slots = max_packed_route_slots(
+                routed_capacity,
+                int(block_size),
+                int(weight_E),
+            )
+            route_blocks = (route_slots + int(block_size) - 1) // int(block_size)
+            route_slots_capacity = max(route_slots_capacity, route_slots)
+            route_blocks_capacity = max(route_blocks_capacity, route_blocks)
+            fc1_c_tmp_elements = max(
+                fc1_c_tmp_elements,
+                packed_gemm_scratch_elements(
+                    size_n=fc1_cols,
+                    route_slots=route_slots,
+                    moe_block_size=int(block_size),
+                    sms=sms,
+                ),
+            )
+            fc2_c_tmp_elements = max(
+                fc2_c_tmp_elements,
+                packed_gemm_scratch_elements(
+                    size_n=int(k),
+                    route_slots=route_slots,
+                    moe_block_size=int(block_size),
+                    sms=sms,
+                ),
+            )
+        return _TPCoreWorkspacePlan(
+            implementation=implementation,
+            quant_mode=quant_mode,
+            activation=activation_spec.activation,
+            state_E=state_E,
+            weight_E=weight_E,
+            routed_rows=routed_capacity,
+            max_rows=max(max_rows, routed_capacity),
+            k=k,
+            n=n,
+            num_topk=num_topk,
+            device=device,
+            dtype=dtype,
+            tensor_specs=(
+                _TensorAllocSpec(
+                    "intermediate_cache13",
+                    (routed_capacity * max(fc1_cols, int(k)),),
+                    dtype,
+                ),
+                _TensorAllocSpec(
+                    "intermediate_cache2",
+                    (routed_capacity, int(n)),
+                    dtype,
+                ),
+                _TensorAllocSpec("fc1_c_tmp", (fc1_c_tmp_elements,), torch.float32),
+                _TensorAllocSpec("fc2_c_tmp", (fc2_c_tmp_elements,), torch.float32),
+                _TensorAllocSpec(
+                    "packed_route_indices", (route_slots_capacity,), torch.int32
+                ),
+                _TensorAllocSpec(
+                    "block_expert_ids", (route_blocks_capacity,), torch.int32
+                ),
+                _TensorAllocSpec("packed_route_count", (1,), torch.int32),
+                _TensorAllocSpec("expert_offsets", (int(weight_E) + 1,), torch.int32),
+            ),
+        )
+
     cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
     direct_micro_tokens = max(1, routed_rows // max(1, num_topk))
     direct_micro_k_supported = (
@@ -974,11 +1115,13 @@ def _plan_core_workspace(
             fc2_n_chunks = (n // 2 + 127) // 128
             micro_intermediate_elements = max(
                 micro_intermediate_elements,
-                direct_micro_tokens * num_topk * k + direct_micro_tokens * num_topk * fc2_n_chunks * 128,
+                direct_micro_tokens * num_topk * k
+                + direct_micro_tokens * num_topk * fc2_n_chunks * 128,
             )
         return _TPCoreWorkspacePlan(
             implementation=implementation,
             quant_mode=quant_mode,
+            activation=activation_spec.activation,
             state_E=state_E,
             weight_E=weight_E,
             routed_rows=routed_rows,
@@ -990,19 +1133,34 @@ def _plan_core_workspace(
             dtype=dtype,
             tensor_specs=common_specs
             + (
-                _TensorAllocSpec("token_map", (state_E, max_rows), torch.int32, init="zeros"),
-                _TensorAllocSpec("token_weights", (state_E, max_rows), torch.float32, init="zeros"),
-                _TensorAllocSpec("packed_input", packed_input_shape, packed_input_dtype),
+                _TensorAllocSpec(
+                    "token_map", (state_E, max_rows), torch.int32, init="zeros"
+                ),
+                _TensorAllocSpec(
+                    "token_weights", (state_E, max_rows), torch.float32, init="zeros"
+                ),
+                _TensorAllocSpec(
+                    "packed_input", packed_input_shape, packed_input_dtype
+                ),
                 _TensorAllocSpec(
                     "packed_input_scale",
                     (state_E, static_rows_pad_k, cols_pad_k),
                     torch.uint8,
                 ),
-                _TensorAllocSpec("active_expert_count", (1,), torch.int32, init="zeros"),
-                _TensorAllocSpec("weight_expert_ids", (state_E,), torch.int32, init="arange"),
+                _TensorAllocSpec(
+                    "active_expert_count", (1,), torch.int32, init="zeros"
+                ),
+                _TensorAllocSpec(
+                    "weight_expert_ids", (state_E,), torch.int32, init="arange"
+                ),
                 _TensorAllocSpec("global_to_local_expert", (weight_E,), torch.int32),
                 _TensorAllocSpec("compact_topk_ids", (state_E,), torch.int32),
-                _TensorAllocSpec("micro_intermediate", (micro_intermediate_elements,), torch.float32, init="zeros"),
+                _TensorAllocSpec(
+                    "micro_intermediate",
+                    (micro_intermediate_elements,),
+                    torch.float32,
+                    init="zeros",
+                ),
             ),
         )
 
@@ -1025,6 +1183,7 @@ def _plan_core_workspace(
     return _TPCoreWorkspacePlan(
         implementation=implementation,
         quant_mode=quant_mode,
+        activation=activation_spec.activation,
         state_E=state_E,
         weight_E=weight_E,
         routed_rows=routed_rows,
@@ -1038,12 +1197,22 @@ def _plan_core_workspace(
         dynamic_task_capacity=dynamic_max_tasks,
         tensor_specs=common_specs
         + (
-            _TensorAllocSpec("token_map", (dynamic_rows_padded,), torch.int32, init="zeros"),
-            _TensorAllocSpec("token_weights", (dynamic_rows_padded,), torch.float32, init="zeros"),
+            _TensorAllocSpec(
+                "token_map", (dynamic_rows_padded,), torch.int32, init="zeros"
+            ),
+            _TensorAllocSpec(
+                "token_weights", (dynamic_rows_padded,), torch.float32, init="zeros"
+            ),
             _TensorAllocSpec("packed_input", packed_input_shape, packed_input_dtype),
-            _TensorAllocSpec("packed_input_scale", (dynamic_rows_padded, cols_pad_k), torch.uint8),
-            _TensorAllocSpec("expert_write_rows", (state_E,), torch.int32, init="zeros"),
-            _TensorAllocSpec("expert_tile_base", (state_E + 1,), torch.int32, init="zeros"),
+            _TensorAllocSpec(
+                "packed_input_scale", (dynamic_rows_padded, cols_pad_k), torch.uint8
+            ),
+            _TensorAllocSpec(
+                "expert_write_rows", (state_E,), torch.int32, init="zeros"
+            ),
+            _TensorAllocSpec(
+                "expert_tile_base", (state_E + 1,), torch.int32, init="zeros"
+            ),
             _TensorAllocSpec("input_gs", (weight_E,), torch.float32),
             _TensorAllocSpec("down_input_scale", (weight_E,), torch.float32),
             _TensorAllocSpec("pair_head", (1,), torch.int32, init="zeros"),
@@ -1051,13 +1220,27 @@ def _plan_core_workspace(
             _TensorAllocSpec("all_work_published", (1,), torch.int32, init="zeros"),
             _TensorAllocSpec("task_head", (1,), torch.int32, init="zeros"),
             _TensorAllocSpec("task_tail", (1,), torch.int32, init="zeros"),
-            _TensorAllocSpec("task_ready", (dynamic_max_tasks,), torch.int32, init="zeros"),
-            _TensorAllocSpec("task_expert", (dynamic_max_tasks,), torch.int32, init="zeros"),
-            _TensorAllocSpec("task_m_tile", (dynamic_max_tasks,), torch.int32, init="zeros"),
-            _TensorAllocSpec("task_slice_begin", (dynamic_max_tasks,), torch.int32, init="zeros"),
-            _TensorAllocSpec("task_slice_count", (dynamic_max_tasks,), torch.int32, init="zeros"),
-            _TensorAllocSpec("task_valid_rows", (dynamic_max_tasks,), torch.int32, init="zeros"),
-            _TensorAllocSpec("tile_write_count", (dynamic_tiles,), torch.int32, init="zeros"),
+            _TensorAllocSpec(
+                "task_ready", (dynamic_max_tasks,), torch.int32, init="zeros"
+            ),
+            _TensorAllocSpec(
+                "task_expert", (dynamic_max_tasks,), torch.int32, init="zeros"
+            ),
+            _TensorAllocSpec(
+                "task_m_tile", (dynamic_max_tasks,), torch.int32, init="zeros"
+            ),
+            _TensorAllocSpec(
+                "task_slice_begin", (dynamic_max_tasks,), torch.int32, init="zeros"
+            ),
+            _TensorAllocSpec(
+                "task_slice_count", (dynamic_max_tasks,), torch.int32, init="zeros"
+            ),
+            _TensorAllocSpec(
+                "task_valid_rows", (dynamic_max_tasks,), torch.int32, init="zeros"
+            ),
+            _TensorAllocSpec(
+                "tile_write_count", (dynamic_tiles,), torch.int32, init="zeros"
+            ),
         ),
     )
 
@@ -1079,7 +1262,9 @@ def _allocate_arena_tensor(
         tensor.zero_()
     elif spec.init == "arange":
         tensor.copy_(
-            torch.arange(tensor.numel(), dtype=tensor.dtype, device=tensor.device).view(spec.shape)
+            torch.arange(tensor.numel(), dtype=tensor.dtype, device=tensor.device).view(
+                spec.shape
+            )
         )
     elif spec.init != "empty":
         raise ValueError(f"unsupported tensor init mode {spec.init!r}")
@@ -1156,8 +1341,33 @@ def _materialize_workspace_from_core_arena(
     a2_gscale: torch.Tensor,
     input_scales_static: bool,
     volatile_launch_state: bool = False,
-) -> TPMoEWorkspace:
+) -> TPMoEWorkspace | TPW4A16Workspace:
     tensors = arena.tensors
+    if plan.implementation == "w4a16":
+        return TPW4A16Workspace(
+            implementation=plan.implementation,
+            quant_mode=plan.quant_mode,
+            activation=plan.activation,
+            state_E=plan.state_E,
+            weight_E=plan.weight_E,
+            max_rows=plan.max_rows,
+            k=plan.k,
+            n=plan.n,
+            num_topk=plan.num_topk,
+            device=plan.device,
+            dtype=plan.dtype,
+            routed_rows_capacity=plan.routed_rows,
+            intermediate_cache13=tensors["intermediate_cache13"],
+            intermediate_cache2=tensors["intermediate_cache2"],
+            fc1_c_tmp=tensors["fc1_c_tmp"],
+            fc2_c_tmp=tensors["fc2_c_tmp"],
+            packed_route_indices=tensors["packed_route_indices"],
+            block_expert_ids=tensors["block_expert_ids"],
+            packed_route_count=tensors["packed_route_count"],
+            expert_offsets=tensors["expert_offsets"],
+            volatile_launch_state=bool(volatile_launch_state),
+        )
+
     common_kwargs = dict(
         implementation=plan.implementation,
         quant_mode=plan.quant_mode,
@@ -1246,11 +1456,12 @@ def _alloc_workspace(
     routed_rows: int,
     max_rows: int,
     input_scales_static: bool,
+    activation: str = "silu",
     dynamic_physical_tiles: int | None = None,
     dynamic_task_capacity: int | None = None,
     pool: TPMoEWorkspacePool | None = None,
     storage_key: tuple | None = None,
-) -> TPMoEWorkspace:
+) -> TPMoEWorkspace | TPW4A16Workspace:
     plan = _plan_core_workspace(
         implementation,
         quant_mode,
@@ -1263,12 +1474,15 @@ def _alloc_workspace(
         dtype,
         routed_rows=routed_rows,
         max_rows=max_rows,
+        activation=activation,
         dynamic_physical_tiles=dynamic_physical_tiles,
         dynamic_task_capacity=dynamic_task_capacity,
     )
     if pool is not None:
         if storage_key is None:
-            raise ValueError("storage_key is required when allocating from a workspace pool")
+            raise ValueError(
+                "storage_key is required when allocating from a workspace pool"
+            )
         arena = pool.core_arenas.get(storage_key)
         if arena is None or arena.plan != plan:
             if pool.shared_arena is None:
@@ -1339,8 +1553,8 @@ def _get_weight_views(
         return cached
 
     # Permute [E, w1_n, k//2] → [w1_n, k//2, E] (view, no copy!)
-    w13 = w1_fp4.permute(1, 2, 0)     # [w1_n, k//2, E]
-    down = w2_fp4.permute(1, 2, 0)    # [k, n//2, E]
+    w13 = w1_fp4.permute(1, 2, 0)  # [w1_n, k//2, E]
+    down = w2_fp4.permute(1, 2, 0)  # [k, n//2, E]
 
     # Compact contiguous scale storage for the FC1 weights.
     w1_n = activation_spec.w1_rows(n)
@@ -1350,8 +1564,10 @@ def _get_weight_views(
 
     sf_dtype = cutlass.Float8E4M3FN
     views = _WeightViews(
-        w13=w13, down=down,
-        w13_sf=w13_sf, down_sf=down_sf,
+        w13=w13,
+        down=down,
+        w13_sf=w13_sf,
+        down_sf=down_sf,
         w1_alpha=_get_plain_cuda_tensor(w1_alphas),
         w2_alpha=_get_plain_cuda_tensor(w2_alphas),
         w1_storage=w1_fp4,
@@ -1365,8 +1581,12 @@ def _get_weight_views(
     # dtype, not from the torch tensor dtype.
     views.w13_fp4 = w13.view(torch.uint8)
     views.down_fp4 = down.view(torch.uint8)
-    views.sfb_w13_ptr = make_ptr(sf_dtype, w13_sf.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
-    views.sfb_down_ptr = make_ptr(sf_dtype, down_sf.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+    views.sfb_w13_ptr = make_ptr(
+        sf_dtype, w13_sf.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+    )
+    views.sfb_down_ptr = make_ptr(
+        sf_dtype, down_sf.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+    )
     _WEIGHT_CACHE[key] = views
     _LAST_WEIGHTS = (key, views)
     return views
@@ -1424,6 +1644,8 @@ def _resolve_workspace_layout(
     quant_mode: str = "nvfp4",
 ) -> tuple[str, int, int]:
     routed_rows = num_tokens * num_topk
+    if _normalize_quant_mode(quant_mode) == "w4a16":
+        return "w4a16", weight_E, max(1, routed_rows)
     implementation = select_tp_moe_backend(
         num_tokens=num_tokens,
         num_topk=num_topk,
@@ -1444,10 +1666,14 @@ def _make_workspace_plan(
     device: torch.device,
     dtype: torch.dtype,
     quant_mode: str = "nvfp4",
+    activation: str = "silu",
     topk_ids: torch.Tensor | None = None,
     eager_exact_dynamic: bool = False,
 ) -> TPMoEPlan:
     quant_mode = _normalize_quant_mode(quant_mode)
+    activation = _get_activation_kernel_spec(
+        activation, quant_mode=quant_mode
+    ).activation
     routed_rows = num_tokens * num_topk
     implementation, state_E, max_rows = _resolve_workspace_layout(
         num_tokens=num_tokens,
@@ -1464,12 +1690,14 @@ def _make_workspace_plan(
         if eager_exact_dynamic:
             if topk_ids is None:
                 raise ValueError("routing-aware dynamic planning requires topk_ids")
-            dynamic_physical_tiles, _, dynamic_task_capacity = _dynamic_task_geometry_from_routing(
-                topk_ids,
-                weight_E=weight_E,
-                n=n,
-                tile_m=dynamic_tile_m,
-                tile_n=dynamic_tile_n,
+            dynamic_physical_tiles, _, dynamic_task_capacity = (
+                _dynamic_task_geometry_from_routing(
+                    topk_ids,
+                    weight_E=weight_E,
+                    n=n,
+                    tile_m=dynamic_tile_m,
+                    tile_n=dynamic_tile_n,
+                )
             )
             max_tokens_per_launch = _eager_dynamic_token_chunk_limit(
                 topk_ids,
@@ -1497,6 +1725,7 @@ def _make_workspace_plan(
     return TPMoEPlan(
         implementation=implementation,
         quant_mode=quant_mode,
+        activation=activation,
         state_E=state_E,
         weight_E=weight_E,
         routed_rows=routed_rows,
@@ -1523,6 +1752,7 @@ def _make_exact_relu2_bs1_nemotron_plan(
     return TPMoEPlan(
         implementation="static",
         quant_mode="nvfp4",
+        activation="relu2",
         state_E=total_pairs,
         weight_E=512,
         routed_rows=total_pairs,
@@ -1537,10 +1767,16 @@ def _make_exact_relu2_bs1_nemotron_plan(
 
 
 def _validate_workspace(
-    workspace: TPMoEWorkspace,
+    workspace: object,
     *,
     plan: TPMoEPlan,
 ) -> None:
+    def _canonical_device(device: torch.device) -> torch.device:
+        device = torch.device(device)
+        if device.type == "cuda" and device.index is None:
+            return torch.device("cuda", torch.cuda.current_device())
+        return device
+
     expected = (
         plan.implementation,
         plan.quant_mode,
@@ -1548,7 +1784,7 @@ def _validate_workspace(
         plan.k,
         plan.n,
         plan.num_topk,
-        plan.device,
+        _canonical_device(plan.device),
         plan.dtype,
     )
     actual = (
@@ -1558,7 +1794,7 @@ def _validate_workspace(
         workspace.k,
         workspace.n,
         workspace.num_topk,
-        workspace.device,
+        _canonical_device(workspace.device),
         workspace.dtype,
     )
     if actual != expected:
@@ -1567,6 +1803,27 @@ def _validate_workspace(
             f"expected {(plan.implementation, plan.quant_mode, plan.weight_E, plan.k, plan.n, plan.num_topk, plan.device, plan.dtype)}, "
             f"got {actual}"
         )
+    if plan.implementation == "w4a16":
+        if not isinstance(workspace, TPW4A16Workspace):
+            raise TypeError("expected a TPW4A16Workspace for the W4A16 backend")
+        if workspace.activation != plan.activation:
+            raise ValueError("workspace activation mismatch")
+        if workspace.state_E < plan.state_E:
+            raise ValueError(
+                "workspace expert capacity mismatch: "
+                f"expected at least {plan.state_E}, got {workspace.state_E}"
+            )
+        if workspace.max_rows < plan.max_rows:
+            raise ValueError(
+                "workspace row capacity mismatch: "
+                f"expected at least {plan.max_rows}, got {workspace.max_rows}"
+            )
+        if workspace.routed_rows_capacity < plan.routed_rows:
+            raise ValueError(
+                "workspace routed-row capacity mismatch: "
+                f"expected at least {plan.routed_rows}, got {workspace.routed_rows_capacity}"
+            )
+        return
     if workspace.state_E < plan.state_E:
         raise ValueError(
             "workspace expert capacity mismatch: "
@@ -1577,16 +1834,28 @@ def _validate_workspace(
             "workspace row capacity mismatch: "
             f"expected at least {plan.max_rows}, got {workspace.max_rows}"
         )
-    if plan.implementation == "static" and not isinstance(workspace, TPCompactStaticWorkspace):
-        raise TypeError("expected a TPCompactStaticWorkspace for the compact static backend")
-    if plan.implementation == "dynamic" and not isinstance(workspace, TPDynamicWorkspace):
+    if plan.implementation == "static" and not isinstance(
+        workspace, TPCompactStaticWorkspace
+    ):
+        raise TypeError(
+            "expected a TPCompactStaticWorkspace for the compact static backend"
+        )
+    if plan.implementation == "dynamic" and not isinstance(
+        workspace, TPDynamicWorkspace
+    ):
         raise TypeError("expected a TPDynamicWorkspace for the dynamic backend")
-    if isinstance(workspace, TPCompactStaticWorkspace) and workspace.routed_rows_capacity < plan.routed_rows:
+    if (
+        isinstance(workspace, TPCompactStaticWorkspace)
+        and workspace.routed_rows_capacity < plan.routed_rows
+    ):
         raise ValueError(
             "workspace routed-row capacity mismatch: "
             f"expected at least {plan.routed_rows}, got {workspace.routed_rows_capacity}"
         )
-    if isinstance(workspace, TPDynamicWorkspace) and workspace.routed_rows_capacity < plan.routed_rows:
+    if (
+        isinstance(workspace, TPDynamicWorkspace)
+        and workspace.routed_rows_capacity < plan.routed_rows
+    ):
         raise ValueError(
             "workspace routed-row capacity mismatch: "
             f"expected at least {plan.routed_rows}, got {workspace.routed_rows_capacity}"
@@ -1615,6 +1884,7 @@ def _workspace_pool_key(
     implementation: str,
     *,
     quant_mode: str,
+    activation: str,
     state_E: int,
     weight_E: int,
     max_rows: int,
@@ -1624,15 +1894,16 @@ def _workspace_pool_key(
     device: torch.device,
     dtype: torch.dtype,
 ) -> tuple:
-    # Pool-backed static and dynamic workspaces are capacity-based. Avoid
+    # Pool-backed workspaces are capacity-based. Avoid
     # exact-shape keys here or long-tail prompt lengths will accumulate one
     # retained workspace per distinct routed-row count.
-    if implementation in ("static", "dynamic"):
+    if implementation in ("static", "dynamic", "w4a16"):
         state_E = -1
         max_rows = -1
     return (
         implementation,
         quant_mode,
+        activation if implementation == "w4a16" else "",
         state_E,
         weight_E,
         max_rows,
@@ -1676,14 +1947,14 @@ def _lookup_capture_static_workspace(
 
 
 def _resolve_workspace(
-    workspace: TPMoEWorkspace | TPMoEWorkspacePool,
+    workspace: TPMoEWorkspace | TPW4A16Workspace | TPMoEWorkspacePool,
     *,
     plan: TPMoEPlan,
     a1_gscale: torch.Tensor,
     a2_gscale: torch.Tensor,
     input_scales_static: bool,
-) -> TPMoEWorkspace:
-    if isinstance(workspace, TPMoEWorkspace):
+) -> object:
+    if isinstance(workspace, (TPMoEWorkspace, TPW4A16Workspace)):
         _validate_workspace(workspace, plan=plan)
         if isinstance(workspace, TPDynamicWorkspace):
             _refresh_dynamic_workspace_scales(
@@ -1696,7 +1967,7 @@ def _resolve_workspace(
 
     if not isinstance(workspace, TPMoEWorkspacePool):
         raise TypeError(
-            "workspace must be a TPMoEWorkspace or TPMoEWorkspacePool"
+            "workspace must be a TPMoEWorkspace, TPW4A16Workspace, or TPMoEWorkspacePool"
         )
 
     key = _workspace_pool_key(
@@ -1710,6 +1981,7 @@ def _resolve_workspace(
         device=plan.device,
         dtype=plan.dtype,
         quant_mode=plan.quant_mode,
+        activation=plan.activation,
     )
     resolved = workspace.workspaces.get(key)
     if resolved is None and torch.cuda.is_current_stream_capturing():
@@ -1721,6 +1993,11 @@ def _resolve_workspace(
             workspace.workspaces[key] = capture_static
             resolved = capture_static
     if resolved is None:
+        if plan.implementation == "w4a16" and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "W4A16 workspace is not initialized for CUDA graph capture; "
+                "run a warmup with the workspace pool or allocate a sufficient workspace before capture"
+            )
         resolved = _alloc_workspace(
             plan.implementation,
             plan.quant_mode,
@@ -1736,6 +2013,7 @@ def _resolve_workspace(
             routed_rows=plan.routed_rows,
             max_rows=plan.max_rows,
             input_scales_static=input_scales_static,
+            activation=plan.activation,
             dynamic_physical_tiles=plan.dynamic_physical_tiles,
             dynamic_task_capacity=plan.dynamic_task_capacity,
             pool=workspace,
@@ -1752,6 +2030,10 @@ def _resolve_workspace(
             and resolved.routed_rows_capacity < plan.routed_rows
         )
         or (
+            isinstance(resolved, TPW4A16Workspace)
+            and resolved.routed_rows_capacity < plan.routed_rows
+        )
+        or (
             isinstance(resolved, TPDynamicWorkspace)
             and plan.dynamic_physical_tiles is not None
             and resolved.physical_tiles_capacity < plan.dynamic_physical_tiles
@@ -1763,6 +2045,11 @@ def _resolve_workspace(
         )
     )
     if needs_growth:
+        if plan.implementation == "w4a16" and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "W4A16 workspace capacity is too small for CUDA graph capture; "
+                "run an eager warmup with a larger routed-row budget before capture"
+            )
         dynamic_tiles = plan.dynamic_physical_tiles
         dynamic_tasks = plan.dynamic_task_capacity
         if isinstance(resolved, TPDynamicWorkspace):
@@ -1780,9 +2067,12 @@ def _resolve_workspace(
             plan.dtype,
             a1_gscale,
             a2_gscale,
-            routed_rows=max(plan.routed_rows, getattr(resolved, "routed_rows_capacity", 0)),
+            routed_rows=max(
+                plan.routed_rows, getattr(resolved, "routed_rows_capacity", 0)
+            ),
             max_rows=max(plan.max_rows, resolved.max_rows),
             input_scales_static=input_scales_static,
+            activation=plan.activation,
             dynamic_physical_tiles=dynamic_tiles,
             dynamic_task_capacity=dynamic_tasks,
             pool=workspace,
@@ -1812,16 +2102,23 @@ def allocate_tp_moe_workspace(
     *,
     input_scales_static: bool = False,
     quant_mode: str | None = None,
-) -> TPMoEWorkspace:
+    activation: str = "silu",
+) -> TPMoEWorkspace | TPW4A16Workspace:
     """Allocate reusable scratch covering one unchunked `b12x_moe_fp4` call."""
     quant_mode = _normalize_quant_mode(quant_mode)
     if a.ndim != 2:
-        raise ValueError(f"expected input activations with rank 2, got shape {tuple(a.shape)}")
+        raise ValueError(
+            f"expected input activations with rank 2, got shape {tuple(a.shape)}"
+        )
     if topk_ids.ndim != 2:
-        raise ValueError(f"expected topk_ids with rank 2, got shape {tuple(topk_ids.shape)}")
+        raise ValueError(
+            f"expected topk_ids with rank 2, got shape {tuple(topk_ids.shape)}"
+        )
     m, k = a.shape
     if topk_ids.shape[0] != m:
-        raise ValueError(f"topk_ids batch mismatch: expected {m}, got {topk_ids.shape[0]}")
+        raise ValueError(
+            f"topk_ids batch mismatch: expected {m}, got {topk_ids.shape[0]}"
+        )
     weight_E = w1_fp4.shape[0]
     n = w2_fp4.shape[2] * 2
     num_topk = topk_ids.shape[1]
@@ -1834,10 +2131,10 @@ def allocate_tp_moe_workspace(
         device=a.device,
         dtype=a.dtype,
         quant_mode=quant_mode,
+        activation=activation,
     )
-    effective_input_scales_static = (
-        input_scales_static
-        or (a1_gscale.numel() == 1 and a2_gscale.numel() == 1)
+    effective_input_scales_static = input_scales_static or (
+        a1_gscale.numel() == 1 and a2_gscale.numel() == 1
     )
     return _alloc_workspace(
         plan.implementation,
@@ -1854,6 +2151,7 @@ def allocate_tp_moe_workspace(
         routed_rows=plan.routed_rows,
         max_rows=plan.max_rows,
         input_scales_static=effective_input_scales_static,
+        activation=plan.activation,
         dynamic_physical_tiles=plan.dynamic_physical_tiles,
         dynamic_task_capacity=plan.dynamic_task_capacity,
     )
@@ -1872,6 +2170,7 @@ def plan_tp_moe_arena_layout(
     route_num_experts: int | None = None,
     route_logits_dtype: torch.dtype | None = None,
     quant_mode: str | None = None,
+    activation: str = "silu",
 ) -> TPMoEArenaLayout:
     """Compute the byte layout needed by one lane-owned MoE pool."""
     quant_mode = _normalize_quant_mode(quant_mode)
@@ -1884,7 +2183,9 @@ def plan_tp_moe_arena_layout(
     if core_token_counts is None:
         core_token_counts = (max_tokens,)
     else:
-        core_token_counts = tuple(max(int(token_count), 1) for token_count in core_token_counts)
+        core_token_counts = tuple(
+            max(int(token_count), 1) for token_count in core_token_counts
+        )
         if max_tokens not in core_token_counts:
             core_token_counts = (max_tokens, *core_token_counts)
     static_cutover_pairs = _get_static_compact_cutover_pairs(quant_mode)
@@ -1893,7 +2194,9 @@ def plan_tp_moe_arena_layout(
         static_boundary_tokens = min(max_tokens, max_static_tokens)
         if static_boundary_tokens not in core_token_counts:
             core_token_counts = (*core_token_counts, static_boundary_tokens)
-    route_num_experts = int(route_num_experts if route_num_experts is not None else weight_E)
+    route_num_experts = int(
+        route_num_experts if route_num_experts is not None else weight_E
+    )
     route_logits_dtype = route_logits_dtype or dtype
     core_nbytes = 0
     for token_count in core_token_counts:
@@ -1906,6 +2209,7 @@ def plan_tp_moe_arena_layout(
             device=device,
             dtype=dtype,
             quant_mode=quant_mode,
+            activation=activation,
             eager_exact_dynamic=False,
         )
         core_plan = _plan_core_workspace(
@@ -1920,6 +2224,7 @@ def plan_tp_moe_arena_layout(
             plan.dtype,
             routed_rows=plan.routed_rows,
             max_rows=plan.max_rows,
+            activation=plan.activation,
             dynamic_physical_tiles=plan.dynamic_physical_tiles,
             dynamic_task_capacity=plan.dynamic_task_capacity,
         )
@@ -2052,9 +2357,23 @@ def _get_static_kernel(
 
     global _LAST_KERNEL
     cache_key = (
-        quant_mode, "static", state_E, weight_E, m, k, n, num_topk, max_rows, mac, mma_tiler_mn, topk_ids_dtype,
-        fast_math, activation,
-        single_token, share_input_across_experts, share_expert_scales,
+        quant_mode,
+        "static",
+        state_E,
+        weight_E,
+        m,
+        k,
+        n,
+        num_topk,
+        max_rows,
+        mac,
+        mma_tiler_mn,
+        topk_ids_dtype,
+        fast_math,
+        activation,
+        single_token,
+        share_input_across_experts,
+        share_expert_scales,
         dynamic_down_scale,
     )
     last_kkey, last_kval = _LAST_KERNEL
@@ -2066,7 +2385,6 @@ def _get_static_kernel(
         if cached is not None:
             _LAST_KERNEL = (cache_key, cached)
             return cached
-
 
     weight_dtype = cutlass.Float4E2M1FN
     a_scratch_dtype = weight_dtype
@@ -2093,88 +2411,157 @@ def _get_static_kernel(
     cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
 
     a_input_fake = cute.runtime.make_fake_compact_tensor(
-        a_dtype, (m, k), stride_order=(1, 0), assumed_align=16,
+        a_dtype,
+        (m, k),
+        stride_order=(1, 0),
+        assumed_align=16,
     )
-    topk_ids_cutlass_dtype = cutlass.Int32 if topk_ids_dtype == torch.int32 else cutlass.Int64
+    topk_ids_cutlass_dtype = (
+        cutlass.Int32 if topk_ids_dtype == torch.int32 else cutlass.Int64
+    )
     topk_ids_align = 4 if topk_ids_dtype == torch.int32 else 8
     topk_ids_fake = cute.runtime.make_fake_compact_tensor(
-        topk_ids_cutlass_dtype, (m * num_topk,), assumed_align=topk_ids_align,
+        topk_ids_cutlass_dtype,
+        (m * num_topk,),
+        assumed_align=topk_ids_align,
     )
     topk_weights_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32, (m * num_topk,), assumed_align=4,
+        cutlass.Float32,
+        (m * num_topk,),
+        assumed_align=4,
     )
     packed_a_fake = cute.runtime.make_fake_compact_tensor(
-        a_scratch_dtype, (max_rows, k, state_E), stride_order=(1, 0, 2), assumed_align=16,
+        a_scratch_dtype,
+        (max_rows, k, state_E),
+        stride_order=(1, 0, 2),
+        assumed_align=16,
     )
     sfa_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     packed_a_storage_elements = state_E * max_rows * (k // 2)
     packed_a_storage_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8, (packed_a_storage_elements,), assumed_align=16,
+        cutlass.Uint8,
+        (packed_a_storage_elements,),
+        assumed_align=16,
     )
     scale_storage_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8, (state_E * rows_pad_k * cols_pad_k,), assumed_align=16,
+        cutlass.Uint8,
+        (state_E * rows_pad_k * cols_pad_k,),
+        assumed_align=16,
     )
     barrier_count_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (1,), assumed_align=4,
+        cutlass.Int32,
+        (1,),
+        assumed_align=4,
     )
     barrier_epoch_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (1,), assumed_align=4,
+        cutlass.Int32,
+        (1,),
+        assumed_align=4,
     )
     w1_n = activation_spec.w1_rows(n)
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
-        weight_dtype, (w1_n, k, weight_E), stride_order=(1, 0, 2), assumed_align=16,
+        weight_dtype,
+        (w1_n, k, weight_E),
+        stride_order=(1, 0, 2),
+        assumed_align=16,
     )
     sfb_w13_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     b_down_fake = cute.runtime.make_fake_compact_tensor(
-        weight_dtype, (k, n, weight_E), stride_order=(1, 0, 2), assumed_align=16,
+        weight_dtype,
+        (k, n, weight_E),
+        stride_order=(1, 0, 2),
+        assumed_align=16,
     )
     sfb_down_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     row_counts_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (state_E,), assumed_align=4,
+        cutlass.Int32,
+        (state_E,),
+        assumed_align=4,
     )
     active_expert_count_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (1,), assumed_align=4,
+        cutlass.Int32,
+        (1,),
+        assumed_align=4,
     )
     weight_expert_ids_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (state_E,), assumed_align=4,
+        cutlass.Int32,
+        (state_E,),
+        assumed_align=4,
     )
     global_to_local_expert_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (weight_E,), assumed_align=4,
+        cutlass.Int32,
+        (weight_E,),
+        assumed_align=4,
     )
     input_gs_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (weight_E,), assumed_align=16,
+        alpha_dtype,
+        (weight_E,),
+        assumed_align=16,
     )
     alpha_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (weight_E,), assumed_align=16,
+        alpha_dtype,
+        (weight_E,),
+        assumed_align=16,
     )
     down_alpha_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (weight_E,), assumed_align=16,
+        alpha_dtype,
+        (weight_E,),
+        assumed_align=16,
     )
     global_scale_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (weight_E,), assumed_align=16,
+        alpha_dtype,
+        (weight_E,),
+        assumed_align=16,
     )
     scatter_fake = cute.runtime.make_fake_compact_tensor(
-        a_dtype, (m, k), stride_order=(1, 0), assumed_align=16,
+        a_dtype,
+        (m, k),
+        stride_order=(1, 0),
+        assumed_align=16,
     )
     token_map_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (state_E, max_rows), stride_order=(1, 0), assumed_align=4,
+        cutlass.Int32,
+        (state_E, max_rows),
+        stride_order=(1, 0),
+        assumed_align=4,
     )
     token_weights_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (state_E, max_rows), stride_order=(1, 0), assumed_align=16,
+        alpha_dtype,
+        (state_E, max_rows),
+        stride_order=(1, 0),
+        assumed_align=16,
     )
-    raise_if_kernel_resolution_frozen("cute.compile", target=kernel, cache_key=cache_key)
+    raise_if_kernel_resolution_frozen(
+        "cute.compile", target=kernel, cache_key=cache_key
+    )
     compiled = cute.compile(
         kernel,
-        a_input_fake, topk_ids_fake, topk_weights_fake,
-        packed_a_fake, sfa_fake,
-        packed_a_storage_fake, scale_storage_fake,
-        barrier_count_fake, barrier_epoch_fake,
-        b_w13_fake, sfb_w13_fake,
-        b_down_fake, sfb_down_fake,
-        row_counts_fake, active_expert_count_fake, weight_expert_ids_fake, global_to_local_expert_fake,
-        input_gs_fake, alpha_fake, down_alpha_fake, global_scale_fake,
-        scatter_fake, token_map_fake, token_weights_fake,
-        mac, current_cuda_stream(),
+        a_input_fake,
+        topk_ids_fake,
+        topk_weights_fake,
+        packed_a_fake,
+        sfa_fake,
+        packed_a_storage_fake,
+        scale_storage_fake,
+        barrier_count_fake,
+        barrier_epoch_fake,
+        b_w13_fake,
+        sfb_w13_fake,
+        b_down_fake,
+        sfb_down_fake,
+        row_counts_fake,
+        active_expert_count_fake,
+        weight_expert_ids_fake,
+        global_to_local_expert_fake,
+        input_gs_fake,
+        alpha_fake,
+        down_alpha_fake,
+        global_scale_fake,
+        scatter_fake,
+        token_map_fake,
+        token_weights_fake,
+        mac,
+        current_cuda_stream(),
     )
 
     result = (compiled, mac)
@@ -2208,9 +2595,20 @@ def _get_micro_kernel(
 
     global _LAST_KERNEL
     cache_key = (
-        quant_mode, "micro_direct", m, k, n, num_topk, weight_E, topk_ids_dtype,
-        fast_math, share_input_across_experts,
-        share_expert_scales, single_token, activation, dynamic_down_scale,
+        quant_mode,
+        "micro_direct",
+        m,
+        k,
+        n,
+        num_topk,
+        weight_E,
+        topk_ids_dtype,
+        fast_math,
+        share_input_across_experts,
+        share_expert_scales,
+        single_token,
+        activation,
+        dynamic_down_scale,
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
@@ -2239,44 +2637,46 @@ def _get_micro_kernel(
 
     ids_dtype = cutlass.Int32 if topk_ids_dtype == torch.int32 else cutlass.Int64
     barrier_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (1,), assumed_align=4,
+        cutlass.Int32,
+        (1,),
+        assumed_align=4,
     )
 
-    raise_if_kernel_resolution_frozen("cute.compile", target=kernel, cache_key=cache_key)
+    raise_if_kernel_resolution_frozen(
+        "cute.compile", target=kernel, cache_key=cache_key
+    )
     compile_kwargs = {}
     compile_options = os.environ.get("B12X_DIRECT_CUTE_OPTIONS", "")
     if compile_options:
         compile_kwargs["options"] = compile_options
     compiled = cute.compile(
         kernel,
-        dummy(cutlass.BFloat16),     # x_ptr
-        dummy(cutlass.Uint8),         # w1_ptr
-        dummy(cutlass.Uint8),         # w1s_ptr
-        dummy(cutlass.Float32),       # w1a_ptr
-        dummy(cutlass.Float32),       # a1_ptr
-        dummy(cutlass.Float32),       # a2_ptr
-        dummy(cutlass.Uint32),        # inter_ptr
-        dummy(cutlass.Uint8),         # w2_ptr
-        dummy(cutlass.Uint8),         # w2s_ptr
-        dummy(cutlass.Float32),       # w2a_ptr
-        dummy(ids_dtype),             # tid_ptr
-        dummy(cutlass.Float32),       # tw_ptr
-        dummy(cutlass.BFloat16),      # out_ptr
-        barrier_fake,                 # barrier_count
-        barrier_fake,                 # barrier_epoch
-        Int32(m),                     # m_val
-        Int32(kernel.grid_x),         # grid_x
-        current_cuda_stream(),        # stream
+        dummy(cutlass.BFloat16),  # x_ptr
+        dummy(cutlass.Uint8),  # w1_ptr
+        dummy(cutlass.Uint8),  # w1s_ptr
+        dummy(cutlass.Float32),  # w1a_ptr
+        dummy(cutlass.Float32),  # a1_ptr
+        dummy(cutlass.Float32),  # a2_ptr
+        dummy(cutlass.Uint32),  # inter_ptr
+        dummy(cutlass.Uint8),  # w2_ptr
+        dummy(cutlass.Uint8),  # w2s_ptr
+        dummy(cutlass.Float32),  # w2a_ptr
+        dummy(ids_dtype),  # tid_ptr
+        dummy(cutlass.Float32),  # tw_ptr
+        dummy(cutlass.BFloat16),  # out_ptr
+        barrier_fake,  # barrier_count
+        barrier_fake,  # barrier_epoch
+        Int32(m),  # m_val
+        Int32(kernel.grid_x),  # grid_x
+        current_cuda_stream(),  # stream
         **compile_kwargs,
     )
-    try:
+    with suppress(Exception):
         setattr(
             compiled,
             _DIRECT_MICRO_SHAPE_ATTR,
             (quant_mode, int(m), int(k), int(n), int(num_topk), int(weight_E)),
         )
-    except Exception:
-        pass
 
     result = (compiled, kernel.grid_x)
     if reuse_compiled:
@@ -2291,7 +2691,11 @@ def _direct_micro_shape_accepts_block_dim(compiled, block_dim: int) -> bool:
 
 def _compiled_direct_micro_accepts_block_dim(compiled, block_dim: int) -> bool:
     """Return whether the compiled direct micro kernel can launch `block_dim` threads."""
-    cache_key = (id(compiled), int(block_dim), getattr(compiled, _DIRECT_MICRO_SHAPE_ATTR, None))
+    cache_key = (
+        id(compiled),
+        int(block_dim),
+        getattr(compiled, _DIRECT_MICRO_SHAPE_ATTR, None),
+    )
     cached = _MICRO_DIRECT_LAUNCH_CAP_CACHE.get(cache_key)
     if cached is not None:
         return cached
@@ -2398,52 +2802,99 @@ class _DynamicMoELaunch:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
-        a_input = cute.make_tensor(a_ptr, layout=cute.make_layout(
-            (num_tokens, self._k), stride=(self._k, 1)))
-        topk_ids = cute.make_tensor(topk_ids_ptr, layout=cute.make_layout(
-            (num_tokens * self._num_topk,), stride=(1,)))
-        topk_weights_t = cute.make_tensor(topk_weights_ptr, layout=cute.make_layout(
-            (num_tokens * self._num_topk,), stride=(1,)))
-        scatter_output = cute.make_tensor(scatter_ptr, layout=cute.make_layout(
-            (num_tokens, self._k), stride=(self._k, 1)))
-        packed_a = cute.make_tensor(packed_a_ptr, layout=cute.make_layout(
-            (rows_padded, self._k, 1), stride=(self._k, 1, rows_padded * self._k)))
-        packed_a_storage = cute.make_tensor(packed_a_storage_ptr, layout=cute.make_layout(
-            (rows_padded * self._half_k,), stride=(1,)))
-        scale_storage = cute.make_tensor(scale_storage_ptr, layout=cute.make_layout(
-            (rows_padded * self._cols_pad_k,), stride=(1,)))
-        token_map = cute.make_tensor(token_map_ptr, layout=cute.make_layout(
-            (rows_padded,), stride=(1,)))
-        token_weights_t = cute.make_tensor(token_weights_ptr, layout=cute.make_layout(
-            (rows_padded,), stride=(1,)))
-        task_ready = cute.make_tensor(task_ready_ptr, layout=cute.make_layout(
-            (max_tasks,), stride=(1,)))
-        task_expert = cute.make_tensor(task_expert_ptr, layout=cute.make_layout(
-            (max_tasks,), stride=(1,)))
-        task_m_tile = cute.make_tensor(task_m_tile_ptr, layout=cute.make_layout(
-            (max_tasks,), stride=(1,)))
-        task_slice_begin = cute.make_tensor(task_slice_begin_ptr, layout=cute.make_layout(
-            (max_tasks,), stride=(1,)))
-        task_slice_count = cute.make_tensor(task_slice_count_ptr, layout=cute.make_layout(
-            (max_tasks,), stride=(1,)))
-        task_valid_rows = cute.make_tensor(task_valid_rows_ptr, layout=cute.make_layout(
-            (max_tasks,), stride=(1,)))
-        tile_write_count = cute.make_tensor(tile_write_count_ptr, layout=cute.make_layout(
-            (max_phys_tiles,), stride=(1,)))
+        a_input = cute.make_tensor(
+            a_ptr, layout=cute.make_layout((num_tokens, self._k), stride=(self._k, 1))
+        )
+        topk_ids = cute.make_tensor(
+            topk_ids_ptr,
+            layout=cute.make_layout((num_tokens * self._num_topk,), stride=(1,)),
+        )
+        topk_weights_t = cute.make_tensor(
+            topk_weights_ptr,
+            layout=cute.make_layout((num_tokens * self._num_topk,), stride=(1,)),
+        )
+        scatter_output = cute.make_tensor(
+            scatter_ptr,
+            layout=cute.make_layout((num_tokens, self._k), stride=(self._k, 1)),
+        )
+        packed_a = cute.make_tensor(
+            packed_a_ptr,
+            layout=cute.make_layout(
+                (rows_padded, self._k, 1), stride=(self._k, 1, rows_padded * self._k)
+            ),
+        )
+        packed_a_storage = cute.make_tensor(
+            packed_a_storage_ptr,
+            layout=cute.make_layout((rows_padded * self._half_k,), stride=(1,)),
+        )
+        scale_storage = cute.make_tensor(
+            scale_storage_ptr,
+            layout=cute.make_layout((rows_padded * self._cols_pad_k,), stride=(1,)),
+        )
+        token_map = cute.make_tensor(
+            token_map_ptr, layout=cute.make_layout((rows_padded,), stride=(1,))
+        )
+        token_weights_t = cute.make_tensor(
+            token_weights_ptr, layout=cute.make_layout((rows_padded,), stride=(1,))
+        )
+        task_ready = cute.make_tensor(
+            task_ready_ptr, layout=cute.make_layout((max_tasks,), stride=(1,))
+        )
+        task_expert = cute.make_tensor(
+            task_expert_ptr, layout=cute.make_layout((max_tasks,), stride=(1,))
+        )
+        task_m_tile = cute.make_tensor(
+            task_m_tile_ptr, layout=cute.make_layout((max_tasks,), stride=(1,))
+        )
+        task_slice_begin = cute.make_tensor(
+            task_slice_begin_ptr, layout=cute.make_layout((max_tasks,), stride=(1,))
+        )
+        task_slice_count = cute.make_tensor(
+            task_slice_count_ptr, layout=cute.make_layout((max_tasks,), stride=(1,))
+        )
+        task_valid_rows = cute.make_tensor(
+            task_valid_rows_ptr, layout=cute.make_layout((max_tasks,), stride=(1,))
+        )
+        tile_write_count = cute.make_tensor(
+            tile_write_count_ptr,
+            layout=cute.make_layout((max_phys_tiles,), stride=(1,)),
+        )
         self._kernel(
-            a_input, topk_ids, topk_weights_t,
-            packed_a, sfa_ptr, packed_a_storage, scale_storage,
-            barrier_count, barrier_epoch,
-            pair_head, producers_done_count, all_work_published,
-            task_head, task_tail, task_ready,
-            task_expert, task_m_tile,
-            task_slice_begin, task_slice_count, task_valid_rows,
+            a_input,
+            topk_ids,
+            topk_weights_t,
+            packed_a,
+            sfa_ptr,
+            packed_a_storage,
+            scale_storage,
+            barrier_count,
+            barrier_epoch,
+            pair_head,
+            producers_done_count,
+            all_work_published,
+            task_head,
+            task_tail,
+            task_ready,
+            task_expert,
+            task_m_tile,
+            task_slice_begin,
+            task_slice_count,
+            task_valid_rows,
             tile_write_count,
-            b_w13, sfb_w13_ptr,
-            b_down, sfb_down_ptr,
-            row_counts, expert_write_rows, expert_tile_base,
-            input_global_scale, alpha, down_alpha, global_scale,
-            scatter_output, token_map, token_weights_t,
+            b_w13,
+            sfb_w13_ptr,
+            b_down,
+            sfb_down_ptr,
+            row_counts,
+            expert_write_rows,
+            expert_tile_base,
+            input_global_scale,
+            alpha,
+            down_alpha,
+            global_scale,
+            scatter_output,
+            token_map,
+            token_weights_t,
             max_active_clusters=max_active_clusters,
             stream=stream,
         )
@@ -2465,7 +2916,9 @@ def _get_dynamic_kernel(
     share_input_across_experts: bool = False,
 ):
     quant_mode = _normalize_quant_mode(quant_mode)
-    share_input_across_experts = bool(share_input_across_experts and quant_mode == "nvfp4")
+    share_input_across_experts = bool(
+        share_input_across_experts and quant_mode == "nvfp4"
+    )
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
     sf_vec_size = 16
     mac = mac_override if mac_override is not None else _get_impl_mac("dynamic")
@@ -2477,13 +2930,26 @@ def _get_dynamic_kernel(
 
     global _LAST_KERNEL
     cache_key = (
-        quant_mode, "dynamic", E, k, n, num_topk, mac, mma_tiler_mn, topk_ids_dtype,
-        fast_math, activation, dynamic_down_scale, share_input_across_experts,
+        quant_mode,
+        "dynamic",
+        E,
+        k,
+        n,
+        num_topk,
+        mac,
+        mma_tiler_mn,
+        topk_ids_dtype,
+        fast_math,
+        activation,
+        dynamic_down_scale,
+        share_input_across_experts,
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
         return last_kval
-    reuse_compiled = _first_env("B12X_DYNAMIC_REUSE_COMPILED", "B12X_LEVEL10_REUSE_COMPILED")
+    reuse_compiled = _first_env(
+        "B12X_DYNAMIC_REUSE_COMPILED", "B12X_LEVEL10_REUSE_COMPILED"
+    )
     if reuse_compiled is None:
         reuse_compiled = "1"
     reuse_compiled = reuse_compiled != "0"
@@ -2509,100 +2975,192 @@ def _get_dynamic_kernel(
     kernel = activation_spec.make_dynamic_kernel(**kernel_kwargs)
     launch = _DynamicMoELaunch(kernel, k=k, num_topk=num_topk)
 
-    topk_ids_cutlass_dtype = cutlass.Int32 if topk_ids_dtype == torch.int32 else cutlass.Int64
+    topk_ids_cutlass_dtype = (
+        cutlass.Int32 if topk_ids_dtype == torch.int32 else cutlass.Int64
+    )
     topk_ids_align = 4 if topk_ids_dtype == torch.int32 else 8
 
     # a_input, topk_ids, topk_weights, scatter_output are pointers — shapes
     # are constructed at runtime from num_tokens Int32.
     a_input_fake = make_ptr(a_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    topk_ids_fake = make_ptr(topk_ids_cutlass_dtype, topk_ids_align, cute.AddressSpace.gmem, assumed_align=topk_ids_align)
-    topk_weights_fake = make_ptr(cutlass.Float32, 4, cute.AddressSpace.gmem, assumed_align=4)
+    topk_ids_fake = make_ptr(
+        topk_ids_cutlass_dtype,
+        topk_ids_align,
+        cute.AddressSpace.gmem,
+        assumed_align=topk_ids_align,
+    )
+    topk_weights_fake = make_ptr(
+        cutlass.Float32, 4, cute.AddressSpace.gmem, assumed_align=4
+    )
 
-    packed_a_fake = make_ptr(a_scratch_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    packed_a_fake = make_ptr(
+        a_scratch_dtype, 16, cute.AddressSpace.gmem, assumed_align=16
+    )
     sfa_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    packed_a_storage_fake = make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16)
-    scale_storage_fake = make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16)
+    packed_a_storage_fake = make_ptr(
+        cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16
+    )
+    scale_storage_fake = make_ptr(
+        cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16
+    )
     barrier_count_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (1,), assumed_align=4,
+        cutlass.Int32,
+        (1,),
+        assumed_align=4,
     )
     barrier_epoch_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (1,), assumed_align=4,
+        cutlass.Int32,
+        (1,),
+        assumed_align=4,
     )
     pair_head_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (1,), assumed_align=4,
+        cutlass.Int32,
+        (1,),
+        assumed_align=4,
     )
     producers_done_count_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (1,), assumed_align=4,
+        cutlass.Int32,
+        (1,),
+        assumed_align=4,
     )
     all_work_published_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (1,), assumed_align=4,
+        cutlass.Int32,
+        (1,),
+        assumed_align=4,
     )
     task_head_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (1,), assumed_align=4,
+        cutlass.Int32,
+        (1,),
+        assumed_align=4,
     )
     task_tail_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (1,), assumed_align=4,
+        cutlass.Int32,
+        (1,),
+        assumed_align=4,
     )
-    tasks_ph = 1
-    tiles_ph = 1
-    task_ready_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
-    task_expert_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
-    task_m_tile_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
-    task_slice_begin_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
-    task_slice_count_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
-    task_valid_rows_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
-    tile_write_count_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
+    task_ready_fake = make_ptr(
+        cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4
+    )
+    task_expert_fake = make_ptr(
+        cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4
+    )
+    task_m_tile_fake = make_ptr(
+        cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4
+    )
+    task_slice_begin_fake = make_ptr(
+        cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4
+    )
+    task_slice_count_fake = make_ptr(
+        cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4
+    )
+    task_valid_rows_fake = make_ptr(
+        cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4
+    )
+    tile_write_count_fake = make_ptr(
+        cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4
+    )
     w1_n = activation_spec.w1_rows(n)
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
-        weight_dtype, (w1_n, k, E), stride_order=(1, 0, 2), assumed_align=16,
+        weight_dtype,
+        (w1_n, k, E),
+        stride_order=(1, 0, 2),
+        assumed_align=16,
     )
     sfb_w13_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     b_down_fake = cute.runtime.make_fake_compact_tensor(
-        weight_dtype, (k, n, E), stride_order=(1, 0, 2), assumed_align=16,
+        weight_dtype,
+        (k, n, E),
+        stride_order=(1, 0, 2),
+        assumed_align=16,
     )
     sfb_down_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     row_counts_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (E,), assumed_align=4,
+        cutlass.Int32,
+        (E,),
+        assumed_align=4,
     )
     expert_write_rows_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (E,), assumed_align=4,
+        cutlass.Int32,
+        (E,),
+        assumed_align=4,
     )
     expert_tile_base_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (E + 1,), assumed_align=4,
+        cutlass.Int32,
+        (E + 1,),
+        assumed_align=4,
     )
     input_gs_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (E,), assumed_align=16,
+        alpha_dtype,
+        (E,),
+        assumed_align=16,
     )
     alpha_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (E,), assumed_align=16,
+        alpha_dtype,
+        (E,),
+        assumed_align=16,
     )
     down_alpha_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (E,), assumed_align=16,
+        alpha_dtype,
+        (E,),
+        assumed_align=16,
     )
     global_scale_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (E,), assumed_align=16,
+        alpha_dtype,
+        (E,),
+        assumed_align=16,
     )
     scatter_fake = make_ptr(a_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     token_map_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
-    token_weights_fake = make_ptr(alpha_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=cache_key)
+    token_weights_fake = make_ptr(
+        alpha_dtype, 16, cute.AddressSpace.gmem, assumed_align=16
+    )
+    raise_if_kernel_resolution_frozen(
+        "cute.compile", target=launch, cache_key=cache_key
+    )
     compiled = cute.compile(
         launch,
-        a_input_fake, topk_ids_fake, topk_weights_fake,
-        packed_a_fake, sfa_fake,
-        packed_a_storage_fake, scale_storage_fake,
-        barrier_count_fake, barrier_epoch_fake,
-        pair_head_fake, producers_done_count_fake, all_work_published_fake,
-        task_head_fake, task_tail_fake, task_ready_fake,
-        task_expert_fake, task_m_tile_fake,
-        task_slice_begin_fake, task_slice_count_fake, task_valid_rows_fake,
+        a_input_fake,
+        topk_ids_fake,
+        topk_weights_fake,
+        packed_a_fake,
+        sfa_fake,
+        packed_a_storage_fake,
+        scale_storage_fake,
+        barrier_count_fake,
+        barrier_epoch_fake,
+        pair_head_fake,
+        producers_done_count_fake,
+        all_work_published_fake,
+        task_head_fake,
+        task_tail_fake,
+        task_ready_fake,
+        task_expert_fake,
+        task_m_tile_fake,
+        task_slice_begin_fake,
+        task_slice_count_fake,
+        task_valid_rows_fake,
         tile_write_count_fake,
-        b_w13_fake, sfb_w13_fake,
-        b_down_fake, sfb_down_fake,
-        row_counts_fake, expert_write_rows_fake, expert_tile_base_fake,
-        input_gs_fake, alpha_fake, down_alpha_fake, global_scale_fake,
-        scatter_fake, token_map_fake, token_weights_fake,
-        1, 1, 1, 1, 1, mac, current_cuda_stream(),
+        b_w13_fake,
+        sfb_w13_fake,
+        b_down_fake,
+        sfb_down_fake,
+        row_counts_fake,
+        expert_write_rows_fake,
+        expert_tile_base_fake,
+        input_gs_fake,
+        alpha_fake,
+        down_alpha_fake,
+        global_scale_fake,
+        scatter_fake,
+        token_map_fake,
+        token_weights_fake,
+        1,
+        1,
+        1,
+        1,
+        1,
+        mac,
+        current_cuda_stream(),
     )
 
     result = (compiled, mac)
@@ -2662,7 +3220,9 @@ def _get_exact_relu2_bs1_nemotron_launcher(
     global _LAST_EXACT_RELU2_BS1_NEMOTRON
     num_tokens = int(a.shape[0])
     plan = _make_exact_relu2_bs1_nemotron_plan(
-        device=a.device, dtype=a.dtype, num_tokens=num_tokens,
+        device=a.device,
+        dtype=a.dtype,
+        num_tokens=num_tokens,
     )
     cache_key = (
         plan.device.index or 0,
@@ -2703,7 +3263,9 @@ def _get_exact_relu2_bs1_nemotron_launcher(
     input_gs = _prepare_expert_scale(a1_gscale, plan.weight_E)
     down_input_scale = _prepare_expert_scale(a2_gscale, plan.weight_E)
     static_work_tiles = plan.routed_rows * max(1, (plan.n + 127) // 128)
-    static_mac = min(_get_impl_mac("static", routed_rows=plan.routed_rows), static_work_tiles)
+    static_mac = min(
+        _get_impl_mac("static", routed_rows=plan.routed_rows), static_work_tiles
+    )
     if get_num_sm(plan.device) <= 96:
         static_mac = min(static_mac, _get_relu2_bs1_spark_micro_cap())
     compiled, mac = _get_static_kernel(
@@ -2719,7 +3281,7 @@ def _get_exact_relu2_bs1_nemotron_launcher(
         share_input_across_experts=True,
         share_expert_scales=False,
         single_token=True,
-        mac_override=micro_mac,
+        mac_override=static_mac,
         activation="relu2",
     )
     launcher = _ExactRelu2Bs1NemotronLauncher(
@@ -2750,11 +3312,17 @@ def _resolve_scatter_output(
     else:
         scatter_output = output
     if scatter_output.shape != (m, k):
-        raise ValueError(f"output must have shape {(m, k)}, got {tuple(scatter_output.shape)}")
+        raise ValueError(
+            f"output must have shape {(m, k)}, got {tuple(scatter_output.shape)}"
+        )
     if scatter_output.dtype != a.dtype:
-        raise ValueError(f"output must have dtype {a.dtype}, got {scatter_output.dtype}")
+        raise ValueError(
+            f"output must have dtype {a.dtype}, got {scatter_output.dtype}"
+        )
     if scatter_output.device != device:
-        raise ValueError(f"output must be on device {device}, got {scatter_output.device}")
+        raise ValueError(
+            f"output must be on device {device}, got {scatter_output.device}"
+        )
     if not scatter_output.is_contiguous():
         raise ValueError("output must be contiguous")
     return scatter_output
@@ -2803,15 +3371,30 @@ def _launch_exact_relu2_bs1_nemotron(
     assert isinstance(resolved, TPCompactStaticWorkspace)
     _prepare_workspace_for_launch(resolved)
     launcher.compiled(
-        a, flat_ids, flat_weights,
-        resolved.packed_a_view, resolved.sfa_ptr,
-        resolved.packed_a_flat, resolved.scale_flat,
-        resolved.barrier_count, resolved.barrier_epoch,
-        launcher.weights.w13_fp4, launcher.weights.sfb_w13_ptr,
-        launcher.weights.down_fp4, launcher.weights.sfb_down_ptr,
-        resolved.row_counts, resolved.active_expert_count, resolved.weight_expert_ids, resolved.global_to_local_expert,
-        launcher.input_gs, launcher.weights.w1_alpha, launcher.weights.w2_alpha, launcher.down_input_scale,
-        scatter_output, resolved.token_map, resolved.token_weights,
+        a,
+        flat_ids,
+        flat_weights,
+        resolved.packed_a_view,
+        resolved.sfa_ptr,
+        resolved.packed_a_flat,
+        resolved.scale_flat,
+        resolved.barrier_count,
+        resolved.barrier_epoch,
+        launcher.weights.w13_fp4,
+        launcher.weights.sfb_w13_ptr,
+        launcher.weights.down_fp4,
+        launcher.weights.sfb_down_ptr,
+        resolved.row_counts,
+        resolved.active_expert_count,
+        resolved.weight_expert_ids,
+        resolved.global_to_local_expert,
+        launcher.input_gs,
+        launcher.weights.w1_alpha,
+        launcher.weights.w2_alpha,
+        launcher.down_input_scale,
+        scatter_output,
+        resolved.token_map,
+        resolved.token_weights,
         current_cuda_stream(),
     )
     return scatter_output
@@ -2844,7 +3427,12 @@ def _launch_dynamic(
     if not _dynamic_multicta_enabled():
         effective_mac = 1
     compiled, mac = _get_dynamic_kernel(
-        E, m, k, n, num_topk, max_rows,
+        E,
+        m,
+        k,
+        n,
+        num_topk,
+        max_rows,
         topk_ids_dtype=topk_ids_dtype,
         fast_math=fast_math,
         mac_override=effective_mac,
@@ -2853,8 +3441,13 @@ def _launch_dynamic(
         share_input_across_experts=share_input_across_experts,
     )
     _prepare_workspace_for_launch(workspace)
-    _gptr = lambda dtype, t, align=16: make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
-    ids_cutlass_dtype = cutlass.Int32 if flat_ids.dtype == torch.int32 else cutlass.Int64
+    def _gptr(dtype, t, align=16):
+        return make_ptr(
+            dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align
+        )
+    ids_cutlass_dtype = (
+        cutlass.Int32 if flat_ids.dtype == torch.int32 else cutlass.Int64
+    )
     ids_align = 4 if flat_ids.dtype == torch.int32 else 8
     compiled(
         _gptr(cutlass.BFloat16, a),
@@ -2864,9 +3457,13 @@ def _launch_dynamic(
         workspace.sfa_ptr,
         _gptr(cutlass.Uint8, workspace.packed_a_flat),
         _gptr(cutlass.Uint8, workspace.scale_flat),
-        workspace.barrier_count, workspace.barrier_epoch,
-        workspace.pair_head, workspace.producers_done_count, workspace.all_work_published,
-        workspace.task_head, workspace.task_tail,
+        workspace.barrier_count,
+        workspace.barrier_epoch,
+        workspace.pair_head,
+        workspace.producers_done_count,
+        workspace.all_work_published,
+        workspace.task_head,
+        workspace.task_tail,
         _gptr(cutlass.Int32, workspace.task_ready, 4),
         _gptr(cutlass.Int32, workspace.task_expert, 4),
         _gptr(cutlass.Int32, workspace.task_m_tile, 4),
@@ -2874,14 +3471,22 @@ def _launch_dynamic(
         _gptr(cutlass.Int32, workspace.task_slice_count, 4),
         _gptr(cutlass.Int32, workspace.task_valid_rows, 4),
         _gptr(cutlass.Int32, workspace.tile_write_count, 4),
-        weights.w13_fp4, weights.sfb_w13_ptr,
-        weights.down_fp4, weights.sfb_down_ptr,
-        workspace.row_counts, workspace.expert_write_rows, workspace.expert_tile_base,
-        workspace.input_gs, weights.w1_alpha, weights.w2_alpha, workspace.down_input_scale,
+        weights.w13_fp4,
+        weights.sfb_w13_ptr,
+        weights.down_fp4,
+        weights.sfb_down_ptr,
+        workspace.row_counts,
+        workspace.expert_write_rows,
+        workspace.expert_tile_base,
+        workspace.input_gs,
+        weights.w1_alpha,
+        weights.w2_alpha,
+        workspace.down_input_scale,
         _gptr(cutlass.BFloat16, scatter_output),
         _gptr(cutlass.Int32, workspace.token_map, 4),
         _gptr(cutlass.Float32, workspace.token_weights, 4),
-        m, max_rows,
+        m,
+        max_rows,
         workspace.physical_tiles_capacity * _dynamic_tile_m(quant_mode),
         workspace.task_capacity,
         workspace.physical_tiles_capacity,
@@ -2918,7 +3523,10 @@ def _launch_compact_static(
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
     micro_cls = activation_spec.micro_kernel_cls
     use_micro_direct = quant_mode == "nvfp4" and micro_cls.is_supported(
-        m=m, k=k, n=n, num_topk=num_topk,
+        m=m,
+        k=k,
+        n=n,
+        num_topk=num_topk,
         weight_E=weight_E,
     )
     if use_micro_direct:
@@ -2928,7 +3536,11 @@ def _launch_compact_static(
             launch_ids = workspace.compact_topk_ids[: flat_ids.numel()]
             launch_ids.copy_(flat_ids.to(torch.int32))
         compiled, grid_x = _get_micro_kernel(
-            weight_E, m, k, n, num_topk,
+            weight_E,
+            m,
+            k,
+            n,
+            num_topk,
             topk_ids_dtype=topk_ids_dtype,
             fast_math=fast_math,
             share_input_across_experts=share_input_across_experts,
@@ -2974,7 +3586,13 @@ def _launch_compact_static(
         static_mac = min(static_mac, 64)
 
     compiled, mac = _get_static_kernel(
-        workspace.state_E, weight_E, m, k, n, num_topk, workspace.max_rows,
+        workspace.state_E,
+        weight_E,
+        m,
+        k,
+        n,
+        num_topk,
+        workspace.max_rows,
         topk_ids_dtype=topk_ids_dtype,
         fast_math=fast_math,
         mac_override=static_mac,
@@ -2987,32 +3605,47 @@ def _launch_compact_static(
     launch_ids = flat_ids
     _prepare_workspace_for_launch(workspace)
     compiled(
-        a, launch_ids, flat_weights,
-        workspace.packed_a_view, workspace.sfa_ptr,
-        workspace.packed_a_flat, workspace.scale_flat,
-        workspace.barrier_count, workspace.barrier_epoch,
-        weights.w13_fp4, weights.sfb_w13_ptr,
-        weights.down_fp4, weights.sfb_down_ptr,
-        workspace.row_counts, workspace.active_expert_count, workspace.weight_expert_ids, workspace.global_to_local_expert,
-        input_gs, weights.w1_alpha, weights.w2_alpha, down_input_scale,
-        scatter_output, workspace.token_map, workspace.token_weights,
+        a,
+        launch_ids,
+        flat_weights,
+        workspace.packed_a_view,
+        workspace.sfa_ptr,
+        workspace.packed_a_flat,
+        workspace.scale_flat,
+        workspace.barrier_count,
+        workspace.barrier_epoch,
+        weights.w13_fp4,
+        weights.sfb_w13_ptr,
+        weights.down_fp4,
+        weights.sfb_down_ptr,
+        workspace.row_counts,
+        workspace.active_expert_count,
+        workspace.weight_expert_ids,
+        workspace.global_to_local_expert,
+        input_gs,
+        weights.w1_alpha,
+        weights.w2_alpha,
+        down_input_scale,
+        scatter_output,
+        workspace.token_map,
+        workspace.token_weights,
         stream,
     )
 
 
 @torch._dynamo.disable
 def b12x_moe_fp4(
-    a: torch.Tensor,           # [m, k] bf16 activations
-    a1_gscale: torch.Tensor,   # [E] or scalar — reciprocal input quant global scale
-    w1_fp4: torch.Tensor,      # [E, 2*n, k//2] uint8
+    a: torch.Tensor,  # [m, k] bf16 activations
+    a1_gscale: torch.Tensor,  # [E] or scalar — reciprocal input quant global scale
+    w1_fp4: torch.Tensor,  # [E, 2*n, k//2] uint8
     w1_blockscale: torch.Tensor,  # [E, ...] float8_e4m3fn swizzled
-    w1_alphas: torch.Tensor,   # [E] float32
-    a2_gscale: torch.Tensor,   # [E] or scalar — reciprocal intermediate quant global scale
-    w2_fp4: torch.Tensor,      # [E, k, n//2] uint8
+    w1_alphas: torch.Tensor,  # [E] float32
+    a2_gscale: torch.Tensor,  # [E] or scalar — reciprocal intermediate quant global scale
+    w2_fp4: torch.Tensor,  # [E, k, n//2] uint8
     w2_blockscale: torch.Tensor,  # [E, ...] float8_e4m3fn swizzled
-    w2_alphas: torch.Tensor,   # [E] float32
+    w2_alphas: torch.Tensor,  # [E] float32
     topk_weights: torch.Tensor,  # [m, topk] float
-    topk_ids: torch.Tensor,    # [m, topk] int
+    topk_ids: torch.Tensor,  # [m, topk] int
     apply_router_weight_on_input: bool = False,
     *,
     workspace: TPMoEWorkspace | TPMoEWorkspacePool,
@@ -3053,7 +3686,9 @@ def b12x_moe_fp4(
     routed_rows = m * num_topk
     device = a.device
     if apply_router_weight_on_input and quant_mode != "w4a16":
-        raise NotImplementedError("apply_router_weight_on_input is not implemented in b12x_moe_fp4")
+        raise NotImplementedError(
+            "apply_router_weight_on_input is not implemented in b12x_moe_fp4"
+        )
     if fast_math is None:
         fast_math = _FAST_MATH_DEFAULT
     if quant_mode_arg is None and quant_mode == "w4a16":
@@ -3069,28 +3704,32 @@ def b12x_moe_fp4(
         )
     # Shared scalar input scales are weight-side constants in the benchmarked
     # path, so treat them as static and avoid re-expanding them every launch.
-    effective_input_scales_static = (
-        input_scales_static
-        or (a1_gscale.numel() == 1 and a2_gscale.numel() == 1)
+    effective_input_scales_static = input_scales_static or (
+        a1_gscale.numel() == 1 and a2_gscale.numel() == 1
     )
     if quant_mode == "w4a16":
         from b12x.moe.fused.w4a16.kernel import run_w4a16_moe
-        from b12x.moe.fused.w4a16.prepare import (
-            make_w4a16_packed_buffers as make_w4a16_buffers,
-        )
 
         if output is None:
             if torch.cuda.is_current_stream_capturing():
-                raise ValueError("CUDA graph capture requires a caller-owned output buffer")
+                raise ValueError(
+                    "CUDA graph capture requires a caller-owned output buffer"
+                )
             scatter_output = torch.empty(m, k, dtype=a.dtype, device=device)
         else:
             scatter_output = output
         if scatter_output.shape != (m, k):
-            raise ValueError(f"output must have shape {(m, k)}, got {tuple(scatter_output.shape)}")
+            raise ValueError(
+                f"output must have shape {(m, k)}, got {tuple(scatter_output.shape)}"
+            )
         if scatter_output.dtype != a.dtype:
-            raise ValueError(f"output must have dtype {a.dtype}, got {scatter_output.dtype}")
+            raise ValueError(
+                f"output must have dtype {a.dtype}, got {scatter_output.dtype}"
+            )
         if scatter_output.device != device:
-            raise ValueError(f"output must be on device {device}, got {scatter_output.device}")
+            raise ValueError(
+                f"output must be on device {device}, got {scatter_output.device}"
+            )
         if not scatter_output.is_contiguous():
             raise ValueError("output must be contiguous")
 
@@ -3105,40 +3744,66 @@ def b12x_moe_fp4(
             params_dtype=a.dtype,
             source_format=source_format,
         )
-        buffers = make_w4a16_buffers(
-            prepared,
-            m=m,
-            topk=num_topk,
-            dtype=a.dtype,
+        plan = _make_workspace_plan(
+            num_tokens=m,
+            weight_E=weight_E,
+            k=k,
+            n=n,
+            num_topk=num_topk,
             device=device,
+            dtype=a.dtype,
+            quant_mode=quant_mode,
+            activation=activation,
         )
+        w4a16_workspace = _resolve_workspace(
+            workspace,
+            plan=plan,
+            a1_gscale=a1_gscale,
+            a2_gscale=a2_gscale,
+            input_scales_static=effective_input_scales_static,
+        )
+        if not isinstance(w4a16_workspace, TPW4A16Workspace):
+            raise TypeError("expected a TPW4A16Workspace for the W4A16 backend")
+        if not topk_weights.is_contiguous():
+            if torch.cuda.is_current_stream_capturing():
+                raise ValueError(
+                    "CUDA graph capture requires contiguous W4A16 topk_weights"
+                )
+            topk_weights = topk_weights.contiguous()
+        if not topk_ids.is_contiguous():
+            if torch.cuda.is_current_stream_capturing():
+                raise ValueError(
+                    "CUDA graph capture requires contiguous W4A16 topk_ids"
+                )
+            topk_ids = topk_ids.contiguous()
         return run_w4a16_moe(
             a,
             prepared,
-            topk_weights.contiguous(),
-            topk_ids.contiguous(),
+            topk_weights,
+            topk_ids,
             activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
             fast_math=fast_math,
-            intermediate_cache13=buffers.intermediate_cache13,
-            intermediate_cache2=buffers.intermediate_cache2,
+            intermediate_cache13=w4a16_workspace.intermediate_cache13,
+            intermediate_cache2=w4a16_workspace.intermediate_cache2,
             output=scatter_output,
-            fc1_c_tmp=buffers.fc1_c_tmp,
-            fc2_c_tmp=buffers.fc2_c_tmp,
+            fc1_c_tmp=w4a16_workspace.fc1_c_tmp,
+            fc2_c_tmp=w4a16_workspace.fc2_c_tmp,
+            packed_route_indices=w4a16_workspace.packed_route_indices,
+            block_expert_ids=w4a16_workspace.block_expert_ids,
+            packed_route_count=w4a16_workspace.packed_route_count,
+            expert_offsets=w4a16_workspace.expert_offsets,
         )
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
-    if (
-        quant_mode == "nvfp4"
-        and _is_exact_relu2_bs1_nemotron_case(
-            activation=activation,
-            a=a,
-            w1_fp4=w1_fp4,
-            a1_gscale=a1_gscale,
-            a2_gscale=a2_gscale,
-            w2_fp4=w2_fp4,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-        )
+    if quant_mode == "nvfp4" and _is_exact_relu2_bs1_nemotron_case(
+        activation=activation,
+        a=a,
+        w1_fp4=w1_fp4,
+        a1_gscale=a1_gscale,
+        a2_gscale=a2_gscale,
+        w2_fp4=w2_fp4,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
     ):
         scatter_output = _resolve_scatter_output(
             a=a,
@@ -3174,6 +3839,7 @@ def b12x_moe_fp4(
         device=device,
         dtype=a.dtype,
         quant_mode=quant_mode,
+        activation=activation,
         topk_ids=topk_ids,
         eager_exact_dynamic=workspace_policy.eager_exact_dynamic,
     )
@@ -3269,11 +3935,17 @@ def b12x_moe_fp4(
     else:
         scatter_output = output
     if scatter_output.shape != (m, k):
-        raise ValueError(f"output must have shape {(m, k)}, got {tuple(scatter_output.shape)}")
+        raise ValueError(
+            f"output must have shape {(m, k)}, got {tuple(scatter_output.shape)}"
+        )
     if scatter_output.dtype != a.dtype:
-        raise ValueError(f"output must have dtype {a.dtype}, got {scatter_output.dtype}")
+        raise ValueError(
+            f"output must have dtype {a.dtype}, got {scatter_output.dtype}"
+        )
     if scatter_output.device != device:
-        raise ValueError(f"output must be on device {device}, got {scatter_output.device}")
+        raise ValueError(
+            f"output must be on device {device}, got {scatter_output.device}"
+        )
     if not scatter_output.is_contiguous():
         raise ValueError("output must be contiguous")
 
@@ -3297,7 +3969,9 @@ def b12x_moe_fp4(
             stream=stream,
             activation=activation,
             quant_mode=quant_mode,
-            share_input_across_experts=(quant_mode == "nvfp4" and a1_gscale.numel() == 1),
+            share_input_across_experts=(
+                quant_mode == "nvfp4" and a1_gscale.numel() == 1
+            ),
         )
     else:
         _launch_compact_static(
@@ -3336,7 +4010,9 @@ def b12x_moe_fp4(
     return scatter_output
 
 
-def _validate_sparse_routing(hidden_states: torch.Tensor, routing: B12XTopKRouting) -> None:
+def _validate_sparse_routing(
+    hidden_states: torch.Tensor, routing: B12XTopKRouting
+) -> None:
     if routing.topk_ids.ndim != 2:
         raise ValueError(
             f"expected topk_ids with rank 2, got shape {tuple(routing.topk_ids.shape)}"
@@ -3356,17 +4032,26 @@ def _validate_sparse_routing(hidden_states: torch.Tensor, routing: B12XTopKRouti
             "routing batch mismatch: expected "
             f"{hidden_states.shape[0]}, got {routing.topk_ids.shape[0]}"
         )
-    if routing.router_logits is not None and routing.router_logits.shape[0] != hidden_states.shape[0]:
+    if (
+        routing.router_logits is not None
+        and routing.router_logits.shape[0] != hidden_states.shape[0]
+    ):
         raise ValueError(
             "router_logits batch mismatch: expected "
             f"{hidden_states.shape[0]}, got {routing.router_logits.shape[0]}"
         )
-    if routing.flat_ids is not None and routing.flat_ids.numel() != routing.topk_ids.numel():
+    if (
+        routing.flat_ids is not None
+        and routing.flat_ids.numel() != routing.topk_ids.numel()
+    ):
         raise ValueError(
             "flat_ids size mismatch: expected "
             f"{routing.topk_ids.numel()}, got {routing.flat_ids.numel()}"
         )
-    if routing.flat_weights is not None and routing.flat_weights.numel() != routing.topk_weights.numel():
+    if (
+        routing.flat_weights is not None
+        and routing.flat_weights.numel() != routing.topk_weights.numel()
+    ):
         raise ValueError(
             "flat_weights size mismatch: expected "
             f"{routing.topk_weights.numel()}, got {routing.flat_weights.numel()}"
@@ -3397,7 +4082,9 @@ def _alloc_route_workspace(
         logits_dtype=logits_dtype,
     )
     return _TPRouteWorkspace(
-        router_logits=torch.empty(num_tokens, num_experts, device=device, dtype=logits_dtype),
+        router_logits=torch.empty(
+            num_tokens, num_experts, device=device, dtype=logits_dtype
+        ),
         topk_logits=torch.empty(num_tokens, top_k, device=device, dtype=torch.float32),
         topk_ids=torch.empty(num_tokens, top_k, device=device, dtype=torch.int32),
         topk_weights=torch.empty(num_tokens, top_k, device=device, dtype=torch.float32),
@@ -3499,7 +4186,9 @@ def _materialize_route_workspace(
     )
 
 
-def _slice_route_workspace(route_workspace: _TPRouteWorkspace, num_tokens: int) -> _TPRouteWorkspace:
+def _slice_route_workspace(
+    route_workspace: _TPRouteWorkspace, num_tokens: int
+) -> _TPRouteWorkspace:
     if route_workspace.router_logits.shape[0] == num_tokens:
         return route_workspace
     return _TPRouteWorkspace(
@@ -3516,7 +4205,7 @@ def _get_route_workspace(
     num_experts: int,
     top_k: int,
     logits_dtype: torch.dtype,
-    workspace: TPMoEWorkspace | TPMoEWorkspacePool | None,
+    workspace: TPMoEWorkspace | TPW4A16Workspace | TPMoEWorkspacePool | None,
 ) -> _TPRouteWorkspace | None:
     if workspace is None:
         return None
@@ -3771,7 +4460,9 @@ def b12x_route_experts_fast(
         assert gate_weight is not None
         torch.mm(hidden_states, gate_weight.t(), out=route_workspace.router_logits)
         if gate_bias is not None:
-            route_workspace.router_logits.add_(gate_bias.to(route_workspace.router_logits.dtype))
+            route_workspace.router_logits.add_(
+                gate_bias.to(route_workspace.router_logits.dtype)
+            )
         router_logits = route_workspace.router_logits
     else:
         if not router_logits.is_contiguous():
@@ -3833,7 +4524,12 @@ def b12x_sparse_moe_fp4(
     )
 
     if routing is not None:
-        if top_k is not None or gate_weight is not None or gate_bias is not None or router_logits is not None:
+        if (
+            top_k is not None
+            or gate_weight is not None
+            or gate_bias is not None
+            or router_logits is not None
+        ):
             raise ValueError(
                 "routing is mutually exclusive with top_k/gate_weight/gate_bias/router_logits"
             )

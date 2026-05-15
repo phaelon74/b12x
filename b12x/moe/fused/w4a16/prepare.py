@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -43,7 +44,9 @@ class W4A16PackedWeights:
     source_format: str = "modelopt"
 
 
-def _make_workspace(device: torch.device, *, max_blocks_per_sm: int = 4) -> torch.Tensor:
+def _make_workspace(
+    device: torch.device, *, max_blocks_per_sm: int = 4
+) -> torch.Tensor:
     props = torch.cuda.get_device_properties(device)
     sms = int(props.multi_processor_count)
     return torch.zeros(
@@ -88,8 +91,9 @@ def _nvfp4_compute_scale_factor(
     nonzero_mask = ws_float > 0
     if bool(nonzero_mask.any().item()):
         max_val = ws_float[nonzero_mask].max()
-        if bool((max_val < 448 * (2**7)).item()):
-            return float((448 * (2**7) / max_val).log2().floor().exp2().item())
+        max_scalar = float(max_val.item())
+        if max_scalar < 448 * (2**7):
+            return float(2 ** math.floor(math.log2((448 * (2**7)) / max_scalar)))
     return 1.0
 
 
@@ -138,13 +142,17 @@ def _normalize_source_format(source_format: str) -> str:
         ) from exc
 
 
-def _source_global_scale(global_scale: torch.Tensor, *, source_format: str) -> torch.Tensor:
+def _source_global_scale(
+    global_scale: torch.Tensor, *, source_format: str
+) -> torch.Tensor:
     if source_format == "compressed_tensors":
         return (1.0 / global_scale).to(torch.float32).contiguous()
     return global_scale.contiguous()
 
 
-def _repack_4bit_no_perm(qweight_i32: torch.Tensor, *, size_k: int, size_n: int) -> torch.Tensor:
+def _repack_4bit_no_perm(
+    qweight_i32: torch.Tensor, *, size_k: int, size_n: int
+) -> torch.Tensor:
     """Pack 4-bit weights into the W4A16 A16 kernel layout."""
     if qweight_i32.dtype != torch.int32:
         raise TypeError("qweight_i32 must be torch.int32")
@@ -154,7 +162,9 @@ def _repack_4bit_no_perm(qweight_i32: torch.Tensor, *, size_k: int, size_n: int)
             f"got {tuple(qweight_i32.shape)}"
         )
     if size_k % _PACKED_TILE_SIZE != 0 or size_n % _PACKED_TILE_N_SIZE != 0:
-        raise ValueError(f"W4A16 repack requires K,N multiples of 16,64; got {size_k},{size_n}")
+        raise ValueError(
+            f"W4A16 repack requires K,N multiples of 16,64; got {size_k},{size_n}"
+        )
 
     k_tiles = size_k // _PACKED_TILE_SIZE
     n_tiles = size_n // _PACKED_TILE_N_SIZE
@@ -285,7 +295,9 @@ def prepare_w4a16_packed_weights(
     )
 
     packed_w13 = _repack_weight(w13.contiguous(), size_k=hidden_size, size_n=w13_rows)
-    packed_w2 = _repack_weight(w2_fp4.contiguous(), size_k=intermediate_size, size_n=hidden_size)
+    packed_w2 = _repack_weight(
+        w2_fp4.contiguous(), size_k=intermediate_size, size_n=hidden_size
+    )
     w13_global_scale = _source_global_scale(
         w13_global_scale,
         source_format=source_format,
@@ -333,8 +345,16 @@ def make_w4a16_packed_buffers(
     topk: int,
     dtype: torch.dtype,
     device: torch.device,
+    route_num_experts: int | None = None,
 ) -> W4A16PackedBuffers:
-    return _make_w4a16_packed_buffers(prepared, m=m, topk=topk, dtype=dtype, device=device)
+    return _make_w4a16_packed_buffers(
+        prepared,
+        m=m,
+        topk=topk,
+        dtype=dtype,
+        device=device,
+        route_num_experts=route_num_experts,
+    )
 
 
 __all__ = [
