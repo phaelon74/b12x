@@ -165,6 +165,32 @@ def sparse_mla_decode_forward_with_lse(
     return output, lse_base2
 
 
+def sparse_mla_decode_forward_with_lse_natural(
+    *,
+    q_all: torch.Tensor,
+    kv_cache: torch.Tensor,
+    metadata: MLASparseDecodeMetadata,
+    workspace: B12XAttentionWorkspace,
+    sm_scale: float,
+    v_head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    workspace.prepare_decode(
+        metadata.page_table_1,
+        metadata.cache_seqlens_int32,
+        metadata.nsa_cache_seqlens_int32,
+    )
+    output, lse_natural = _run_sparse_mla(
+        q_all=q_all,
+        kv_cache=kv_cache,
+        workspace=workspace,
+        sm_scale=sm_scale,
+        v_head_dim=v_head_dim,
+        return_lse=True,
+        lse_scale="natural",
+    )
+    return output, lse_natural
+
+
 def sparse_mla_extend_forward(
     *,
     q_all: torch.Tensor,
@@ -213,6 +239,32 @@ def sparse_mla_extend_forward_with_lse(
     return output, lse_base2
 
 
+def sparse_mla_extend_forward_with_lse_natural(
+    *,
+    q_all: torch.Tensor,
+    kv_cache: torch.Tensor,
+    metadata: MLASparseExtendMetadata,
+    workspace: B12XAttentionWorkspace,
+    sm_scale: float,
+    v_head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    workspace.prepare_extend(
+        metadata.selected_token_offsets,
+        metadata.cache_seqlens_int32,
+        metadata.nsa_cache_seqlens_int32,
+    )
+    output, lse_natural = _run_sparse_mla(
+        q_all=q_all,
+        kv_cache=kv_cache,
+        workspace=workspace,
+        sm_scale=sm_scale,
+        v_head_dim=v_head_dim,
+        return_lse=True,
+        lse_scale="natural",
+    )
+    return output, lse_natural
+
+
 def _run_sparse_mla(
     *,
     q_all: torch.Tensor,
@@ -221,6 +273,7 @@ def _run_sparse_mla(
     sm_scale: float,
     v_head_dim: int,
     return_lse: bool = False,
+    lse_scale: Literal["base2", "natural"] = "base2",
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     selected_indices = workspace.page_table_1
     active_token_counts = workspace.nsa_cache_seqlens_int32
@@ -373,11 +426,12 @@ def _run_sparse_mla(
             workspace=workspace,
         )
         if return_lse:
-            lse_base2 = _final_lse_base2_from_split_workspace(
+            lse = _final_lse_from_split_workspace(
                 workspace=workspace,
                 q_rows=int(q_all.shape[0]),
                 num_heads=int(q_all.shape[1]),
                 launch_num_chunks=int(launch_num_chunks),
+                scale=lse_scale,
             )
     elif supports_sparse_mla_kernel(
         q_all=q_all,
@@ -422,18 +476,21 @@ def _run_sparse_mla(
             reference_kwargs["return_lse"] = True
         output = sparse_mla_reference(**reference_kwargs)
         if return_lse:
-            output, lse_base2 = output
+            output, lse = output
+            if lse_scale == "natural":
+                lse = lse * _LN2
     if return_lse:
-        return output, lse_base2
+        return output, lse
     return output
 
 
-def _final_lse_base2_from_split_workspace(
+def _final_lse_from_split_workspace(
     *,
     workspace: B12XAttentionWorkspace,
     q_rows: int,
     num_heads: int,
     launch_num_chunks: int,
+    scale: Literal["base2", "natural"] = "base2",
 ) -> torch.Tensor:
     if workspace.tmp_lse is None:
         raise RuntimeError("workspace is missing split MLA LSE buffer")
@@ -441,7 +498,10 @@ def _final_lse_base2_from_split_workspace(
     chunk_lse_base2 = workspace.tmp_lse[:q_rows, :num_heads, :chunk_count].to(
         torch.float32
     )
-    return torch.logsumexp(chunk_lse_base2 * _LN2, dim=-1) / _LN2
+    lse_natural = torch.logsumexp(chunk_lse_base2 * _LN2, dim=-1)
+    if scale == "natural":
+        return lse_natural
+    return lse_natural / _LN2
 
 
 def _get_sm_scale_tensor(

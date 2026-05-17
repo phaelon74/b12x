@@ -28,8 +28,10 @@ from .mla import (
     clear_mla_caches,
     sparse_mla_decode_forward,
     sparse_mla_decode_forward_with_lse,
+    sparse_mla_decode_forward_with_lse_natural,
     sparse_mla_extend_forward,
     sparse_mla_extend_forward_with_lse,
+    sparse_mla_extend_forward_with_lse_natural,
 )
 from .nsa_indexer import (
     NSAIndexerExtendLogitsMetadata,
@@ -79,8 +81,10 @@ __all__ = [
     "clear_mla_caches",
     "sparse_mla_decode_forward",
     "sparse_mla_decode_forward_with_lse",
+    "sparse_mla_decode_forward_with_lse_natural",
     "sparse_mla_extend_forward",
     "sparse_mla_extend_forward_with_lse",
+    "sparse_mla_extend_forward_with_lse_natural",
     "NSAIndexerExtendLogitsMetadata",
     "NSAIndexerPagedDecodeMetadata",
     "clear_nsa_indexer_caches",

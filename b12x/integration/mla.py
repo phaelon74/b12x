@@ -14,9 +14,11 @@ from b12x.attention.mla import (
     pack_mla_kv_cache_reference,
     sparse_mla_decode_forward,
     sparse_mla_decode_forward_with_lse,
+    sparse_mla_decode_forward_with_lse_natural,
     sparse_mla_reference,
     sparse_mla_extend_forward,
     sparse_mla_extend_forward_with_lse,
+    sparse_mla_extend_forward_with_lse_natural,
     unpack_mla_kv_cache_reference,
 )
 
@@ -32,8 +34,10 @@ __all__ = [
     "pack_mla_kv_cache_reference",
     "sparse_mla_decode_forward",
     "sparse_mla_decode_forward_with_lse",
+    "sparse_mla_decode_forward_with_lse_natural",
     "sparse_mla_reference",
     "sparse_mla_extend_forward",
     "sparse_mla_extend_forward_with_lse",
+    "sparse_mla_extend_forward_with_lse_natural",
     "unpack_mla_kv_cache_reference",
 ]

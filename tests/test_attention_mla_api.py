@@ -11,6 +11,7 @@ from b12x.integration.mla import (
     B12XAttentionWorkspace,
     sparse_mla_decode_forward,
     sparse_mla_decode_forward_with_lse,
+    sparse_mla_decode_forward_with_lse_natural,
     sparse_mla_extend_forward,
 )
 from b12x.attention.mla import kernel as mla_kernel
@@ -144,6 +145,67 @@ def test_sparse_mla_decode_with_lse_reduces_split_chunks(monkeypatch) -> None:
     expected_row0 = math.log2(3.0)
     assert torch.allclose(lse_base2[0], torch.full((8,), expected_row0))
     assert torch.allclose(lse_base2[1], torch.full((8,), 2.0))
+
+
+def test_sparse_mla_decode_with_lse_natural_reduces_in_natural_units(
+    monkeypatch,
+) -> None:
+    workspace = _make_workspace(mode="decode")
+
+    def fake_select_split(**kwargs):
+        del kwargs
+        from b12x.attention.mla.split import SparseMLASplitDecodeConfig
+
+        return SparseMLASplitDecodeConfig(chunk_size=2, num_chunks=2)
+
+    def fake_run_split_decode(**kwargs):
+        output = kwargs["output"]
+        output.zero_()
+        tmp_lse = kwargs["tmp_lse"]
+        tmp_lse.fill_(float("-inf"))
+        tmp_lse[:2, :8, 0] = torch.tensor(
+            [[0.0] * 8, [float("-inf")] * 8],
+            dtype=tmp_lse.dtype,
+        )
+        tmp_lse[:2, :8, 1] = torch.tensor(
+            [[1.0] * 8, [2.0] * 8],
+            dtype=tmp_lse.dtype,
+        )
+
+    monkeypatch.setattr(
+        "b12x.attention.mla.api.select_sparse_mla_split_decode_config",
+        fake_select_split,
+    )
+    monkeypatch.setattr(
+        "b12x.attention.mla.api.run_sparse_mla_split_decode",
+        fake_run_split_decode,
+    )
+
+    q_all = torch.ones((2, 8, 256), dtype=torch.bfloat16)
+    kv_cache = torch.zeros((16, 1, 656), dtype=torch.uint8)
+    page_table_1 = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32)
+    cache_seqlens = torch.tensor([8, 8], dtype=torch.int32)
+    metadata = MLASparseDecodeMetadata(
+        page_table_1=page_table_1,
+        cache_seqlens_int32=cache_seqlens,
+        nsa_cache_seqlens_int32=cache_seqlens,
+        max_seq_len_k=8,
+    )
+
+    output, lse_natural = sparse_mla_decode_forward_with_lse_natural(
+        q_all=q_all,
+        kv_cache=kv_cache,
+        metadata=metadata,
+        workspace=workspace,
+        sm_scale=0.5,
+        v_head_dim=256,
+    )
+
+    assert output.shape == (2, 8, 256)
+    assert lse_natural.shape == (2, 8)
+    expected_row0 = math.log(3.0)
+    assert torch.allclose(lse_natural[0], torch.full((8,), expected_row0))
+    assert torch.allclose(lse_natural[1], torch.full((8,), 2.0 * math.log(2.0)))
 
 
 def test_sparse_mla_extend_uses_bound_metadata(monkeypatch) -> None:
