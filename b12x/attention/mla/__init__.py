@@ -3,11 +3,7 @@ from .api import (
     MLASparseExtendMetadata,
     clear_mla_caches,
     sparse_mla_decode_forward,
-    sparse_mla_decode_forward_with_lse,
-    sparse_mla_decode_forward_with_lse_natural,
     sparse_mla_extend_forward,
-    sparse_mla_extend_forward_with_lse,
-    sparse_mla_extend_forward_with_lse_natural,
 )
 from .reference import (
     dense_mla_reference,
@@ -33,11 +29,7 @@ __all__ = [
     "dense_mla_reference",
     "pack_mla_kv_cache_reference",
     "sparse_mla_decode_forward",
-    "sparse_mla_decode_forward_with_lse",
-    "sparse_mla_decode_forward_with_lse_natural",
     "sparse_mla_reference",
     "sparse_mla_extend_forward",
-    "sparse_mla_extend_forward_with_lse",
-    "sparse_mla_extend_forward_with_lse_natural",
     "unpack_mla_kv_cache_reference",
 ]

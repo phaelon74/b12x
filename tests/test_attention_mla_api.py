@@ -10,8 +10,6 @@ from b12x.integration.mla import (
     MLASparseExtendMetadata,
     B12XAttentionWorkspace,
     sparse_mla_decode_forward,
-    sparse_mla_decode_forward_with_lse,
-    sparse_mla_decode_forward_with_lse_natural,
     sparse_mla_extend_forward,
 )
 from b12x.attention.mla import kernel as mla_kernel
@@ -73,7 +71,9 @@ def test_sparse_mla_decode_keeps_query_head_shape(monkeypatch) -> None:
     output = sparse_mla_decode_forward(
         q_all=q_all,
         kv_cache=kv_cache,
-        metadata=metadata,
+        page_table_1=metadata.page_table_1,
+        cache_seqlens_int32=metadata.cache_seqlens_int32,
+        nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
         workspace=workspace,
         sm_scale=0.5,
         v_head_dim=256,
@@ -84,8 +84,6 @@ def test_sparse_mla_decode_keeps_query_head_shape(monkeypatch) -> None:
     assert captured["page_table_1"].shape == (2, 4)
     assert captured["sm_scale"] == 0.5
     assert captured["d_v"] == 256
-    assert workspace.page_table_1 is not page_table_1
-    assert torch.equal(workspace.page_table_1, page_table_1)
 
 
 def test_sparse_mla_decode_with_lse_reduces_split_chunks(monkeypatch) -> None:
@@ -131,13 +129,16 @@ def test_sparse_mla_decode_with_lse_reduces_split_chunks(monkeypatch) -> None:
         max_seq_len_k=8,
     )
 
-    output, lse_base2 = sparse_mla_decode_forward_with_lse(
+    output, lse_base2 = sparse_mla_decode_forward(
         q_all=q_all,
         kv_cache=kv_cache,
-        metadata=metadata,
+        page_table_1=metadata.page_table_1,
+        cache_seqlens_int32=metadata.cache_seqlens_int32,
+        nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
         workspace=workspace,
         sm_scale=0.5,
         v_head_dim=256,
+        return_lse=True,
     )
 
     assert output.shape == (2, 8, 256)
@@ -192,13 +193,17 @@ def test_sparse_mla_decode_with_lse_natural_reduces_in_natural_units(
         max_seq_len_k=8,
     )
 
-    output, lse_natural = sparse_mla_decode_forward_with_lse_natural(
+    output, lse_natural = sparse_mla_decode_forward(
         q_all=q_all,
         kv_cache=kv_cache,
-        metadata=metadata,
+        page_table_1=metadata.page_table_1,
+        cache_seqlens_int32=metadata.cache_seqlens_int32,
+        nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
         workspace=workspace,
         sm_scale=0.5,
         v_head_dim=256,
+        return_lse=True,
+        lse_scale="natural",
     )
 
     assert output.shape == (2, 8, 256)
@@ -208,7 +213,7 @@ def test_sparse_mla_decode_with_lse_natural_reduces_in_natural_units(
     assert torch.allclose(lse_natural[1], torch.full((8,), 2.0 * math.log(2.0)))
 
 
-def test_sparse_mla_extend_uses_bound_metadata(monkeypatch) -> None:
+def test_sparse_mla_extend_passes_runtime_metadata(monkeypatch) -> None:
     workspace = _make_workspace(mode="extend", topk=6)
 
     def fake_sparse_mla_reference(
@@ -254,17 +259,15 @@ def test_sparse_mla_extend_uses_bound_metadata(monkeypatch) -> None:
     output = sparse_mla_extend_forward(
         q_all=q_all,
         kv_cache=kv_cache,
-        metadata=metadata,
+        selected_token_offsets=metadata.selected_token_offsets,
+        cache_seqlens_int32=metadata.cache_seqlens_int32,
+        nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
         workspace=workspace,
         sm_scale=1.0,
         v_head_dim=256,
     )
 
     assert output.shape == (3, 8, 256)
-    assert workspace.cache_seqlens_int32 is not cache_seqlens
-    assert workspace.nsa_cache_seqlens_int32 is not cache_seqlens
-    assert torch.equal(workspace.cache_seqlens_int32, cache_seqlens)
-    assert torch.equal(workspace.nsa_cache_seqlens_int32, cache_seqlens)
 
 
 def test_mla_verify_workspace_allocates_split_buffers() -> None:
@@ -470,7 +473,9 @@ def test_sparse_mla_verify_prefers_split_path(monkeypatch) -> None:
     output = sparse_mla_extend_forward(
         q_all=q_all,
         kv_cache=kv_cache,
-        metadata=metadata,
+        selected_token_offsets=metadata.selected_token_offsets,
+        cache_seqlens_int32=metadata.cache_seqlens_int32,
+        nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
         workspace=workspace,
         sm_scale=1.0,
         v_head_dim=256,
@@ -534,7 +539,9 @@ def test_sparse_mla_extend_prefers_split_path(monkeypatch) -> None:
     output = sparse_mla_extend_forward(
         q_all=q_all,
         kv_cache=kv_cache,
-        metadata=metadata,
+        selected_token_offsets=metadata.selected_token_offsets,
+        cache_seqlens_int32=metadata.cache_seqlens_int32,
+        nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
         workspace=workspace,
         sm_scale=1.0,
         v_head_dim=256,
@@ -611,7 +618,9 @@ def test_sparse_mla_large_bs1_extend_prefers_single_pass(monkeypatch) -> None:
     output = sparse_mla_extend_forward(
         q_all=q_all,
         kv_cache=kv_cache,
-        metadata=metadata,
+        selected_token_offsets=metadata.selected_token_offsets,
+        cache_seqlens_int32=metadata.cache_seqlens_int32,
+        nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
         workspace=workspace,
         sm_scale=1.0,
         v_head_dim=256,
@@ -670,7 +679,9 @@ def test_sparse_mla_extend_passes_active_token_counts_to_kernel(monkeypatch) -> 
     output = sparse_mla_extend_forward(
         q_all=q_all,
         kv_cache=kv_cache,
-        metadata=metadata,
+        selected_token_offsets=metadata.selected_token_offsets,
+        cache_seqlens_int32=metadata.cache_seqlens_int32,
+        nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
         workspace=workspace,
         sm_scale=1.0,
         v_head_dim=256,
@@ -680,7 +691,7 @@ def test_sparse_mla_extend_passes_active_token_counts_to_kernel(monkeypatch) -> 
     assert torch.equal(captured["active_token_counts"], nsa_cache_seqlens)
 
 
-def test_mla_workspace_graph_mode_copies_runtime_metadata() -> None:
+def test_mla_workspace_graph_mode_does_not_own_runtime_metadata() -> None:
     workspace = B12XAttentionWorkspace.for_contract(
         mode="decode",
         device="cpu",
@@ -695,17 +706,9 @@ def test_mla_workspace_graph_mode_copies_runtime_metadata() -> None:
         use_cuda_graph=True,
     )
 
-    page_table_1 = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32)
-    cache_seqlens = torch.tensor([8, 8], dtype=torch.int32)
-    nsa_cache_seqlens = torch.tensor([4, 4], dtype=torch.int32)
-    workspace.prepare_decode(page_table_1, cache_seqlens, nsa_cache_seqlens)
-
-    assert workspace.page_table_1 is not page_table_1
-    assert workspace.cache_seqlens_int32 is not cache_seqlens
-    assert workspace.nsa_cache_seqlens_int32 is not nsa_cache_seqlens
-    assert torch.equal(workspace.page_table_1, page_table_1)
-    assert torch.equal(workspace.cache_seqlens_int32, cache_seqlens)
-    assert torch.equal(workspace.nsa_cache_seqlens_int32, nsa_cache_seqlens)
+    assert not hasattr(workspace, "page_table_1")
+    assert not hasattr(workspace, "cache_seqlens_int32")
+    assert not hasattr(workspace, "nsa_cache_seqlens_int32")
 
 
 def test_mla_decode_workspace_allocates_split_buffers_and_chunk_scalars() -> None:
@@ -739,8 +742,17 @@ def test_mla_workspace_enforces_capacity_limits() -> None:
         too_wide = torch.zeros((2, 5), dtype=torch.int32)
         cache_seqlens = torch.zeros((2,), dtype=torch.int32)
         try:
-            workspace.prepare_decode(too_wide, cache_seqlens, cache_seqlens)
+            sparse_mla_decode_forward(
+                q_all=torch.zeros((2, 8, 256), dtype=torch.bfloat16),
+                kv_cache=torch.zeros((16, 1, 656), dtype=torch.uint8),
+                page_table_1=too_wide,
+                cache_seqlens_int32=cache_seqlens,
+                nsa_cache_seqlens_int32=cache_seqlens,
+                workspace=workspace,
+                sm_scale=1.0,
+                v_head_dim=256,
+            )
         except ValueError as exc:
-            assert "topk capacity" in str(exc)
+            assert "exceeds workspace topk" in str(exc)
         else:
             raise AssertionError("expected capacity validation to fail")
