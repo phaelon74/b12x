@@ -83,7 +83,9 @@ _MLA_ROPE_U32_OFFSET = _MLA_SCALE_U32_OFFSET + _MLA_SCALE_GROUPS
 _MLA_NUM_MMA_KV = 2
 _MLA_QK_NUM_MMA_D = 4
 _MLA_VO_NUM_MMA_D = _MLA_NOPE_GROUP_ELEMS // 16
-_EAGER_HOST_LAUNCHER_CACHE_SIZE = 32
+_EAGER_HOST_LAUNCHER_CACHE_SIZE = int(
+    os.getenv("B12X_EAGER_HOST_LAUNCHER_CACHE_SIZE", "512")
+)
 
 
 def _torch_to_cutlass_dtype(dtype: torch.dtype) -> type[cutlass.Numeric]:

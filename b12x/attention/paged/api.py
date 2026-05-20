@@ -23,7 +23,9 @@ from .merge import PagedPersistentMergeKernel, default_paged_persistent_ctas
 from .traits import PagedForwardTraits, select_paged_forward_traits_from_plan
 from .workspace import PagedAttentionWorkspace
 
-_EAGER_HOST_LAUNCHER_CACHE_SIZE = 32
+_EAGER_HOST_LAUNCHER_CACHE_SIZE = int(
+    os.getenv("B12X_EAGER_HOST_LAUNCHER_CACHE_SIZE", "512")
+)
 _DECODE_NATIVE_FP8_QKV_MAX_SMALL_BATCH = 2
 _DECODE_NATIVE_FP8_QKV_MIN_LONG_CHUNK_PAGES = 11
 

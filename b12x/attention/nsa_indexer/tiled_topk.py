@@ -35,6 +35,9 @@ from b12x.cute.fp4 import (
 from b12x.cute.utils import current_cuda_stream
 from b12x.runtime_control import raise_if_kernel_resolution_frozen
 
+_EAGER_HOST_LAUNCHER_CACHE_SIZE = int(
+    os.getenv("B12X_EAGER_HOST_LAUNCHER_CACHE_SIZE", "512")
+)
 _THREADS_PER_CTA = 1024
 _TOPK = 2048
 _RADIX = 256
@@ -199,7 +202,7 @@ def _run_cached_host_launcher(kernel, cache_key, args):
             )
             compiled = kernel(*args, compile_only=True)
         cache[cache_key] = compiled
-        if len(cache) > 32:
+        if len(cache) > _EAGER_HOST_LAUNCHER_CACHE_SIZE:
             cache.popitem(last=False)
     exe_args, _ = compiled.generate_execution_args(*args)
     compiled.run_compiled_program(exe_args)

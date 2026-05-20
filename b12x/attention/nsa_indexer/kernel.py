@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from functools import lru_cache
+import os
 import warnings
 
 import cuda.bindings.driver as cuda
@@ -47,7 +48,9 @@ _SCHEDULE_SINGLE_ROW_PARALLEL_CTAS = 4
 _SCHEDULE_MULTI_ROW_PARALLEL_CTAS = 4
 _SCHEDULE_MULTI_ROW_MAX_Q_ROWS = 8
 _MAX_SUPPORTED_Q_HEADS = 64
-_EAGER_HOST_LAUNCHER_CACHE_SIZE = 32
+_EAGER_HOST_LAUNCHER_CACHE_SIZE = int(
+    os.getenv("B12X_EAGER_HOST_LAUNCHER_CACHE_SIZE", "512")
+)
 _PAGED_Q_HEAD_TILE = 16
 _PAGED_K_TMA_DESC_CACHE_SIZE = 32
 _BLACKWELL_TMA_DESC_WORDS = 16
