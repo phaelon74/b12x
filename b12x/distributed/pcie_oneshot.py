@@ -59,6 +59,17 @@ def _normalize_device(device: torch.device | int | str) -> torch.device:
     return torch.device(device)
 
 
+def _current_stream_key(device: torch.device | int | str, stream: object = None) -> Optional[int]:
+    device_obj = _normalize_device(device)
+    if device_obj.type != "cuda":
+        return None
+    if stream is None:
+        stream = torch.cuda.current_stream(device_obj)
+    if hasattr(stream, "cuda_stream"):
+        return int(stream.cuda_stream)
+    return int(stream)
+
+
 def _is_weak_contiguous(inp: torch.Tensor) -> bool:
     if inp.is_contiguous():
         return True
@@ -85,15 +96,32 @@ def _group_ranks(group: ProcessGroup) -> list[int]:
     return list(range(world_size))
 
 
+def _object_broadcast_device(group: ProcessGroup) -> torch.device | str:
+    try:
+        try:
+            backend = dist.get_backend(group=group)
+        except TypeError:
+            backend = dist.get_backend(group)
+    except Exception as exc:
+        raise RuntimeError("PCIe oneshot IPC exchange requires a CUDA/NCCL process group") from exc
+    backend_name = str(backend).lower()
+    if "nccl" not in backend_name:
+        raise RuntimeError(f"PCIe oneshot IPC exchange requires an NCCL process group, got {backend}")
+    if not torch.cuda.is_available():
+        raise RuntimeError("PCIe oneshot IPC exchange requires CUDA")
+    return torch.device("cuda", torch.cuda.current_device())
+
+
 def _broadcast_gather_object(local_object: object, group: ProcessGroup) -> list[object]:
     # `broadcast_object_list` is more robust than `all_gather_object` for
-    # the CPU-side exchange that happens around IPC setup and graph capture.
+    # the host-side exchange that happens around IPC setup and graph capture.
     world_size = dist.get_world_size(group=group)
     rank = dist.get_rank(group=group)
     all_objects: list[list[object | None]] = [[None] for _ in range(world_size)]
     all_objects[rank][0] = local_object
+    device = _object_broadcast_device(group)
     for index, src_rank in enumerate(_group_ranks(group)):
-        dist.broadcast_object_list(all_objects[index], src=src_rank, group=group, device="cpu")
+        dist.broadcast_object_list(all_objects[index], src=src_rank, group=group, device=device)
     return [entry[0] for entry in all_objects]
 
 
@@ -221,6 +249,7 @@ class PCIeOneshotAllReduce:
         self._signal_ptrs = tuple(int(ptr) for ptr in signal_ptrs)
         self._owned_buffers = list(owned_buffers or [])
         self._registered_input_ptrs: dict[int, tuple[int, ...]] = {}
+        self._owner_stream_key: Optional[int] = None
         self._closed = False
         self._ext = ext_module or _load_extension()
 
@@ -391,6 +420,21 @@ class PCIeOneshotAllReduce:
     def signal_ptrs(self) -> tuple[int, ...]:
         return self._signal_ptrs
 
+    def _bind_stream_key(self, stream_key: Optional[int]) -> None:
+        if stream_key is None:
+            return
+        if self._owner_stream_key is None:
+            self._owner_stream_key = int(stream_key)
+            return
+        if self._owner_stream_key != int(stream_key):
+            raise RuntimeError(
+                "PCIe oneshot allreduce channels are stream-affine; "
+                "create or use a separate channel for each CUDA stream"
+            )
+
+    def _check_stream(self, stream: object = None) -> None:
+        self._bind_stream_key(_current_stream_key(self.device, stream))
+
     def should_allreduce(self, inp: torch.Tensor) -> bool:
         if self._closed:
             return False
@@ -456,6 +500,7 @@ class PCIeOneshotAllReduce:
             raise RuntimeError("runtime is closed")
         if inp.device != self.device:
             raise ValueError(f"input device {inp.device} does not match runtime device {self.device}")
+        self._check_stream()
         if not self.should_allreduce(inp):
             raise ValueError(
                 "input does not satisfy device/dtype/size/alignment/contiguity requirements "
@@ -489,19 +534,26 @@ class PCIeOneshotAllReduce:
         return out
 
     @contextmanager
-    def capture(self):
-        if self.exchange_group is None:
+    def capture(self, stream: object = None):
+        if self.exchange_group is None and self._eager_ptrs is None:
             raise ValueError("exchange_group is required for CUDA graph capture registration")
+        self._check_stream(stream)
         try:
             yield
         finally:
-            self.register_graph_buffers()
+            if self.exchange_group is not None and self._eager_ptrs is None:
+                self.register_graph_buffers()
 
     def register_graph_buffers(self) -> None:
         if self.exchange_group is None:
             raise ValueError("exchange_group is required to register graph buffers")
         local_meta = self.get_graph_buffer_ipc_meta()
         all_meta = _broadcast_gather_object(local_meta, self.exchange_group)
+        num_buffers = [len(entry[1]) for entry in all_meta]
+        if any(count != num_buffers[0] for count in num_buffers):
+            raise RuntimeError("graph capture registered a different number of buffers across ranks")
+        if num_buffers[0] == 0:
+            return
         self.register_graph_buffers_from_ranks(
             [entry[0] for entry in all_meta],
             [entry[1] for entry in all_meta],
@@ -517,6 +569,7 @@ class PCIeOneshotAllReduce:
     ) -> tuple[float, float]:
         if self.exchange_group is None:
             raise ValueError("exchange_group is required for graph-based autotuning")
+        self._check_stream(stream)
 
         numel = size_bytes // torch.tensor([], dtype=torch.bfloat16).element_size()
         device = self.device
@@ -630,8 +683,213 @@ class PCIeOneshotAllReduce:
             pass
 
 
+def _is_current_stream_capturing(device: torch.device) -> bool:
+    if device.type != "cuda":
+        return False
+    is_capturing = getattr(torch.cuda, "is_current_stream_capturing", None)
+    if is_capturing is None:
+        return False
+    return bool(is_capturing())
+
+
+class PCIeOneshotAllReducePool:
+    """Stream-affine PCIe oneshot wrapper.
+
+    A ``PCIeOneshotAllReduce`` instance is a single ordered channel with one
+    signal buffer and one double-buffered staging pair. The pool creates a
+    separate channel for each CUDA stream key so multi-stream callers never
+    reuse those buffers concurrently.
+    """
+
+    def __init__(
+        self,
+        *,
+        rank: int,
+        world_size: int,
+        device: torch.device | int | str,
+        exchange_group: Optional[ProcessGroup] = None,
+        process_group: Optional[ProcessGroup] = None,
+        eager_buffer_bytes: int = DEFAULT_MAX_SIZE,
+        max_size: int = DEFAULT_MAX_SIZE,
+        rank_data_bytes: int = DEFAULT_RANK_DATA_BYTES,
+        ext_module=None,
+        ipc: Optional[CudaRTLibrary] = None,
+        channel_factory: Optional[Callable[[Optional[int]], PCIeOneshotAllReduce]] = None,
+    ):
+        if world_size not in SUPPORTED_WORLD_SIZES:
+            raise ValueError(f"unsupported world size {world_size}")
+        if rank < 0 or rank >= world_size:
+            raise ValueError(f"invalid rank {rank} for world size {world_size}")
+
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.device = _normalize_device(device)
+        self.exchange_group = _resolve_exchange_group(exchange_group, process_group)
+        self.process_group = self.exchange_group
+        self.eager_buffer_bytes = int(eager_buffer_bytes)
+        self.max_size = int(max_size)
+        self.rank_data_bytes = int(rank_data_bytes)
+        self._channel_factory = channel_factory
+        self._channels: dict[int, PCIeOneshotAllReduce] = {}
+        self._closed = False
+
+        self._ipc = ipc
+        self._ext = ext_module
+        if self._channel_factory is None:
+            if self.exchange_group is None:
+                raise ValueError("exchange_group is required unless channel_factory is provided")
+            if self.device.type != "cuda":
+                raise ValueError("PCIe oneshot pool requires a CUDA device")
+            self._ipc = self._ipc or CudaRTLibrary()
+            self._ipc.cudaSetDevice(self.device.index or 0)
+            self._ext = self._ext or _load_extension()
+
+    @classmethod
+    def from_exchange_group(
+        cls,
+        *,
+        exchange_group: ProcessGroup,
+        device: torch.device | int | str,
+        eager_buffer_bytes: int = DEFAULT_MAX_SIZE,
+        max_size: int = DEFAULT_MAX_SIZE,
+        rank_data_bytes: int = DEFAULT_RANK_DATA_BYTES,
+        ext_module=None,
+    ) -> "PCIeOneshotAllReducePool":
+        return cls(
+            rank=dist.get_rank(group=exchange_group),
+            world_size=dist.get_world_size(group=exchange_group),
+            device=device,
+            exchange_group=exchange_group,
+            eager_buffer_bytes=eager_buffer_bytes,
+            max_size=max_size,
+            rank_data_bytes=rank_data_bytes,
+            ext_module=ext_module,
+        )
+
+    @classmethod
+    def from_process_group(
+        cls,
+        *,
+        process_group: ProcessGroup,
+        device: torch.device | int | str,
+        max_input_bytes: int = DEFAULT_MAX_SIZE,
+        eager_buffer_bytes: Optional[int] = None,
+        max_size: int = DEFAULT_MAX_SIZE,
+        rank_data_bytes: int = DEFAULT_RANK_DATA_BYTES,
+        ext_module=None,
+    ) -> "PCIeOneshotAllReducePool":
+        return cls.from_exchange_group(
+            exchange_group=process_group,
+            device=device,
+            eager_buffer_bytes=max_input_bytes if eager_buffer_bytes is None else eager_buffer_bytes,
+            max_size=max_size,
+            rank_data_bytes=rank_data_bytes,
+            ext_module=ext_module,
+        )
+
+    def _new_channel(self, stream_key: Optional[int]) -> PCIeOneshotAllReduce:
+        if self._channel_factory is not None:
+            channel = self._channel_factory(stream_key)
+            channel._bind_stream_key(stream_key)
+            return channel
+
+        if self.exchange_group is None or self._ipc is None or self._ext is None:
+            raise RuntimeError("pool is not configured to allocate channels")
+
+        owned_buffers: list[_OwnedSharedBuffer] = []
+        signal_buf = PCIeOneshotAllReduce._allocate_shared_buffer(
+            self.exchange_group,
+            self._ext.meta_size(),
+            zero_fill=True,
+            ipc=self._ipc,
+        )
+        owned_buffers.append(signal_buf)
+        eager0 = PCIeOneshotAllReduce._allocate_shared_buffer(
+            self.exchange_group,
+            self.eager_buffer_bytes,
+            zero_fill=False,
+            ipc=self._ipc,
+        )
+        eager1 = PCIeOneshotAllReduce._allocate_shared_buffer(
+            self.exchange_group,
+            self.eager_buffer_bytes,
+            zero_fill=False,
+            ipc=self._ipc,
+        )
+        owned_buffers.extend([eager0, eager1])
+
+        channel = PCIeOneshotAllReduce(
+            rank=self.rank,
+            world_size=self.world_size,
+            device=self.device,
+            signal_ptrs=signal_buf.peer_ptrs,
+            eager_buffer_ptrs0=eager0.peer_ptrs,
+            eager_buffer_ptrs1=eager1.peer_ptrs,
+            exchange_group=self.exchange_group,
+            ipc=self._ipc,
+            owned_buffers=owned_buffers,
+            max_size=self.max_size,
+            rank_data_bytes=self.rank_data_bytes,
+            ext_module=self._ext,
+        )
+        channel._bind_stream_key(stream_key)
+        return channel
+
+    def for_stream(self, stream: object = None) -> PCIeOneshotAllReduce:
+        if self._closed:
+            raise RuntimeError("pool is closed")
+        stream_key = _current_stream_key(self.device, stream)
+        channel_key = 0 if stream_key is None else int(stream_key)
+        channel = self._channels.get(channel_key)
+        if channel is not None:
+            return channel
+        if _is_current_stream_capturing(self.device):
+            raise RuntimeError(
+                "PCIe oneshot pool cannot allocate a new stream channel during CUDA graph capture; "
+                "call for_stream(stream) before capture starts"
+            )
+        channel = self._new_channel(stream_key)
+        self._channels[channel_key] = channel
+        return channel
+
+    def all_reduce(
+        self,
+        inp: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+        peer_input_ptrs: Optional[Sequence[int]] = None,
+        stream: object = None,
+    ) -> torch.Tensor:
+        channel = self.for_stream(stream)
+        if stream is not None and self.device.type == "cuda":
+            with torch.cuda.stream(stream):
+                return channel.all_reduce(inp, out=out, peer_input_ptrs=peer_input_ptrs)
+        return channel.all_reduce(inp, out=out, peer_input_ptrs=peer_input_ptrs)
+
+    @contextmanager
+    def capture(self, stream: object = None):
+        channel = self.for_stream(stream)
+        with channel.capture(stream=stream):
+            yield channel
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for channel in self._channels.values():
+            channel.close()
+        self._channels.clear()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 __all__ = [
     "PCIeOneshotAllReduce",
+    "PCIeOneshotAllReducePool",
     "SUPPORTED_WORLD_SIZES",
     "parse_pcie_oneshot_max_size",
 ]

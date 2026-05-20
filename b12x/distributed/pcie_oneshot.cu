@@ -163,8 +163,10 @@ DINLINE P packed_reduce(const P* ptrs[], int idx) {
   return downcast<P>(tmp);
 }
 
-// 1-stage allreduce with staggered peer reads and start-barrier-only.
-// The end barrier is avoided by alternating between two eager IPC buffers.
+// 1-stage allreduce with staggered peer reads and start-barrier-only. The end
+// barrier is avoided by alternating between eager IPC buffers in a single
+// ordered channel. Callers must not share a channel concurrently across CUDA
+// streams; multi-stream use needs separate signal and staging buffers.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1) pcie_allreduce_kernel(
     RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size) {
@@ -306,15 +308,16 @@ class PCIeAllreduce {
     cudaStreamCaptureStatus status;
     CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &status));
 
-    if (dbuf_enabled_ && status != cudaStreamCaptureStatusActive) {
+    if (dbuf_enabled_) {
       int slot = dbuf_slot_ % 2;
       dbuf_slot_++;
       auto input_size = size * sizeof(T);
       AT_CUDA_CHECK(cudaMemcpyAsync(dbuf_raw_[slot][rank_], input, input_size, cudaMemcpyDeviceToDevice, stream));
       ptrs = dbuf_rd_[slot];
     } else if (status == cudaStreamCaptureStatusActive) {
-      ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
-      graph_unreg_buffers_.push_back(input);
+      throw std::runtime_error(
+          "PCIe oneshot graph capture requires eager IPC buffers; construct the runtime with eager buffers or use "
+          "PCIeOneshotAllReducePool");
     } else {
       auto it = buffers_.find(input);
       if (it == buffers_.end())
@@ -384,7 +387,7 @@ static void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, fptr_
   auto input_size = inp.numel() * inp.element_size();
 
   // When double-buffer is active, allreduce handles the memcpy and slot
-  // alternation internally.
+  // alternation internally, including under CUDA graph capture.
   void* reg_buffer;
   if (fa->dbuf_enabled_) {
     reg_buffer = inp.data_ptr();

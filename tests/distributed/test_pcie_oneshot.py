@@ -5,6 +5,7 @@ import torch
 
 from b12x.distributed.pcie_oneshot import (
     PCIeOneshotAllReduce,
+    PCIeOneshotAllReducePool,
     _compute_crossover_size,
     parse_pcie_oneshot_max_size,
 )
@@ -48,7 +49,20 @@ class _FakeExt:
         self.register_graph_buffers_calls.append((ptr, handles, offsets))
 
 
-def _make_runtime(*, rank=0, world_size=2, exchange_group=None, max_size=8 * 1024 * 1024):
+def _make_runtime(
+    *,
+    rank=0,
+    world_size=2,
+    exchange_group=None,
+    max_size=8 * 1024 * 1024,
+    eager=False,
+    ext=None,
+):
+    ext = ext or _FakeExt()
+    kwargs = {}
+    if eager:
+        kwargs["eager_buffer_ptrs0"] = tuple(range(200, 200 + world_size))
+        kwargs["eager_buffer_ptrs1"] = tuple(range(300, 300 + world_size))
     return PCIeOneshotAllReduce(
         rank=rank,
         world_size=world_size,
@@ -56,7 +70,8 @@ def _make_runtime(*, rank=0, world_size=2, exchange_group=None, max_size=8 * 102
         signal_ptrs=tuple(range(100, 100 + world_size)),
         exchange_group=exchange_group,
         max_size=max_size,
-        ext_module=_FakeExt(),
+        ext_module=ext,
+        **kwargs,
     )
 
 
@@ -131,6 +146,36 @@ def test_all_reduce_requires_registration_without_eager_buffers():
         runtime.all_reduce(inp)
 
 
+def test_eager_buffers_allow_all_reduce_without_peer_ptrs():
+    runtime = _make_runtime(eager=True)
+    ext = runtime._ext
+    inp = torch.arange(8, dtype=torch.bfloat16)
+
+    out = runtime.all_reduce(inp)
+
+    assert torch.equal(out, inp)
+    assert ext.register_pcie_buffers_calls == [(12345, (200, 201), (300, 301))]
+    assert ext.register_buffer_calls == []
+    assert len(ext.all_reduce_calls) == 1
+
+
+def test_runtime_rejects_reuse_from_another_stream_key(monkeypatch):
+    runtime = _make_runtime(eager=True)
+    inp = torch.arange(8, dtype=torch.bfloat16)
+    state = {"stream_key": 11}
+
+    monkeypatch.setattr(
+        "b12x.distributed.pcie_oneshot._current_stream_key",
+        lambda device, stream=None: state["stream_key"],
+    )
+
+    runtime.all_reduce(inp)
+    state["stream_key"] = 22
+
+    with pytest.raises(RuntimeError, match="stream-affine"):
+        runtime.all_reduce(inp)
+
+
 def test_should_allreduce_checks_device_dtype_size_alignment_and_contiguity():
     runtime = _make_runtime(max_size=16)
 
@@ -167,6 +212,7 @@ def test_register_graph_buffers_uses_exchange_group_broadcast(monkeypatch):
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 2)
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
     monkeypatch.setattr("torch.distributed.get_process_group_ranks", lambda group=None: [0, 1])
+    monkeypatch.setattr("b12x.distributed.pcie_oneshot._object_broadcast_device", lambda group: "cpu")
 
     def fake_broadcast(object_list, src, group=None, device=None):
         object_list[0] = remote_meta[src]
@@ -182,6 +228,26 @@ def test_register_graph_buffers_uses_exchange_group_broadcast(monkeypatch):
     ]
 
 
+def test_register_graph_buffers_noops_when_no_rank_registered_buffers(monkeypatch):
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 2)
+    monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
+    monkeypatch.setattr("torch.distributed.get_process_group_ranks", lambda group=None: [0, 1])
+    monkeypatch.setattr("b12x.distributed.pcie_oneshot._object_broadcast_device", lambda group: "cpu")
+    monkeypatch.setattr(
+        "torch.distributed.broadcast_object_list",
+        lambda object_list, src, group=None, device=None: object_list.__setitem__(0, ([], [])),
+    )
+
+    runtime = _make_runtime(exchange_group=object())
+    ext = runtime._ext
+    ext.handle_bytes = []
+    ext.offsets = []
+
+    runtime.register_graph_buffers()
+
+    assert ext.register_graph_buffers_calls == []
+
+
 def test_capture_registers_graph_buffers_after_context(monkeypatch):
     runtime = _make_runtime(exchange_group=object())
     calls = []
@@ -192,3 +258,63 @@ def test_capture_registers_graph_buffers_after_context(monkeypatch):
         pass
 
     assert calls == ["registered"]
+
+
+def test_eager_capture_skips_graph_buffer_registration(monkeypatch):
+    runtime = _make_runtime(eager=True, exchange_group=object())
+    calls = []
+
+    monkeypatch.setattr(runtime, "register_graph_buffers", lambda: calls.append("registered"))
+
+    with runtime.capture():
+        pass
+
+    assert calls == []
+
+
+def test_pool_creates_distinct_channels_per_stream_key(monkeypatch):
+    created = []
+
+    def make_channel(stream_key):
+        runtime = _make_runtime(eager=True)
+        created.append((stream_key, runtime))
+        return runtime
+
+    pool = PCIeOneshotAllReducePool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        channel_factory=make_channel,
+    )
+
+    monkeypatch.setattr(
+        "b12x.distributed.pcie_oneshot._current_stream_key",
+        lambda device, stream=None: 7 if stream is None else int(stream),
+    )
+
+    ch7 = pool.for_stream()
+    ch8 = pool.for_stream(8)
+
+    assert pool.for_stream() is ch7
+    assert pool.for_stream(8) is ch8
+    assert ch7 is not ch8
+    assert [entry[0] for entry in created] == [7, 8]
+
+
+def test_pool_requires_precreated_channel_during_capture(monkeypatch):
+    pool = PCIeOneshotAllReducePool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        channel_factory=lambda stream_key: _make_runtime(eager=True),
+    )
+
+    monkeypatch.setattr("b12x.distributed.pcie_oneshot._current_stream_key", lambda device, stream=None: 7)
+    monkeypatch.setattr("b12x.distributed.pcie_oneshot._is_current_stream_capturing", lambda device: True)
+
+    with pytest.raises(RuntimeError, match="before capture starts"):
+        pool.for_stream()
+
+    pool._channels[7] = _make_runtime(eager=True)
+
+    assert pool.for_stream() is pool._channels[7]
