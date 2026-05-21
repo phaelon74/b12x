@@ -153,7 +153,6 @@ def select_sparse_mla_split_decode_config(
     q_all: torch.Tensor,
     kv_cache: torch.Tensor,
     page_table_1: torch.Tensor,
-    active_token_counts: torch.Tensor | None = None,
     output_dtype: torch.dtype,
     v_head_dim: int,
     max_chunks: int = _SPLIT_MAX_CHUNKS,
@@ -169,9 +168,6 @@ def select_sparse_mla_split_decode_config(
         return None
 
     width = int(page_table_1.shape[1])
-    if active_token_counts is not None and active_token_counts.numel() > 0:
-        if active_token_counts.device.type != "cuda" or not torch.cuda.is_current_stream_capturing():
-            width = min(width, max(0, int(active_token_counts.max().item())))
     env_chunk = os.environ.get("B12X_MLA_SPLIT_CHUNK_SIZE", None)
     if env_chunk is not None:
         chunk_size = int(env_chunk)

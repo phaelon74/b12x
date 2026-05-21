@@ -8,6 +8,7 @@ this arena.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import torch
@@ -31,6 +32,26 @@ from b12x.integration.tp_moe import (
     default_moe_quant_mode,
     plan_tp_moe_arena_layout,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def _format_nbytes(nbytes: int) -> str:
+    value = float(nbytes)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if abs(value) < 1024.0 or unit == "GiB":
+            return f"{value:.2f} {unit}"
+        value /= 1024.0
+    return f"{nbytes} B"
+
+
+def _cuda_memory_stats(device: torch.device) -> tuple[int | None, int | None]:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return None, None
+    return (
+        int(torch.cuda.memory_allocated(device)),
+        int(torch.cuda.memory_reserved(device)),
+    )
 
 
 def _canonical_device(device: torch.device | str) -> torch.device:
@@ -289,11 +310,50 @@ class B12XExecutionLaneArena:
         )
         moe_layout = spec.moe_caps.layout() if spec.moe_caps is not None else None
         moe_nbytes = moe_layout.total_nbytes if moe_layout is not None else 0
-        shared_arena_nbytes = max(attention_nbytes, paged_attention_nbytes, moe_nbytes, 1)
+        shared_arena_nbytes = max(
+            attention_nbytes,
+            paged_attention_nbytes,
+            moe_nbytes,
+            1,
+        )
+        allocated_before, reserved_before = _cuda_memory_stats(spec.device)
         shared_arena = torch.empty(
             shared_arena_nbytes,
             dtype=torch.uint8,
             device=spec.device,
+        )
+        allocated_after, reserved_after = _cuda_memory_stats(spec.device)
+        allocated_delta = (
+            allocated_after - allocated_before
+            if allocated_before is not None and allocated_after is not None
+            else None
+        )
+        reserved_delta = (
+            reserved_after - reserved_before
+            if reserved_before is not None and reserved_after is not None
+            else None
+        )
+        logger.warning(
+            "B12X joint arena allocation: device=%s shared=%s (%d bytes), "
+            "attention_required=%s, paged_attention_required=%s, moe_required=%s, "
+            "moe_route=%s, moe_core=%s, cuda_allocated_delta=%s, "
+            "cuda_reserved_delta=%s, cuda_allocated=%s, cuda_reserved=%s",
+            spec.device,
+            _format_nbytes(shared_arena_nbytes),
+            shared_arena_nbytes,
+            _format_nbytes(attention_nbytes),
+            _format_nbytes(paged_attention_nbytes),
+            _format_nbytes(moe_nbytes),
+            _format_nbytes(moe_layout.route_workspace_nbytes)
+            if moe_layout is not None
+            else "0.00 B",
+            _format_nbytes(moe_layout.core_workspace_nbytes)
+            if moe_layout is not None
+            else "0.00 B",
+            _format_nbytes(allocated_delta) if allocated_delta is not None else "n/a",
+            _format_nbytes(reserved_delta) if reserved_delta is not None else "n/a",
+            _format_nbytes(allocated_after) if allocated_after is not None else "n/a",
+            _format_nbytes(reserved_after) if reserved_after is not None else "n/a",
         )
 
         attention_arena = (

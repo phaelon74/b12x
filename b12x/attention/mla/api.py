@@ -288,7 +288,6 @@ def _run_sparse_mla(
         q_all=q_all,
         kv_cache=kv_cache,
         page_table_1=selected_indices,
-        active_token_counts=active_token_counts,
         output_dtype=q_all.dtype,
         v_head_dim=v_head_dim,
         max_chunks=workspace.max_chunks_per_row,
@@ -305,15 +304,6 @@ def _run_sparse_mla(
         )
     ):
         forced_width = int(selected_indices.shape[1])
-        if active_token_counts is not None and active_token_counts.numel() > 0:
-            if not graph_stable_split and (
-                active_token_counts.device.type != "cuda"
-                or not torch.cuda.is_current_stream_capturing()
-            ):
-                forced_width = min(
-                    forced_width,
-                    max(0, int(active_token_counts.max().item())),
-                )
         split_cfg = forced_sparse_mla_split_decode_config_for_width(
             forced_width,
             max_chunks=workspace.max_chunks_per_row,
