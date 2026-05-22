@@ -30,6 +30,7 @@ from b12x.integration.tp_moe import (
     TPMoEWorkspacePool,
     allocate_tp_moe_workspace_pool,
     default_moe_quant_mode,
+    materialize_tp_moe_arena_workspaces,
     plan_tp_moe_arena_layout,
 )
 
@@ -81,6 +82,9 @@ class B12XMoEArenaCaps:
     core_token_counts: tuple[int, ...] | None = None
     route_num_experts: int | None = None
     route_logits_dtype: torch.dtype | None = None
+    activation: str = "silu"
+    apply_router_weight_on_input: bool = False
+    swiglu_limit: float | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "device", _canonical_device(self.device))
@@ -97,6 +101,17 @@ class B12XMoEArenaCaps:
         object.__setattr__(self, "n", max(int(self.n), 1))
         object.__setattr__(self, "num_topk", max(int(self.num_topk), 1))
         object.__setattr__(self, "max_tokens", max(int(self.max_tokens), 1))
+        activation = str(self.activation).lower()
+        if activation not in {"silu", "relu2"}:
+            raise ValueError(f"unsupported activation {self.activation!r}")
+        object.__setattr__(self, "activation", activation)
+        object.__setattr__(
+            self,
+            "apply_router_weight_on_input",
+            bool(self.apply_router_weight_on_input),
+        )
+        if self.swiglu_limit is not None:
+            object.__setattr__(self, "swiglu_limit", float(self.swiglu_limit))
         if self.core_token_counts is not None:
             object.__setattr__(
                 self,
@@ -119,6 +134,7 @@ class B12XMoEArenaCaps:
             route_num_experts=self.route_num_experts,
             route_logits_dtype=self.route_logits_dtype,
             quant_mode=self.quant_mode,
+            activation=self.activation,
         )
 
 
@@ -176,7 +192,6 @@ def _attention_caps_cover(
             "kv_dtype",
             "num_q_heads",
             "head_dim",
-            "topk",
             "page_size",
             "padded_heads",
         ),
@@ -184,20 +199,48 @@ def _attention_caps_cover(
         return False
     if requested.reserve_extend_indexer_logits and not existing.reserve_extend_indexer_logits:
         return False
+    if requested.reserve_paged_indexer_logits and not existing.reserve_paged_indexer_logits:
+        return False
+    if getattr(requested, "reserve_mhc", False) and not getattr(existing, "reserve_mhc", False):
+        return False
+    if getattr(requested, "reserve_mhc", False) and (
+        getattr(existing, "mhc_hidden_size", 0) != getattr(requested, "mhc_hidden_size", 0)
+        or getattr(existing, "mhc_split_k", 0) != getattr(requested, "mhc_split_k", 0)
+    ):
+        return False
+    existing_mla_q_chunks = int(
+        getattr(existing, "mla_max_q_chunks", 0)
+        or int(getattr(existing, "mla_max_total_q", 1))
+        * int(getattr(existing, "max_chunks_per_row", 1))
+    )
+    requested_mla_q_chunks = int(
+        getattr(requested, "mla_max_q_chunks", 0)
+        or int(getattr(requested, "mla_max_total_q", 1))
+        * int(getattr(requested, "max_chunks_per_row", 1))
+    )
+    if existing_mla_q_chunks < requested_mla_q_chunks:
+        return False
     return _fields_cover(
         existing,
         requested,
         (
             "indexer_num_q_heads",
             "max_v_head_dim",
+            "topk",
+            "indexer_topk",
             "max_page_table_width",
             "extend_max_total_q",
             "extend_max_batch",
             "extend_max_kv_rows",
+            "indexer_max_k_rows",
             "paged_max_q_rows",
             "paged_max_batch",
+            "mla_max_total_q",
             "max_chunks_per_row",
             "extend_indexer_tile_logits_k_rows",
+            "paged_indexer_logits_k_rows",
+            "paged_indexer_tile_logits_k_rows",
+            "mhc_max_tokens",
         ),
     )
 
@@ -252,7 +295,18 @@ def _moe_caps_cover(
     if not _fields_match(
         existing,
         requested,
-        ("device", "dtype", "quant_mode", "weight_E", "k", "n", "num_topk"),
+        (
+            "device",
+            "dtype",
+            "quant_mode",
+            "activation",
+            "apply_router_weight_on_input",
+            "swiglu_limit",
+            "weight_E",
+            "k",
+            "n",
+            "num_topk",
+        ),
     ):
         return False
     if _moe_route_num_experts(existing) != _moe_route_num_experts(requested):
@@ -261,6 +315,10 @@ def _moe_caps_cover(
         return False
     existing_layout = existing.layout()
     requested_layout = requested.layout()
+    if existing.quant_mode == "w4a16" and not set(
+        requested_layout.core_token_counts
+    ).issubset(set(existing_layout.core_token_counts)):
+        return False
     return (
         existing_layout.route_workspace_nbytes >= requested_layout.route_workspace_nbytes
         and existing_layout.core_workspace_nbytes >= requested_layout.core_workspace_nbytes
@@ -317,6 +375,25 @@ class B12XExecutionLaneArena:
             1,
         )
         allocated_before, reserved_before = _cuda_memory_stats(spec.device)
+        logger.warning(
+            "B12X joint arena request: device=%s shared=%s (%d bytes), "
+            "attention_required=%s, paged_attention_required=%s, moe_required=%s, "
+            "moe_route=%s, moe_core=%s, cuda_allocated_before=%s, cuda_reserved_before=%s",
+            spec.device,
+            _format_nbytes(shared_arena_nbytes),
+            shared_arena_nbytes,
+            _format_nbytes(attention_nbytes),
+            _format_nbytes(paged_attention_nbytes),
+            _format_nbytes(moe_nbytes),
+            _format_nbytes(moe_layout.route_workspace_nbytes)
+            if moe_layout is not None
+            else "0.00 B",
+            _format_nbytes(moe_layout.core_workspace_nbytes)
+            if moe_layout is not None
+            else "0.00 B",
+            _format_nbytes(allocated_before) if allocated_before is not None else "n/a",
+            _format_nbytes(reserved_before) if reserved_before is not None else "n/a",
+        )
         shared_arena = torch.empty(
             shared_arena_nbytes,
             dtype=torch.uint8,
@@ -373,6 +450,22 @@ class B12XExecutionLaneArena:
                 route_workspace_nbytes=moe_layout.route_workspace_nbytes,
                 core_workspace_nbytes=moe_layout.core_workspace_nbytes,
                 frozen=True,
+            )
+            assert spec.moe_caps is not None
+            materialize_tp_moe_arena_workspaces(
+                moe_workspace_pool,
+                max_tokens=spec.moe_caps.max_tokens,
+                weight_E=spec.moe_caps.weight_E,
+                k=spec.moe_caps.k,
+                n=spec.moe_caps.n,
+                num_topk=spec.moe_caps.num_topk,
+                device=spec.moe_caps.device,
+                dtype=spec.moe_caps.dtype,
+                core_token_counts=spec.moe_caps.core_token_counts,
+                quant_mode=spec.moe_caps.quant_mode,
+                activation=spec.moe_caps.activation,
+                apply_router_weight_on_input=spec.moe_caps.apply_router_weight_on_input,
+                swiglu_limit=spec.moe_caps.swiglu_limit,
             )
 
         lane = cls(

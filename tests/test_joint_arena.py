@@ -29,6 +29,12 @@ def _storage_ptr(tensor: torch.Tensor) -> int:
     return tensor.untyped_storage().data_ptr()
 
 
+def _cuda_device() -> torch.device:
+    if not torch.cuda.is_available():
+        pytest.skip("B12X execution lane arenas require CUDA")
+    return torch.device("cuda", torch.cuda.current_device())
+
+
 def _attention_caps(device: torch.device) -> B12XAttentionArenaCaps:
     return B12XAttentionArenaCaps(
         device=device,
@@ -80,7 +86,7 @@ def _paged_attention_caps(device: torch.device) -> PagedAttentionArenaCaps:
 
 
 def test_joint_arena_size_is_max_of_attention_and_moe_phases() -> None:
-    device = torch.device("cpu")
+    device = _cuda_device()
     attn_caps = _attention_caps(device)
     paged_caps = _paged_attention_caps(device)
     moe_caps = _moe_caps(device)
@@ -105,7 +111,7 @@ def test_joint_arena_size_is_max_of_attention_and_moe_phases() -> None:
 
 
 def test_joint_arena_views_share_one_backing_allocation() -> None:
-    device = torch.device("cpu")
+    device = _cuda_device()
     lane = B12XExecutionLaneArena.allocate(
         B12XJointArenaSpec(
             device=device,
@@ -197,6 +203,7 @@ def test_moe_pool_keys_are_not_stream_partitioned() -> None:
     key = tp_moe._workspace_pool_key(
         "static",
         quant_mode="nvfp4",
+        activation="silu",
         state_E=4,
         weight_E=8,
         max_rows=4,
@@ -222,6 +229,209 @@ def test_moe_arena_caps_env_defaults_to_w4a16(monkeypatch) -> None:
     )
 
     assert caps.quant_mode == "w4a16"
+
+
+def test_w4a16_joint_arena_materializes_planned_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _fake_w4a16_prewarm(workspace, *, token_counts, **_kwargs) -> None:
+        counts = tuple(int(token_count) for token_count in token_counts)
+        workspace.planned_fused_moe_launches = {
+            token_count: object() for token_count in counts
+        }
+        workspace.planned_topk_sum_launches = {
+            token_count: object() for token_count in counts
+        }
+
+    monkeypatch.setattr(tp_moe, "get_num_sm", lambda _device: 48)
+    monkeypatch.setattr(
+        tp_moe,
+        "_prewarm_w4a16_planned_launches",
+        _fake_w4a16_prewarm,
+    )
+    device = _cuda_device()
+    caps = B12XMoEArenaCaps(
+        device=device,
+        dtype=torch.bfloat16,
+        quant_mode="w4a16",
+        weight_E=8,
+        route_num_experts=8,
+        k=16,
+        n=16,
+        num_topk=2,
+        max_tokens=4,
+        core_token_counts=(1, 4),
+    )
+    lane = B12XExecutionLaneArena.allocate(
+        B12XJointArenaSpec(device=device, moe_caps=caps)
+    )
+    pool = lane.get_moe_workspace_pool()
+    plan = tp_moe._make_workspace_plan(
+        num_tokens=4,
+        weight_E=8,
+        k=16,
+        n=16,
+        num_topk=2,
+        device=device,
+        dtype=torch.bfloat16,
+        quant_mode="w4a16",
+    )
+    key = tp_moe._workspace_pool_key(
+        plan.implementation,
+        quant_mode=plan.quant_mode,
+        activation=plan.activation,
+        state_E=plan.state_E,
+        weight_E=plan.weight_E,
+        max_rows=plan.max_rows,
+        k=plan.k,
+        n=plan.n,
+        num_topk=plan.num_topk,
+        device=plan.device,
+        dtype=plan.dtype,
+    )
+
+    workspace = pool.workspaces.get(key)
+    assert isinstance(workspace, tp_moe.TPW4A16Workspace)
+    assert workspace.planned_token_counts == frozenset({1, 4})
+    assert workspace.planned_apply_router_weight_on_input is False
+    assert workspace.planned_swiglu_limit is None
+    assert workspace.routed_rows_capacity >= plan.routed_rows
+    assert _storage_ptr(workspace.intermediate_cache13) == _storage_ptr(
+        lane.shared_arena
+    )
+    assert (
+        workspace.intermediate_cache13.data_ptr()
+        >= lane.shared_arena.data_ptr() + pool.core_arena_offset_bytes
+    )
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    resolved = tp_moe._resolve_workspace(
+        pool,
+        plan=plan,
+        a1_gscale=torch.empty(0, dtype=torch.float32, device=device),
+        a2_gscale=torch.empty(0, dtype=torch.float32, device=device),
+        input_scales_static=True,
+    )
+    assert resolved is workspace
+
+    unplanned_plan = tp_moe._make_workspace_plan(
+        num_tokens=2,
+        weight_E=8,
+        k=16,
+        n=16,
+        num_topk=2,
+        device=device,
+        dtype=torch.bfloat16,
+        quant_mode="w4a16",
+    )
+    with pytest.raises(RuntimeError, match="unplanned token count"):
+        tp_moe._resolve_workspace(
+            pool,
+            plan=unplanned_plan,
+            a1_gscale=torch.empty(0, dtype=torch.float32, device=device),
+            a2_gscale=torch.empty(0, dtype=torch.float32, device=device),
+            input_scales_static=True,
+        )
+
+
+def test_nvfp4_joint_arena_materializes_planned_workspaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    device = torch.device("cpu")
+    num_topk = 8
+    static_tokens = tp_moe._get_static_compact_cutover_pairs("nvfp4") // num_topk
+    dynamic_tokens = static_tokens + 1
+    caps = B12XMoEArenaCaps(
+        device=device,
+        dtype=torch.bfloat16,
+        quant_mode="nvfp4",
+        weight_E=32,
+        route_num_experts=32,
+        k=128,
+        n=128,
+        num_topk=num_topk,
+        max_tokens=dynamic_tokens,
+        core_token_counts=(1, dynamic_tokens),
+    )
+    lane = B12XExecutionLaneArena.allocate(
+        B12XJointArenaSpec(device=device, moe_caps=caps)
+    )
+    pool = lane.get_moe_workspace_pool()
+
+    def _key(plan: tp_moe.TPMoEPlan) -> tuple:
+        return tp_moe._workspace_pool_key(
+            plan.implementation,
+            quant_mode=plan.quant_mode,
+            activation=plan.activation,
+            state_E=plan.state_E,
+            weight_E=plan.weight_E,
+            max_rows=plan.max_rows,
+            k=plan.k,
+            n=plan.n,
+            num_topk=plan.num_topk,
+            device=plan.device,
+            dtype=plan.dtype,
+        )
+
+    static_plan = tp_moe._make_workspace_plan(
+        num_tokens=static_tokens,
+        weight_E=32,
+        k=128,
+        n=128,
+        num_topk=num_topk,
+        device=device,
+        dtype=torch.bfloat16,
+        quant_mode="nvfp4",
+    )
+    dynamic_plan = tp_moe._make_workspace_plan(
+        num_tokens=dynamic_tokens,
+        weight_E=32,
+        k=128,
+        n=128,
+        num_topk=num_topk,
+        device=device,
+        dtype=torch.bfloat16,
+        quant_mode="nvfp4",
+    )
+    assert static_plan.implementation == "static"
+    assert dynamic_plan.implementation == "dynamic"
+
+    static_workspace = pool.workspaces.get(_key(static_plan))
+    dynamic_workspace = pool.workspaces.get(_key(dynamic_plan))
+    assert isinstance(static_workspace, tp_moe.TPCompactStaticWorkspace)
+    assert isinstance(dynamic_workspace, tp_moe.TPDynamicWorkspace)
+    assert (
+        static_workspace.row_counts.data_ptr()
+        >= lane.shared_arena.data_ptr() + pool.core_arena_offset_bytes
+    )
+    assert (
+        dynamic_workspace.row_counts.data_ptr()
+        >= lane.shared_arena.data_ptr() + pool.core_arena_offset_bytes
+    )
+
+    a1_gscale = torch.ones(1, dtype=torch.float32, device=device)
+    a2_gscale = torch.ones(1, dtype=torch.float32, device=device)
+    assert (
+        tp_moe._resolve_workspace(
+            pool,
+            plan=static_plan,
+            a1_gscale=a1_gscale,
+            a2_gscale=a2_gscale,
+            input_scales_static=True,
+        )
+        is static_workspace
+    )
+    assert (
+        tp_moe._resolve_workspace(
+            pool,
+            plan=dynamic_plan,
+            a1_gscale=a1_gscale,
+            a2_gscale=a2_gscale,
+            input_scales_static=True,
+        )
+        is dynamic_workspace
+    )
 
 
 def test_moe_arena_caps_cover_static_boundary_shapes() -> None:
@@ -273,7 +483,7 @@ def test_moe_arena_caps_cover_static_boundary_shapes() -> None:
 
 
 def test_shared_moe_workspace_resets_overlaid_barrier_state() -> None:
-    device = torch.device("cpu")
+    device = _cuda_device()
     lane = B12XExecutionLaneArena.allocate(
         B12XJointArenaSpec(
             device=device,
@@ -307,13 +517,13 @@ def test_shared_moe_workspace_resets_overlaid_barrier_state() -> None:
     assert moe_ws.volatile_launch_state
     moe_ws.barrier_count.fill_(123)
     moe_ws.barrier_epoch.fill_(456)
-    tp_moe._prepare_workspace_for_launch(moe_ws)
+    tp_moe._reset_volatile_launch_state(moe_ws)
     assert int(moe_ws.barrier_count[0].item()) == 0
     assert int(moe_ws.barrier_epoch[0].item()) == 0
 
 
 def test_execution_lane_arena_reuses_target_for_smaller_draft_caps() -> None:
-    device = torch.device("cpu")
+    device = _cuda_device()
     _EXECUTION_LANES.clear()
     try:
         target_spec = B12XJointArenaSpec(
@@ -344,7 +554,7 @@ def test_execution_lane_arena_reuses_target_for_smaller_draft_caps() -> None:
 
 
 def test_execution_lane_arena_rejects_incompatible_draft_geometry() -> None:
-    device = torch.device("cpu")
+    device = _cuda_device()
     _EXECUTION_LANES.clear()
     try:
         target_spec = B12XJointArenaSpec(
