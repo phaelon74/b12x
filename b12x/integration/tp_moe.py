@@ -1954,7 +1954,11 @@ def _validate_frozen_w4a16_launch(
     swiglu_limit: float | None,
 ) -> None:
     token_count = int(plan.max_tokens_per_launch)
-    if token_count not in workspace.planned_token_counts:
+    planned_capacity = min(
+        (planned for planned in workspace.planned_token_counts if planned >= token_count),
+        default=None,
+    )
+    if planned_capacity is None:
         raise RuntimeError(
             "frozen W4A16 MoE workspace was asked to launch an unplanned token "
             f"count: tokens={token_count}, planned={sorted(workspace.planned_token_counts)}"
@@ -1973,15 +1977,15 @@ def _validate_frozen_w4a16_launch(
             "frozen W4A16 MoE workspace swiglu_limit mismatch: "
             f"requested={requested_limit}, planned={workspace.planned_swiglu_limit}"
         )
-    if token_count not in workspace.planned_fused_moe_launches:
+    if planned_capacity not in workspace.planned_fused_moe_launches:
         raise RuntimeError(
             "frozen W4A16 MoE workspace is missing its preplanned fused launch "
-            f"for tokens={token_count}"
+            f"for capacity={planned_capacity}"
         )
-    if token_count not in workspace.planned_topk_sum_launches:
+    if planned_capacity not in workspace.planned_topk_sum_launches:
         raise RuntimeError(
             "frozen W4A16 MoE workspace is missing its preplanned top-k sum launch "
-            f"for tokens={token_count}"
+            f"for capacity={planned_capacity}"
         )
 
 
@@ -1993,17 +1997,21 @@ def _w4a16_preplanned_launches(
     token_count = int(token_count)
     if not workspace.planned_token_counts:
         return None, None
-    if token_count not in workspace.planned_token_counts:
+    planned_capacity = min(
+        (planned for planned in workspace.planned_token_counts if planned >= token_count),
+        default=None,
+    )
+    if planned_capacity is None:
         raise RuntimeError(
             "W4A16 MoE workspace was asked to launch an unplanned token count: "
             f"tokens={token_count}, planned={sorted(workspace.planned_token_counts)}"
         )
-    fused = workspace.planned_fused_moe_launches.get(token_count)
-    topk_sum = workspace.planned_topk_sum_launches.get(token_count)
+    fused = workspace.planned_fused_moe_launches.get(planned_capacity)
+    topk_sum = workspace.planned_topk_sum_launches.get(planned_capacity)
     if fused is None or topk_sum is None:
         raise RuntimeError(
             "W4A16 MoE workspace is missing preplanned launches for "
-            f"tokens={token_count}"
+            f"capacity={planned_capacity}"
         )
     return fused, topk_sum
 

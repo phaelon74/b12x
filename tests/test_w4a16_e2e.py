@@ -5,7 +5,13 @@ import torch
 
 from b12x.cute.fp4 import swizzle_block_scale
 from b12x.integration.tp_moe import allocate_tp_moe_workspace_pool, b12x_moe_fp4
-from b12x.moe.fused.w4a16.kernel import run_w4a16_moe
+from b12x.moe.fused.w4a16.host import max_packed_route_slots, select_route_block_size_m
+from b12x.moe.fused.w4a16.kernel import (
+    _DEFAULT_MAX_SHARED_MEM,
+    compile_w4a16_fused_moe,
+    compile_w4a16_topk_sum,
+    run_w4a16_moe,
+)
 from b12x.moe.fused.w4a16.prepare import (
     make_w4a16_packed_buffers as make_w4a16_buffers,
     prepare_w4a16_packed_weights as prepare_w4a16_weights,
@@ -338,6 +344,111 @@ def test_w4a16_moe_swiglu_limit_matches_oracle_under_cuda_graph() -> None:
     torch.cuda.synchronize()
 
     _assert_matches_oracle(buffers.output, expected, activation=activation)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_w4a16_preplanned_capacity_launch_accepts_smaller_live_m() -> None:
+    torch.manual_seed(20260522)
+    experts, hidden_size, intermediate_size = 8, 128, 128
+    topk, live_m, capacity_m = 2, 24, 32
+    activation = "relu2"
+    assert select_route_block_size_m(live_m, topk, experts) != select_route_block_size_m(
+        capacity_m, topk, experts
+    )
+    weights = _make_weights(
+        experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+    )
+    x = (torch.randn(live_m, hidden_size, device="cuda") * 0.25).to(torch.bfloat16)
+    topk_ids = torch.randint(0, experts, (live_m, topk), device="cuda", dtype=torch.int32)
+    topk_weights = torch.softmax(torch.randn(live_m, topk, device="cuda"), dim=-1)
+    prepared = prepare_w4a16_weights(
+        *weights,
+        activation=activation,
+        params_dtype=x.dtype,
+    )
+    buffers = make_w4a16_buffers(
+        prepared,
+        m=capacity_m,
+        topk=topk,
+        dtype=x.dtype,
+        device=x.device,
+    )
+    props = torch.cuda.get_device_properties(x.device)
+    max_shared_mem = int(
+        getattr(props, "shared_memory_per_block_optin", _DEFAULT_MAX_SHARED_MEM)
+    )
+    block_size_m = select_route_block_size_m(capacity_m, topk, experts)
+    route_slots = max_packed_route_slots(capacity_m * topk, block_size_m, experts)
+    max_m_blocks = (route_slots + block_size_m - 1) // block_size_m
+    fused_launch = compile_w4a16_fused_moe(
+        size_m=capacity_m,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=experts,
+        top_k=topk,
+        activation=activation,
+        apply_router_weight_on_input=False,
+        zero_fc2_output=False,
+        moe_block_size=block_size_m,
+        max_m_blocks=max_m_blocks,
+        element_dtype="bf16",
+        sms=int(props.multi_processor_count),
+        max_shared_mem=max_shared_mem,
+    )
+    topk_sum_launch = compile_w4a16_topk_sum(
+        m=capacity_m,
+        topk=topk,
+        hidden_size=hidden_size,
+        element_dtype="bf16",
+    )
+    output = torch.empty_like(x)
+
+    def _run(output_buffer: torch.Tensor) -> torch.Tensor:
+        return run_w4a16_moe(
+            x,
+            prepared,
+            topk_weights,
+            topk_ids,
+            activation=activation,
+            fast_math=True,
+            intermediate_cache13=buffers.intermediate_cache13,
+            intermediate_cache2=buffers.intermediate_cache2,
+            output=output_buffer,
+            fc1_c_tmp=buffers.fc1_c_tmp,
+            fc2_c_tmp=buffers.fc2_c_tmp,
+            packed_route_indices=buffers.packed_route_indices,
+            block_expert_ids=buffers.block_expert_ids,
+            packed_route_count=buffers.packed_route_count,
+            expert_offsets=buffers.expert_offsets,
+            fused_launch=fused_launch,
+            topk_sum_launch=topk_sum_launch,
+        )
+
+    actual = _run(output)
+    expected = _reference_w4a16(
+        x,
+        *weights,
+        topk_ids,
+        topk_weights,
+        activation=activation,
+    )
+    torch.cuda.synchronize()
+
+    assert actual is output
+    _assert_matches_oracle(actual, expected, activation=activation)
+
+    graph_output = torch.empty_like(x)
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        _run(graph_output)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    _assert_matches_oracle(graph_output, expected, activation=activation)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

@@ -54,12 +54,13 @@ from b12x.cute.fp4 import (
     st_shared_v4_f32,
     threadfence,
 )
-from b12x.cute.utils import current_cuda_stream
+from b12x.cute.utils import current_cuda_stream, make_ptr
 from b12x.moe.fused.w4a16.route_pack import (
     pack_topk_routes_by_expert as _pack_topk_routes_by_expert,
 )
 from b12x.moe.fused.w4a16.host import (
     _W4A16_ALLOWED_ROUTED_SIZES,
+    max_packed_route_slots,
     packed_gemm_scratch_elements,
     plan_w4a16_buffers,
     select_route_block_size_m,
@@ -652,6 +653,7 @@ class W4A16GemmKernel:
             tid,
             cta,
             Int32(grid_x),
+            Int32(self.size_m),
         )
 
     @cute.jit
@@ -672,6 +674,7 @@ class W4A16GemmKernel:
         tid: Int32,
         cta: Int32,
         grid_x: Int32,
+        active_size_m: Int32,
     ):
         n_tiles = Int32(self.size_n // self.tile_n)
         route_blocks = packed_route_count[Int32(0)].to(Int32) // Int32(
@@ -805,6 +808,7 @@ class W4A16GemmKernel:
                         reduce_slice_count,
                         reduce_slice_idx,
                         lock_slot,
+                        active_size_m,
                     )
 
             if has_work != Int32(0):
@@ -827,6 +831,7 @@ class W4A16GemmKernel:
         tid: Int32,
         route_block_idx: Int32,
         global_scale_f32: cutlass.Float32,
+        active_size_m: Int32,
     ) -> Int32:
         route_indices_int4_addr = self._int4_addr(
             smem_base, Int32(self.sh_route_off) + tid
@@ -854,7 +859,7 @@ class W4A16GemmKernel:
                     idx = ld_shared_i32_relaxed(
                         smem_base + Int32(self.sh_route_off * 16) + j * Int32(4)
                     )
-                    if idx < Int32(self.size_m * self.top_k):
+                    if idx < active_size_m * Int32(self.top_k):
                         local_count += Int32(1)
             valid = cute.arch.warp_redux_sync(local_count, "add")
             if lane == Int32(0):
@@ -871,7 +876,7 @@ class W4A16GemmKernel:
             )
             if cutlass.const_expr(self.mul_topk_weights):
                 safe_idx = idx
-                if idx >= Int32(self.size_m * self.top_k):
+                if idx >= active_size_m * Int32(self.top_k):
                     safe_idx = Int32(0)
                 topk = (
                     topk_weights_flat[safe_idx].to(cutlass.Float32) * global_scale_f32
@@ -912,6 +917,7 @@ class W4A16GemmKernel:
         reduce_slice_count: Int32,
         reduce_slice_idx: Int32,
         lock_slot: Int32,
+        active_size_m: Int32,
     ):
         if cutlass.const_expr(self.uses_m_block_8):
             self._run_tile_m8(
@@ -934,6 +940,7 @@ class W4A16GemmKernel:
                 reduce_slice_count,
                 reduce_slice_idx,
                 lock_slot,
+                active_size_m,
             )
         else:
             self._run_tile_large_m(
@@ -956,6 +963,7 @@ class W4A16GemmKernel:
                 reduce_slice_count,
                 reduce_slice_idx,
                 lock_slot,
+                active_size_m,
             )
 
     @cute.jit
@@ -969,6 +977,7 @@ class W4A16GemmKernel:
         route_block_idx: Int32,
         expert_idx: Int32,
         output_n_tile: Int32,
+        active_size_m: Int32,
     ):
         global_scale_f32 = global_scale[expert_idx].to(cutlass.Float32)
         block_valid_rows = self._read_moe_block_data(
@@ -978,6 +987,7 @@ class W4A16GemmKernel:
             tid,
             route_block_idx,
             global_scale_f32,
+            active_size_m,
         )
         (
             a_gl_stride,
@@ -1089,6 +1099,7 @@ class W4A16GemmKernel:
         reduce_slice_count: Int32,
         reduce_slice_idx: Int32,
         lock_slot: Int32,
+        active_size_m: Int32,
     ):
         (
             global_scale_f32,
@@ -1113,6 +1124,7 @@ class W4A16GemmKernel:
             route_block_idx,
             expert_idx,
             output_n_tile,
+            active_size_m,
         )
         a_sh_rd = self._a_shared_read_offset(tid, 8)
 
@@ -1230,6 +1242,7 @@ class W4A16GemmKernel:
         reduce_slice_count: Int32,
         reduce_slice_idx: Int32,
         lock_slot: Int32,
+        active_size_m: Int32,
     ):
         (
             global_scale_f32,
@@ -1254,6 +1267,7 @@ class W4A16GemmKernel:
             route_block_idx,
             expert_idx,
             output_n_tile,
+            active_size_m,
         )
         a_sh_rd = self._a_shared_read_offset(tid, 16)
 
@@ -2764,7 +2778,7 @@ class W4A16FusedMoeKernel:
     @cute.jit
     def __call__(
         self,
-        a_bf16_flat: cute.Tensor,
+        a_bf16_ptr: cute.Pointer,
         w13_i32_flat: cute.Tensor,
         w2_i32_flat: cute.Tensor,
         fc1_bf16_flat: cute.Tensor,
@@ -2777,12 +2791,23 @@ class W4A16FusedMoeKernel:
         packed_route_indices: cute.Tensor,
         block_expert_ids: cute.Tensor,
         packed_route_count: cute.Tensor,
-        topk_weights_flat: cute.Tensor,
+        topk_weights_ptr: cute.Pointer,
         fc1_c_tmp_f32_flat: cute.Tensor,
         fc2_c_tmp_f32_flat: cute.Tensor,
         locks_i32_flat: cute.Tensor,
+        active_m: cutlass.Int32,
         stream: cuda.CUstream,
     ):
+        a_bf16_flat = cute.make_tensor(
+            a_bf16_ptr,
+            layout=cute.make_layout(
+                (active_m * Int32(self.hidden_size),), stride=(1,)
+            ),
+        )
+        topk_weights_flat = cute.make_tensor(
+            topk_weights_ptr,
+            layout=cute.make_layout((active_m * Int32(self.top_k),), stride=(1,)),
+        )
         grid_x = self.sms * self.blocks_per_sm
         grid = (grid_x, 1, 1)
         self.kernel(
@@ -2803,6 +2828,7 @@ class W4A16FusedMoeKernel:
             fc1_c_tmp_f32_flat,
             fc2_c_tmp_f32_flat,
             locks_i32_flat,
+            active_m,
         ).launch(
             grid=grid,
             block=[self.cta_threads, 1, 1],
@@ -2829,6 +2855,7 @@ class W4A16FusedMoeKernel:
         fc1_c_tmp_f32_flat: cute.Tensor,
         fc2_c_tmp_f32_flat: cute.Tensor,
         locks_i32_flat: cute.Tensor,
+        active_m: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -2866,6 +2893,7 @@ class W4A16FusedMoeKernel:
                 tid,
                 cta,
                 grid_x,
+                active_m,
             )
             self._grid_barrier(locks_i32_flat, tid, grid_x)
             self._run_activation(
@@ -2874,6 +2902,7 @@ class W4A16FusedMoeKernel:
                 tid,
                 cta,
                 grid_x,
+                active_m,
             )
         else:
             self.fc1._run_persistent_gemm(
@@ -2892,10 +2921,11 @@ class W4A16FusedMoeKernel:
                 tid,
                 cta,
                 grid_x,
+                active_m,
             )
         self._grid_barrier(locks_i32_flat, tid, grid_x)
         if cutlass.const_expr(self.zero_fc2_output):
-            self._zero_fc2_output(fc2_bf16_flat, tid, cta, grid_x)
+            self._zero_fc2_output(fc2_bf16_flat, tid, cta, grid_x, active_m)
             self._grid_barrier(locks_i32_flat, tid, grid_x)
         self.fc2._run_persistent_gemm(
             activated_bf16_flat,
@@ -2913,6 +2943,7 @@ class W4A16FusedMoeKernel:
             tid,
             cta,
             grid_x,
+            active_m * Int32(self.top_k),
         )
 
     @cute.jit
@@ -2945,10 +2976,11 @@ class W4A16FusedMoeKernel:
         tid: Int32,
         cta: Int32,
         grid_x: Int32,
+        active_m: cutlass.Int32,
     ):
         idx = cta * Int32(self.cta_threads) + tid
         stride = grid_x * Int32(self.cta_threads)
-        total = Int32(self.size_m * self.top_k * self.hidden_size)
+        total = active_m * Int32(self.top_k * self.hidden_size)
         zero = self._cast_elem(cutlass.Float32(0.0))
         while idx < total:
             fc2_bf16_flat[idx] = zero
@@ -2962,10 +2994,11 @@ class W4A16FusedMoeKernel:
         tid: Int32,
         cta: Int32,
         grid_x: Int32,
+        active_m: cutlass.Int32,
     ):
         idx = cta * Int32(self.cta_threads) + tid
         stride = grid_x * Int32(self.cta_threads)
-        total = Int32(self.size_m * self.top_k * self.intermediate_size)
+        total = active_m * Int32(self.top_k * self.intermediate_size)
         while idx < total:
             if cutlass.const_expr(self.activation_is_gated):
                 row = idx // Int32(self.intermediate_size)
@@ -3111,24 +3144,40 @@ class W4A16TopKSumKernel:
     @cute.jit
     def __call__(
         self,
-        fc2_flat: cute.Tensor,
-        output_flat: cute.Tensor,
+        fc2_ptr: cute.Pointer,
+        output_ptr: cute.Pointer,
+        active_m: cutlass.Int32,
         stream: cuda.CUstream,
     ):
+        fc2_flat = cute.make_tensor(
+            fc2_ptr,
+            layout=cute.make_layout(
+                (active_m * Int32(self.topk * self.hidden_size),), stride=(1,)
+            ),
+        )
+        output_flat = cute.make_tensor(
+            output_ptr,
+            layout=cute.make_layout((active_m * Int32(self.hidden_size),), stride=(1,)),
+        )
         total = self.m * self.hidden_size
         grid = (_covering_count(total, self.cta_threads), 1, 1)
-        self.kernel(fc2_flat, output_flat).launch(
+        self.kernel(fc2_flat, output_flat, active_m).launch(
             grid=grid,
             block=[self.cta_threads, 1, 1],
             stream=stream,
         )
 
     @cute.kernel
-    def kernel(self, fc2_flat: cute.Tensor, output_flat: cute.Tensor):
+    def kernel(
+        self,
+        fc2_flat: cute.Tensor,
+        output_flat: cute.Tensor,
+        active_m: cutlass.Int32,
+    ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         idx = Int32(bidx) * Int32(self.cta_threads) + Int32(tidx)
-        total = Int32(self.m * self.hidden_size)
+        total = active_m * Int32(self.hidden_size)
         if idx < total:
             token = idx // Int32(self.hidden_size)
             col = idx - token * Int32(self.hidden_size)
@@ -3408,11 +3457,7 @@ def compile_w4a16_fused_moe(
     if cached is not None:
         return cached
 
-    a_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass_dtype,
-        (size_m * hidden_size,),
-        assumed_align=16,
-    )
+    a_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     w13_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
         (num_experts * (hidden_size // 16) * (fc1_cols // 16 * 32),),
@@ -3473,11 +3518,7 @@ def compile_w4a16_fused_moe(
         (1,),
         assumed_align=4,
     )
-    topk_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (size_m * top_k,),
-        assumed_align=4,
-    )
+    topk_fake = make_ptr(cutlass.Float32, 4, cute.AddressSpace.gmem, assumed_align=4)
     fc1_c_tmp_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
         (
@@ -3544,6 +3585,7 @@ def compile_w4a16_fused_moe(
         fc1_c_tmp_fake,
         fc2_c_tmp_fake,
         locks_fake,
+        1,
         current_cuda_stream(),
     )
     result = W4A16FusedMoeCompileResult(
@@ -3656,16 +3698,8 @@ def compile_w4a16_topk_sum(
     if cached is not None:
         return cached
 
-    fc2_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass_dtype,
-        (m * topk * hidden_size,),
-        assumed_align=16,
-    )
-    output_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass_dtype,
-        (m * hidden_size,),
-        assumed_align=16,
-    )
+    fc2_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    output_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     kernel = W4A16TopKSumKernel(
         m=m,
         topk=topk,
@@ -3679,6 +3713,7 @@ def compile_w4a16_topk_sum(
         kernel,
         fc2_fake,
         output_fake,
+        1,
         current_cuda_stream(),
     )
     result = W4A16TopKSumCompileResult(
@@ -3902,11 +3937,35 @@ def run_w4a16_moe(
     route_num_experts = (
         int(expert_map.numel()) if expert_map is not None else int(prepared.num_experts)
     )
-    block_size_m = select_route_block_size_m(m, topk, route_num_experts)
+    if fused_launch is None:
+        block_size_m = select_route_block_size_m(m, topk, route_num_experts)
+    else:
+        block_size_m = int(fused_launch.moe_block_size)
     if block_size_m not in _ALLOWED_ROUTED_SIZES:
         raise ValueError(f"unsupported W4A16 moe_block_size={block_size_m}")
 
     stream = current_cuda_stream() if stream is None else stream
+    if fused_launch is not None:
+        route_slots_capacity = max_packed_route_slots(
+            int(fused_launch.size_m) * int(topk),
+            int(block_size_m),
+            route_num_experts,
+        )
+        route_blocks_capacity = (route_slots_capacity + int(block_size_m) - 1) // int(
+            block_size_m
+        )
+        if packed_route_indices is not None:
+            if int(packed_route_indices.numel()) < route_slots_capacity:
+                raise ValueError(
+                    "packed_route_indices is smaller than the selected W4A16 launch capacity"
+                )
+            packed_route_indices = packed_route_indices[:route_slots_capacity]
+        if block_expert_ids is not None:
+            if int(block_expert_ids.numel()) < route_blocks_capacity:
+                raise ValueError(
+                    "block_expert_ids is smaller than the selected W4A16 launch capacity"
+                )
+            block_expert_ids = block_expert_ids[:route_blocks_capacity]
     packed_route_indices, block_expert_ids, packed_route_count = (
         pack_topk_routes_by_expert(
             topk_ids,
@@ -3961,18 +4020,6 @@ def run_w4a16_moe(
 
     intermediate_cache13_flat = intermediate_cache13.view(-1)
     intermediate_cache2_flat = intermediate_cache2.view(-1)
-    fc1_out = intermediate_cache13_flat[: routed_rows * fc1_cols].view(
-        routed_rows,
-        fc1_cols,
-    )
-    activated = intermediate_cache2_flat[: routed_rows * intermediate_size].view(
-        routed_rows,
-        intermediate_size,
-    )
-    fc2_out = intermediate_cache13_flat[: routed_rows * hidden_size].view(
-        routed_rows,
-        hidden_size,
-    )
 
     del fast_math
     if int(prepared.workspace.numel()) < sms * 4 + 2:
@@ -3995,8 +4042,12 @@ def run_w4a16_moe(
             swiglu_limit=swiglu_limit,
         )
     else:
+        if int(fused_launch.size_m) < m:
+            raise RuntimeError(
+                "preplanned W4A16 fused MoE launch capacity is smaller than requested rows: "
+                f"requested={m}, planned={int(fused_launch.size_m)}"
+            )
         expected_fused = (
-            m,
             hidden_size,
             intermediate_size,
             int(prepared.num_experts),
@@ -4007,10 +4058,8 @@ def run_w4a16_moe(
             element_dtype,
             swiglu_limit,
             block_size_m,
-            int(block_expert_ids.numel()),
         )
         actual_fused = (
-            int(fused_launch.size_m),
             int(fused_launch.hidden_size),
             int(fused_launch.intermediate_size),
             int(fused_launch.num_experts),
@@ -4021,14 +4070,31 @@ def run_w4a16_moe(
             fused_launch.element_dtype,
             fused_launch.swiglu_limit,
             int(fused_launch.moe_block_size),
-            int(fused_launch.max_m_blocks),
         )
-        if actual_fused != expected_fused:
+        if actual_fused != expected_fused or int(fused_launch.max_m_blocks) < int(
+            block_expert_ids.numel()
+        ):
             raise RuntimeError(
                 "preplanned W4A16 fused MoE launch does not match requested contract: "
-                f"requested={expected_fused}, planned={actual_fused}"
+                f"requested={expected_fused + (int(block_expert_ids.numel()),)}, "
+                f"planned={actual_fused + (int(fused_launch.max_m_blocks),)}"
             )
         fused = fused_launch
+    capacity_m = int(fused.size_m)
+    capacity_routed_rows = capacity_m * topk
+    if intermediate_cache13_flat.numel() < capacity_routed_rows * max(fc1_cols, hidden_size):
+        raise ValueError(
+            "intermediate_cache13 is smaller than the selected W4A16 launch capacity: "
+            f"capacity_rows={capacity_m}, topk={topk}"
+        )
+    if intermediate_cache2_flat.numel() < capacity_routed_rows * intermediate_size:
+        raise ValueError(
+            "intermediate_cache2 is smaller than the selected W4A16 launch capacity: "
+            f"capacity_rows={capacity_m}, topk={topk}"
+        )
+    fc1_out = intermediate_cache13_flat[: capacity_routed_rows * fc1_cols]
+    activated = intermediate_cache2_flat[: capacity_routed_rows * intermediate_size]
+    fc2_out = intermediate_cache13_flat[: capacity_routed_rows * hidden_size]
     fc1_scratch = _get_c_tmp(
         packed_gemm_scratch_elements(
             size_n=fc1_cols,
@@ -4050,12 +4116,17 @@ def run_w4a16_moe(
         scratch=fc2_c_tmp,
     )
     fused.compiled(
-        a_input.view(-1),
+        make_ptr(
+            _cutlass_element_dtype(element_dtype),
+            a_input.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
         prepared.w13.view(torch.int32).view(-1),
         prepared.w2.view(torch.int32).view(-1),
-        fc1_out.view(-1),
-        activated.view(-1),
-        fc2_out.view(-1),
+        fc1_out,
+        activated,
+        fc2_out,
         prepared.w13_scale.view(torch.uint8).view(torch.int32).view(-1),
         prepared.w2_scale.view(torch.uint8).view(torch.int32).view(-1),
         prepared.w13_global_scale,
@@ -4063,10 +4134,16 @@ def run_w4a16_moe(
         packed_route_indices,
         block_expert_ids,
         packed_route_count,
-        topk_weights.view(-1),
+        make_ptr(
+            cutlass.Float32,
+            topk_weights.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
         fc1_scratch,
         fc2_scratch,
         prepared.workspace,
+        m,
         stream,
     )
 
@@ -4078,21 +4155,31 @@ def run_w4a16_moe(
             element_dtype=element_dtype,
         )
     else:
-        expected_sum = (m, topk, hidden_size)
+        expected_sum = (topk, hidden_size)
         actual_sum = (
-            int(topk_sum_launch.m),
             int(topk_sum_launch.topk),
             int(topk_sum_launch.hidden_size),
         )
-        if actual_sum != expected_sum:
+        if int(topk_sum_launch.m) < m or actual_sum != expected_sum:
             raise RuntimeError(
                 "preplanned W4A16 top-k sum launch does not match requested contract: "
-                f"requested={expected_sum}, planned={actual_sum}"
+                f"requested={(m,) + expected_sum}, planned={(int(topk_sum_launch.m),) + actual_sum}"
             )
         sum_kernel = topk_sum_launch
     sum_kernel.compiled(
-        fc2_out.view(-1),
-        output.view(-1),
+        make_ptr(
+            _cutlass_element_dtype(element_dtype),
+            fc2_out.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            _cutlass_element_dtype(element_dtype),
+            output.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        m,
         stream,
     )
     return output

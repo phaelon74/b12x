@@ -314,7 +314,7 @@ def test_w4a16_joint_arena_materializes_planned_workspace(
     )
     assert resolved is workspace
 
-    unplanned_plan = tp_moe._make_workspace_plan(
+    tail_plan = tp_moe._make_workspace_plan(
         num_tokens=2,
         weight_E=8,
         k=16,
@@ -324,10 +324,29 @@ def test_w4a16_joint_arena_materializes_planned_workspace(
         dtype=torch.bfloat16,
         quant_mode="w4a16",
     )
-    with pytest.raises(RuntimeError, match="unplanned token count"):
+    resolved_tail = tp_moe._resolve_workspace(
+        pool,
+        plan=tail_plan,
+        a1_gscale=torch.empty(0, dtype=torch.float32, device=device),
+        a2_gscale=torch.empty(0, dtype=torch.float32, device=device),
+        input_scales_static=True,
+    )
+    assert resolved_tail is workspace
+
+    oversized_plan = tp_moe._make_workspace_plan(
+        num_tokens=8,
+        weight_E=8,
+        k=16,
+        n=16,
+        num_topk=2,
+        device=device,
+        dtype=torch.bfloat16,
+        quant_mode="w4a16",
+    )
+    with pytest.raises(RuntimeError, match="capacity is too small|unplanned token count"):
         tp_moe._resolve_workspace(
             pool,
-            plan=unplanned_plan,
+            plan=oversized_plan,
             a1_gscale=torch.empty(0, dtype=torch.float32, device=device),
             a2_gscale=torch.empty(0, dtype=torch.float32, device=device),
             input_scales_static=True,
