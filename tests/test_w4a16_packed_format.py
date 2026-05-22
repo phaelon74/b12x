@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from b12x.cute.fp4 import swizzle_block_scale
+from b12x.integration.tp_moe import prepare_b12x_w4a16_packed_weights
 from b12x.moe.fused.w4a16.prepare import (
     prepare_w4a16_packed_weights as prepare_w4a16_weights,
 )
@@ -150,3 +151,107 @@ def test_packed_compressed_tensors_source_matches_reciprocal_modelopt_contract(
         "w2_global_scale",
     ):
         assert torch.equal(getattr(modelopt, name), getattr(compressed_tensors, name)), name
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("activation", ["relu2", "silu"])
+def test_packed_weight_preparation_can_reuse_input_storage(activation: str) -> None:
+    torch.manual_seed(20260521)
+    experts, hidden_size, intermediate_size = 3, 128, 128
+    w13, w13_blockscale, w2, w2_blockscale = _make_case(
+        experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+    )
+    w13_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(torch.float32)
+    w2_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(torch.float32)
+
+    expected = prepare_w4a16_weights(
+        w13.clone(),
+        w13_blockscale,
+        w13_global_scale,
+        w2.clone(),
+        w2_blockscale,
+        w2_global_scale,
+        activation=activation,
+    )
+    actual = prepare_w4a16_weights(
+        w13,
+        w13_blockscale,
+        w13_global_scale,
+        w2,
+        w2_blockscale,
+        w2_global_scale,
+        activation=activation,
+        reuse_input_storage=True,
+    )
+
+    assert actual.w13.data_ptr() == w13.data_ptr()
+    assert actual.w2.data_ptr() == w2.data_ptr()
+    for name in (
+        "w13",
+        "w13_scale",
+        "w13_global_scale",
+        "w2",
+        "w2_scale",
+        "w2_global_scale",
+    ):
+        assert torch.equal(getattr(actual, name), getattr(expected, name)), name
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("activation", ["relu2", "silu"])
+def test_integration_packed_preparation_uses_default_a16_alpha_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    activation: str,
+) -> None:
+    torch.manual_seed(20260522)
+    monkeypatch.setenv("B12X_MOE_FORCE_A16", "1")
+    experts, hidden_size, intermediate_size = 3, 128, 128
+    w13, w13_blockscale, w2, w2_blockscale = _make_case(
+        experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+    )
+    w13_alphas = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(torch.float32)
+    w2_alphas = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(torch.float32)
+    a1_gscale = (torch.rand(experts, device="cuda") * 0.5 + 0.75).to(torch.float32)
+    a2_gscale = (torch.rand(experts, device="cuda") * 0.5 + 0.75).to(torch.float32)
+
+    expected = prepare_w4a16_weights(
+        w13.clone(),
+        w13_blockscale,
+        w13_alphas * a1_gscale,
+        w2.clone(),
+        w2_blockscale,
+        w2_alphas * a2_gscale,
+        activation=activation,
+    )
+    actual = prepare_b12x_w4a16_packed_weights(
+        w13,
+        w13_blockscale,
+        w13_alphas,
+        a1_gscale,
+        w2,
+        w2_blockscale,
+        w2_alphas,
+        a2_gscale,
+        activation=activation,
+        params_dtype=torch.bfloat16,
+        quant_mode=None,
+        reuse_input_storage=True,
+    )
+
+    assert actual.w13.data_ptr() == w13.data_ptr()
+    assert actual.w2.data_ptr() == w2.data_ptr()
+    for name in (
+        "w13",
+        "w13_scale",
+        "w13_global_scale",
+        "w2",
+        "w2_scale",
+        "w2_global_scale",
+    ):
+        assert torch.equal(getattr(actual, name), getattr(expected, name)), name

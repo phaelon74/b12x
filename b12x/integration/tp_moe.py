@@ -142,6 +142,11 @@ class TPW4A16Workspace:
     block_expert_ids: torch.Tensor
     packed_route_count: torch.Tensor
     expert_offsets: torch.Tensor
+    planned_token_counts: frozenset[int] = field(default_factory=frozenset)
+    planned_apply_router_weight_on_input: bool = False
+    planned_swiglu_limit: float | None = None
+    planned_fused_moe_launches: dict[int, object] = field(default_factory=dict)
+    planned_topk_sum_launches: dict[int, object] = field(default_factory=dict)
     route_workspace: "_TPRouteWorkspace | None" = None
     volatile_launch_state: bool = False
 
@@ -586,6 +591,31 @@ def _get_micro_compact_cutover_pairs() -> int:
     return _MICRO_COMPACT_CUTOVER_PAIRS_CACHE
 
 
+def _arena_core_token_counts(
+    *,
+    max_tokens: int,
+    num_topk: int,
+    core_token_counts: tuple[int, ...] | None,
+    quant_mode: str,
+) -> tuple[int, ...]:
+    max_tokens = max(int(max_tokens), 1)
+    num_topk = max(int(num_topk), 1)
+    quant_mode = _normalize_quant_mode(quant_mode)
+    if core_token_counts is None:
+        normalized = (max_tokens,)
+    else:
+        normalized = tuple(max(int(token_count), 1) for token_count in core_token_counts)
+        if max_tokens not in normalized:
+            normalized = (max_tokens, *normalized)
+    static_cutover_pairs = _get_static_compact_cutover_pairs(quant_mode)
+    max_static_tokens = static_cutover_pairs // num_topk
+    if max_static_tokens >= 1:
+        static_boundary_tokens = min(max_tokens, max_static_tokens)
+        if static_boundary_tokens not in normalized:
+            normalized = (*normalized, static_boundary_tokens)
+    return normalized
+
+
 def _dynamic_multicta_enabled() -> bool:
     global _DYNAMIC_MULTICTA_CACHE
     if _DYNAMIC_MULTICTA_CACHE is None:
@@ -935,7 +965,6 @@ def _plan_core_workspace(
     dynamic_task_capacity: int | None = None,
 ) -> _TPCoreWorkspacePlan:
     quant_mode = _normalize_quant_mode(quant_mode)
-    activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
     if implementation == "w4a16":
         from b12x.moe.fused.w4a16.host import (
             _W4A16_ALLOWED_ROUTED_SIZES,
@@ -944,7 +973,7 @@ def _plan_core_workspace(
         )
 
         routed_capacity = max(int(routed_rows), 1)
-        fc1_cols = activation_spec.w1_rows(int(n))
+        fc1_cols = _activation_w1_rows(activation, int(n))
         route_slots_capacity = 1
         route_blocks_capacity = 1
         fc1_c_tmp_elements = 1
@@ -980,7 +1009,7 @@ def _plan_core_workspace(
         return _TPCoreWorkspacePlan(
             implementation=implementation,
             quant_mode=quant_mode,
-            activation=activation_spec.activation,
+            activation=activation,
             state_E=state_E,
             weight_E=weight_E,
             routed_rows=routed_capacity,
@@ -1013,6 +1042,8 @@ def _plan_core_workspace(
                 _TensorAllocSpec("expert_offsets", (int(weight_E) + 1,), torch.int32),
             ),
         )
+
+    activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
 
     cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
     direct_micro_tokens = max(1, routed_rows // max(1, num_topk))
@@ -1271,8 +1302,8 @@ def _materialize_workspace_from_core_arena(
     plan: _TPCoreWorkspacePlan,
     arena: _TPCoreArena,
     *,
-    a1_gscale: torch.Tensor,
-    a2_gscale: torch.Tensor,
+    a1_gscale: torch.Tensor | None,
+    a2_gscale: torch.Tensor | None,
     input_scales_static: bool,
     volatile_launch_state: bool = False,
 ) -> TPMoEWorkspace | TPW4A16Workspace:
@@ -1301,6 +1332,8 @@ def _materialize_workspace_from_core_arena(
             expert_offsets=tensors["expert_offsets"],
             volatile_launch_state=bool(volatile_launch_state),
         )
+    if a1_gscale is None or a2_gscale is None:
+        raise ValueError("NVFP4 workspace materialization requires input scale tensors")
 
     common_kwargs = dict(
         implementation=plan.implementation,
@@ -1537,6 +1570,7 @@ def _get_w4a16_packed_weights(
     activation: str,
     params_dtype: torch.dtype,
     source_format: str = "modelopt",
+    reuse_input_storage: bool = False,
 ):
     from b12x.moe.fused.w4a16.prepare import prepare_w4a16_packed_weights
 
@@ -1551,6 +1585,7 @@ def _get_w4a16_packed_weights(
         activation,
         params_dtype,
         source_format,
+        reuse_input_storage,
     )
     cached = _W4A16_PACKED_WEIGHT_CACHE.get(key)
     if cached is not None:
@@ -1565,9 +1600,56 @@ def _get_w4a16_packed_weights(
         activation=activation,
         params_dtype=params_dtype,
         source_format=source_format,
+        reuse_input_storage=reuse_input_storage,
     )
     _W4A16_PACKED_WEIGHT_CACHE[key] = prepared
     return prepared
+
+
+def prepare_b12x_w4a16_packed_weights(
+    w1_fp4: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w1_alphas: torch.Tensor,
+    a1_gscale: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_alphas: torch.Tensor,
+    a2_gscale: torch.Tensor,
+    *,
+    activation: str,
+    params_dtype: torch.dtype,
+    quant_mode: str | None = "w4a16",
+    source_format: str = "modelopt",
+    reuse_input_storage: bool = False,
+) -> object:
+    """Prepare W4A16 packed weights using the same contract as b12x_moe_fp4."""
+    quant_mode_arg = quant_mode
+    quant_mode = _normalize_quant_mode(quant_mode_arg)
+    if quant_mode != "w4a16":
+        raise ValueError("W4A16 packed weights require quant_mode='w4a16'")
+    source_format = _normalize_fp4_source_format(source_format)
+    _validate_fp4_source_format_for_quant_mode(
+        source_format=source_format,
+        quant_mode=quant_mode,
+    )
+
+    weight_E = int(w1_fp4.shape[0])
+    if quant_mode_arg is None:
+        w1_alphas = _w4a16_default_alpha(w1_alphas, a1_gscale, weight_E)
+        w2_alphas = _w4a16_default_alpha(w2_alphas, a2_gscale, weight_E)
+
+    return _get_w4a16_packed_weights(
+        w1_fp4,
+        w1_blockscale,
+        w1_alphas,
+        w2_fp4,
+        w2_blockscale,
+        w2_alphas,
+        activation=activation,
+        params_dtype=params_dtype,
+        source_format=source_format,
+        reuse_input_storage=reuse_input_storage,
+    )
 
 
 def _resolve_workspace_layout(
@@ -1603,9 +1685,12 @@ def _make_workspace_plan(
     activation: str = "silu",
 ) -> TPMoEPlan:
     quant_mode = _normalize_quant_mode(quant_mode)
-    activation = _get_activation_kernel_spec(
-        activation, quant_mode=quant_mode
-    ).activation
+    if quant_mode == "w4a16":
+        _activation_w1_rows(activation, 1)
+    else:
+        activation = _get_activation_kernel_spec(
+            activation, quant_mode=quant_mode
+        ).activation
     routed_rows = num_tokens * num_topk
     implementation, state_E, max_rows = _resolve_workspace_layout(
         num_tokens=num_tokens,
@@ -1857,6 +1942,72 @@ def _lookup_capture_static_workspace(
     return None
 
 
+def _normalize_w4a16_swiglu_limit(value: float | None) -> float | None:
+    return None if value is None else float(value)
+
+
+def _validate_frozen_w4a16_launch(
+    workspace: TPW4A16Workspace,
+    *,
+    plan: TPMoEPlan,
+    apply_router_weight_on_input: bool,
+    swiglu_limit: float | None,
+) -> None:
+    token_count = int(plan.max_tokens_per_launch)
+    if token_count not in workspace.planned_token_counts:
+        raise RuntimeError(
+            "frozen W4A16 MoE workspace was asked to launch an unplanned token "
+            f"count: tokens={token_count}, planned={sorted(workspace.planned_token_counts)}"
+        )
+    if bool(apply_router_weight_on_input) != bool(
+        workspace.planned_apply_router_weight_on_input
+    ):
+        raise RuntimeError(
+            "frozen W4A16 MoE workspace apply_router_weight_on_input mismatch: "
+            f"requested={bool(apply_router_weight_on_input)}, "
+            f"planned={workspace.planned_apply_router_weight_on_input}"
+        )
+    requested_limit = _normalize_w4a16_swiglu_limit(swiglu_limit)
+    if requested_limit != workspace.planned_swiglu_limit:
+        raise RuntimeError(
+            "frozen W4A16 MoE workspace swiglu_limit mismatch: "
+            f"requested={requested_limit}, planned={workspace.planned_swiglu_limit}"
+        )
+    if token_count not in workspace.planned_fused_moe_launches:
+        raise RuntimeError(
+            "frozen W4A16 MoE workspace is missing its preplanned fused launch "
+            f"for tokens={token_count}"
+        )
+    if token_count not in workspace.planned_topk_sum_launches:
+        raise RuntimeError(
+            "frozen W4A16 MoE workspace is missing its preplanned top-k sum launch "
+            f"for tokens={token_count}"
+        )
+
+
+def _w4a16_preplanned_launches(
+    workspace: TPW4A16Workspace,
+    *,
+    token_count: int,
+) -> tuple[object | None, object | None]:
+    token_count = int(token_count)
+    if not workspace.planned_token_counts:
+        return None, None
+    if token_count not in workspace.planned_token_counts:
+        raise RuntimeError(
+            "W4A16 MoE workspace was asked to launch an unplanned token count: "
+            f"tokens={token_count}, planned={sorted(workspace.planned_token_counts)}"
+        )
+    fused = workspace.planned_fused_moe_launches.get(token_count)
+    topk_sum = workspace.planned_topk_sum_launches.get(token_count)
+    if fused is None or topk_sum is None:
+        raise RuntimeError(
+            "W4A16 MoE workspace is missing preplanned launches for "
+            f"tokens={token_count}"
+        )
+    return fused, topk_sum
+
+
 def _resolve_workspace(
     workspace: TPMoEWorkspace | TPW4A16Workspace | TPMoEWorkspacePool,
     *,
@@ -1864,6 +2015,8 @@ def _resolve_workspace(
     a1_gscale: torch.Tensor,
     a2_gscale: torch.Tensor,
     input_scales_static: bool,
+    apply_router_weight_on_input: bool = False,
+    swiglu_limit: float | None = None,
 ) -> object:
     if isinstance(workspace, (TPMoEWorkspace, TPW4A16Workspace)):
         _validate_workspace(workspace, plan=plan)
@@ -1904,6 +2057,12 @@ def _resolve_workspace(
             workspace.workspaces[key] = capture_static
             resolved = capture_static
     if resolved is None:
+        if workspace.frozen:
+            raise RuntimeError(
+                "frozen MoE workspace pool does not contain a preplanned workspace "
+                f"for implementation={plan.implementation!r}, quant_mode={plan.quant_mode!r}, "
+                f"tokens={plan.max_tokens_per_launch}, routed_rows={plan.routed_rows}"
+            )
         if plan.implementation == "w4a16" and torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "W4A16 workspace is not initialized for CUDA graph capture; "
@@ -1956,6 +2115,12 @@ def _resolve_workspace(
         )
     )
     if needs_growth:
+        if workspace.frozen:
+            raise RuntimeError(
+                "frozen MoE workspace pool capacity is too small for a requested "
+                f"launch: implementation={plan.implementation!r}, quant_mode={plan.quant_mode!r}, "
+                f"tokens={plan.max_tokens_per_launch}, routed_rows={plan.routed_rows}"
+            )
         if plan.implementation == "w4a16" and torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "W4A16 workspace capacity is too small for CUDA graph capture; "
@@ -1991,6 +2156,14 @@ def _resolve_workspace(
         )
         workspace.workspaces[key] = resolved
         return resolved
+
+    if workspace.frozen and isinstance(resolved, TPW4A16Workspace):
+        _validate_frozen_w4a16_launch(
+            resolved,
+            plan=plan,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            swiglu_limit=swiglu_limit,
+        )
 
     if isinstance(resolved, TPDynamicWorkspace):
         _refresh_dynamic_workspace_scales(
@@ -2091,20 +2264,12 @@ def plan_tp_moe_arena_layout(
     k = max(int(k), 1)
     n = max(int(n), 1)
     num_topk = max(int(num_topk), 1)
-    if core_token_counts is None:
-        core_token_counts = (max_tokens,)
-    else:
-        core_token_counts = tuple(
-            max(int(token_count), 1) for token_count in core_token_counts
-        )
-        if max_tokens not in core_token_counts:
-            core_token_counts = (max_tokens, *core_token_counts)
-    static_cutover_pairs = _get_static_compact_cutover_pairs(quant_mode)
-    max_static_tokens = static_cutover_pairs // num_topk
-    if max_static_tokens >= 1:
-        static_boundary_tokens = min(max_tokens, max_static_tokens)
-        if static_boundary_tokens not in core_token_counts:
-            core_token_counts = (*core_token_counts, static_boundary_tokens)
+    core_token_counts = _arena_core_token_counts(
+        max_tokens=max_tokens,
+        num_topk=num_topk,
+        core_token_counts=core_token_counts,
+        quant_mode=quant_mode,
+    )
     route_num_experts = int(
         route_num_experts if route_num_experts is not None else weight_E
     )
@@ -2152,6 +2317,309 @@ def plan_tp_moe_arena_layout(
         total_nbytes=max(route_nbytes + core_nbytes, 1),
         core_token_counts=core_token_counts,
     )
+
+
+def _select_arena_core_workspace_plan(
+    *,
+    core_token_counts: tuple[int, ...],
+    weight_E: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    quant_mode: str,
+    activation: str,
+) -> tuple[TPMoEPlan, _TPCoreWorkspacePlan, int]:
+    selected_plan: TPMoEPlan | None = None
+    selected_core_plan: _TPCoreWorkspacePlan | None = None
+    selected_nbytes = -1
+    for token_count in core_token_counts:
+        plan = _make_workspace_plan(
+            num_tokens=token_count,
+            weight_E=weight_E,
+            k=k,
+            n=n,
+            num_topk=num_topk,
+            device=device,
+            dtype=dtype,
+            quant_mode=quant_mode,
+            activation=activation,
+        )
+        core_plan = _plan_core_workspace(
+            plan.implementation,
+            plan.quant_mode,
+            plan.state_E,
+            plan.weight_E,
+            plan.k,
+            plan.n,
+            plan.num_topk,
+            plan.device,
+            plan.dtype,
+            routed_rows=plan.routed_rows,
+            max_rows=plan.max_rows,
+            activation=plan.activation,
+            dynamic_physical_tiles=plan.dynamic_physical_tiles,
+            dynamic_task_capacity=plan.dynamic_task_capacity,
+        )
+        nbytes = _core_workspace_nbytes(core_plan)
+        if nbytes > selected_nbytes:
+            selected_plan = plan
+            selected_core_plan = core_plan
+            selected_nbytes = nbytes
+    assert selected_plan is not None
+    assert selected_core_plan is not None
+    return selected_plan, selected_core_plan, selected_nbytes
+
+
+def _w4a16_element_dtype(dtype: torch.dtype) -> str:
+    if dtype == torch.bfloat16:
+        return "bf16"
+    if dtype == torch.float16:
+        return "fp16"
+    raise TypeError(f"unsupported W4A16 activation dtype {dtype}")
+
+
+def _prewarm_w4a16_planned_launches(
+    workspace: TPW4A16Workspace,
+    *,
+    token_counts: tuple[int, ...],
+    apply_router_weight_on_input: bool,
+    swiglu_limit: float | None,
+) -> None:
+    """Resolve every W4A16 kernel shape owned by a frozen arena."""
+    if workspace.device.type != "cuda":
+        raise RuntimeError("W4A16 MoE launch planning requires a CUDA device")
+
+    from b12x.moe.fused.w4a16.host import (
+        max_packed_route_slots,
+        select_route_block_size_m,
+    )
+    from b12x.moe.fused.w4a16.kernel import (
+        _DEFAULT_MAX_SHARED_MEM,
+        compile_w4a16_fused_moe,
+        compile_w4a16_topk_sum,
+        pack_topk_routes_by_expert,
+    )
+
+    token_counts = tuple(sorted({max(int(token_count), 1) for token_count in token_counts}))
+    if not token_counts:
+        raise ValueError("W4A16 launch planning requires at least one token count")
+
+    with torch.cuda.device(workspace.device):
+        props = torch.cuda.get_device_properties(workspace.device)
+        sms = int(props.multi_processor_count)
+        max_shared_mem = int(
+            getattr(props, "shared_memory_per_block_optin", _DEFAULT_MAX_SHARED_MEM)
+        )
+        element_dtype = _w4a16_element_dtype(workspace.dtype)
+        fused_launches: dict[int, object] = {}
+        topk_sum_launches: dict[int, object] = {}
+        for token_count in token_counts:
+            block_size_m = select_route_block_size_m(
+                token_count,
+                workspace.num_topk,
+                workspace.weight_E,
+            )
+            routed_rows = int(token_count) * int(workspace.num_topk)
+            route_slots = max_packed_route_slots(
+                routed_rows,
+                block_size_m,
+                workspace.weight_E,
+            )
+            max_m_blocks = (route_slots + block_size_m - 1) // block_size_m
+            fused_launches[token_count] = compile_w4a16_fused_moe(
+                size_m=token_count,
+                hidden_size=workspace.k,
+                intermediate_size=workspace.n,
+                num_experts=workspace.weight_E,
+                top_k=workspace.num_topk,
+                activation=workspace.activation,
+                apply_router_weight_on_input=bool(apply_router_weight_on_input),
+                zero_fc2_output=False,
+                moe_block_size=block_size_m,
+                max_m_blocks=max_m_blocks,
+                element_dtype=element_dtype,
+                sms=sms,
+                max_shared_mem=max_shared_mem,
+                swiglu_limit=swiglu_limit,
+            )
+            topk_sum_launches[token_count] = compile_w4a16_topk_sum(
+                m=token_count,
+                topk=workspace.num_topk,
+                hidden_size=workspace.k,
+                element_dtype=element_dtype,
+            )
+
+            dummy_topk_ids = torch.empty(
+                token_count,
+                workspace.num_topk,
+                dtype=torch.int32,
+                device=workspace.device,
+            )
+            dummy_topk_ids.zero_()
+            pack_topk_routes_by_expert(
+                dummy_topk_ids,
+                block_size_m,
+                workspace.weight_E,
+                packed_route_indices=workspace.packed_route_indices,
+                block_expert_ids=workspace.block_expert_ids,
+                packed_route_count=workspace.packed_route_count,
+                expert_offsets=workspace.expert_offsets,
+            )
+        workspace.planned_fused_moe_launches = fused_launches
+        workspace.planned_topk_sum_launches = topk_sum_launches
+
+
+def materialize_tp_moe_arena_workspaces(
+    pool: TPMoEWorkspacePool,
+    *,
+    max_tokens: int,
+    weight_E: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    device: torch.device | str,
+    dtype: torch.dtype,
+    core_token_counts: tuple[int, ...] | None = None,
+    quant_mode: str | None = None,
+    activation: str = "silu",
+    apply_router_weight_on_input: bool = False,
+    swiglu_limit: float | None = None,
+) -> None:
+    """Materialize graph-capture-sensitive workspaces from arena sizing caps."""
+    quant_mode = _normalize_quant_mode(quant_mode)
+
+    device = torch.device(device)
+    max_tokens = max(int(max_tokens), 1)
+    weight_E = max(int(weight_E), 1)
+    k = max(int(k), 1)
+    n = max(int(n), 1)
+    num_topk = max(int(num_topk), 1)
+    core_token_counts = _arena_core_token_counts(
+        max_tokens=max_tokens,
+        num_topk=num_topk,
+        core_token_counts=core_token_counts,
+        quant_mode=quant_mode,
+    )
+    selected: dict[tuple, tuple[TPMoEPlan, _TPCoreWorkspacePlan, int]] = {}
+    for token_count in core_token_counts:
+        plan = _make_workspace_plan(
+            num_tokens=token_count,
+            weight_E=weight_E,
+            k=k,
+            n=n,
+            num_topk=num_topk,
+            device=device,
+            dtype=dtype,
+            quant_mode=quant_mode,
+            activation=activation,
+        )
+        core_plan = _plan_core_workspace(
+            plan.implementation,
+            plan.quant_mode,
+            plan.state_E,
+            plan.weight_E,
+            plan.k,
+            plan.n,
+            plan.num_topk,
+            plan.device,
+            plan.dtype,
+            routed_rows=plan.routed_rows,
+            max_rows=plan.max_rows,
+            activation=plan.activation,
+            dynamic_physical_tiles=plan.dynamic_physical_tiles,
+            dynamic_task_capacity=plan.dynamic_task_capacity,
+        )
+        required_nbytes = _core_workspace_nbytes(core_plan)
+        key = _workspace_pool_key(
+            plan.implementation,
+            quant_mode=plan.quant_mode,
+            activation=plan.activation,
+            state_E=plan.state_E,
+            weight_E=plan.weight_E,
+            max_rows=plan.max_rows,
+            k=plan.k,
+            n=plan.n,
+            num_topk=plan.num_topk,
+            device=plan.device,
+            dtype=plan.dtype,
+        )
+        existing_selection = selected.get(key)
+        if existing_selection is None or required_nbytes > existing_selection[2]:
+            selected[key] = (plan, core_plan, required_nbytes)
+
+    for key, (plan, core_plan, required_nbytes) in selected.items():
+        existing = pool.workspaces.get(key)
+        if existing is not None:
+            with suppress(TypeError, ValueError):
+                _validate_workspace(existing, plan=plan)
+                if isinstance(existing, TPW4A16Workspace) and (
+                    not set(core_token_counts).issubset(existing.planned_token_counts)
+                    or existing.planned_apply_router_weight_on_input
+                    != bool(apply_router_weight_on_input)
+                    or existing.planned_swiglu_limit
+                    != _normalize_w4a16_swiglu_limit(swiglu_limit)
+                ):
+                    pass
+                else:
+                    continue
+
+        if pool.shared_arena is None:
+            arena = _allocate_core_arena(core_plan)
+        else:
+            if pool.shared_arena.device != plan.device:
+                raise ValueError(
+                    f"MoE pool arena device {pool.shared_arena.device} does not match plan device {plan.device}"
+                )
+            arena = _materialize_core_arena(
+                core_plan,
+                pool.shared_arena,
+                offset_bytes=pool.core_arena_offset_bytes,
+                capacity_nbytes=pool.core_arena_nbytes,
+            )
+            _emit_core_workspace_stats(
+                core_plan,
+                storage="shared",
+                required_nbytes=required_nbytes,
+                capacity_nbytes=pool.core_arena_nbytes,
+            )
+        pool.core_arenas[key] = arena
+
+        if quant_mode == "w4a16":
+            a1_init = None
+            a2_init = None
+        else:
+            a1_init = torch.ones((), dtype=torch.float32, device=plan.device)
+            a2_init = torch.ones((), dtype=torch.float32, device=plan.device)
+        materialized = _materialize_workspace_from_core_arena(
+            core_plan,
+            arena,
+            a1_gscale=a1_init,
+            a2_gscale=a2_init,
+            input_scales_static=True,
+            volatile_launch_state=bool(pool.shared_arena is not None),
+        )
+        if quant_mode == "w4a16":
+            if not isinstance(materialized, TPW4A16Workspace):
+                raise TypeError(
+                    "expected W4A16 arena materialization to create "
+                    "TPW4A16Workspace"
+                )
+            materialized.planned_token_counts = frozenset(core_token_counts)
+            materialized.planned_apply_router_weight_on_input = bool(
+                apply_router_weight_on_input
+            )
+            materialized.planned_swiglu_limit = _normalize_w4a16_swiglu_limit(
+                swiglu_limit
+            )
+            _prewarm_w4a16_planned_launches(
+                materialized,
+                token_counts=core_token_counts,
+                apply_router_weight_on_input=bool(apply_router_weight_on_input),
+                swiglu_limit=materialized.planned_swiglu_limit,
+            )
+        pool.workspaces[key] = materialized
 
 
 def allocate_tp_moe_workspace_pool(
@@ -3567,6 +4035,8 @@ def b12x_moe_fp4(
     quant_mode: str | None = None,
     unit_scale_contract: bool = False,
     source_format: str = "modelopt",
+    prepared_w4a16: object | None = None,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     """MoE with shape-selected fused static or dynamic kernels.
 
@@ -3582,26 +4052,43 @@ def b12x_moe_fp4(
         source_format=source_format,
         quant_mode=quant_mode,
     )
-    m, k = a.shape
-    E = w1_fp4.shape[0]
-    weight_E = E
-    n = w2_fp4.shape[2] * 2  # intermediate_size
-    expected_w1_rows = _activation_w1_rows(activation, n)
-    if w1_fp4.shape[1] != expected_w1_rows:
-        raise ValueError(
-            f"expected w1_fp4.shape[1] == {expected_w1_rows} for activation "
-            f"{activation!r}, got {w1_fp4.shape[1]}"
-        )
     num_topk = topk_ids.shape[1]
-    routed_rows = m * num_topk
+    m, k = a.shape
     device = a.device
+    if prepared_w4a16 is not None:
+        if quant_mode != "w4a16":
+            raise ValueError("prepared_w4a16 requires quant_mode='w4a16'")
+        prepared_hidden = int(getattr(prepared_w4a16, "hidden_size"))
+        if prepared_hidden != k:
+            raise ValueError(
+                f"prepared_w4a16 hidden_size mismatch: expected {k}, got {prepared_hidden}"
+            )
+        prepared_dtype = getattr(prepared_w4a16, "params_dtype", a.dtype)
+        if prepared_dtype != a.dtype:
+            raise TypeError(
+                f"prepared_w4a16 was built for {prepared_dtype}, but a has dtype {a.dtype}"
+            )
+        weight_E = int(getattr(prepared_w4a16, "num_experts"))
+        n = int(getattr(prepared_w4a16, "intermediate_size"))
+    else:
+        weight_E = w1_fp4.shape[0]
+        n = w2_fp4.shape[2] * 2  # intermediate_size
+        expected_w1_rows = _activation_w1_rows(activation, n)
+        if w1_fp4.shape[1] != expected_w1_rows:
+            raise ValueError(
+                f"expected w1_fp4.shape[1] == {expected_w1_rows} for activation "
+                f"{activation!r}, got {w1_fp4.shape[1]}"
+            )
+    routed_rows = m * num_topk
     if apply_router_weight_on_input and quant_mode != "w4a16":
         raise NotImplementedError(
             "apply_router_weight_on_input is not implemented in b12x_moe_fp4"
         )
+    if swiglu_limit is not None and quant_mode != "w4a16":
+        raise NotImplementedError("swiglu_limit is implemented only for W4A16 MoE")
     if fast_math is None:
         fast_math = _FAST_MATH_DEFAULT
-    if quant_mode_arg is None and quant_mode == "w4a16":
+    if prepared_w4a16 is None and quant_mode_arg is None and quant_mode == "w4a16":
         w1_alphas = _w4a16_default_alpha(
             w1_alphas,
             a1_gscale,
@@ -3643,17 +4130,19 @@ def b12x_moe_fp4(
         if not scatter_output.is_contiguous():
             raise ValueError("output must be contiguous")
 
-        prepared = _get_w4a16_packed_weights(
-            w1_fp4,
-            w1_blockscale,
-            w1_alphas,
-            w2_fp4,
-            w2_blockscale,
-            w2_alphas,
-            activation=activation,
-            params_dtype=a.dtype,
-            source_format=source_format,
-        )
+        prepared = prepared_w4a16
+        if prepared is None:
+            prepared = _get_w4a16_packed_weights(
+                w1_fp4,
+                w1_blockscale,
+                w1_alphas,
+                w2_fp4,
+                w2_blockscale,
+                w2_alphas,
+                activation=activation,
+                params_dtype=a.dtype,
+                source_format=source_format,
+            )
         plan = _make_workspace_plan(
             num_tokens=m,
             weight_E=weight_E,
@@ -3671,6 +4160,8 @@ def b12x_moe_fp4(
             a1_gscale=a1_gscale,
             a2_gscale=a2_gscale,
             input_scales_static=effective_input_scales_static,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            swiglu_limit=swiglu_limit,
         )
         if not isinstance(w4a16_workspace, TPW4A16Workspace):
             raise TypeError("expected a TPW4A16Workspace for the W4A16 backend")
@@ -3686,6 +4177,10 @@ def b12x_moe_fp4(
                     "CUDA graph capture requires contiguous W4A16 topk_ids"
                 )
             topk_ids = topk_ids.contiguous()
+        fused_launch, topk_sum_launch = _w4a16_preplanned_launches(
+            w4a16_workspace,
+            token_count=m,
+        )
         return run_w4a16_moe(
             a,
             prepared,
@@ -3703,6 +4198,9 @@ def b12x_moe_fp4(
             block_expert_ids=w4a16_workspace.block_expert_ids,
             packed_route_count=w4a16_workspace.packed_route_count,
             expert_offsets=w4a16_workspace.expert_offsets,
+            swiglu_limit=swiglu_limit,
+            fused_launch=fused_launch,
+            topk_sum_launch=topk_sum_launch,
         )
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
     if quant_mode == "nvfp4" and _is_exact_relu2_bs1_nemotron_case(
@@ -3785,6 +4283,7 @@ def b12x_moe_fp4(
                 activation=activation,
                 quant_mode=quant_mode,
                 unit_scale_contract=unit_scale_contract,
+                swiglu_limit=swiglu_limit,
             )
         return chunk_output
 
@@ -3865,7 +4364,7 @@ def b12x_moe_fp4(
             flat_ids=flat_ids,
             flat_weights=flat_weights,
             scatter_output=scatter_output,
-            E=E,
+            E=weight_E,
             m=m,
             k=k,
             n=n,
