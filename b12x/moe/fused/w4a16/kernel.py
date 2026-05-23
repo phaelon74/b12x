@@ -9,8 +9,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass.cutlass_dsl import Int32, Int64, T, Uint32, dsl_user_op
-from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import Int32, Int64, Uint32
 
 from b12x.cute.fp4 import (
     atomic_add_global_i32,
@@ -78,22 +77,6 @@ _DEVICE_MAX_REG_BYTES = 255 * 1024
 _DEFAULT_MAX_SHARED_MEM = 101_376
 _WEIGHT_LAYOUTS = {"packed", "modelopt"}
 
-
-@dsl_user_op
-def _ld_global_nc_u8(base_ptr: Int64, *, loc=None, ip=None) -> Uint32:
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
-            "ld.global.nc.u8 $0, [$1];",
-            "=r,l",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
-    )
 
 # The W4A16 launch model chooses blocks/SM from static resource usage
 # for each specialization.  These register counts were measured from the local
@@ -1886,14 +1869,22 @@ class W4A16GemmKernel:
         pipe: Int32,
         kk: Int32,
     ):
-        b_addr = self._int4_addr(
-            smem_base,
-            Int32(self.sh_b_off)
-            + pipe * Int32(self.b_sh_stage)
-            + Int32(self.b_sh_stride) * kk
-            + b_sh_rd,
-        )
-        q0, q1, q2, q3 = ld_shared_v4_u32(b_addr)
+        if cutlass.const_expr(self.weight_layout == "modelopt"):
+            q0, q1, q2, q3 = self._load_b_registers_modelopt_shared(
+                smem_base,
+                b_sh_rd,
+                pipe,
+                kk,
+            )
+        else:
+            b_addr = self._int4_addr(
+                smem_base,
+                Int32(self.sh_b_off)
+                + pipe * Int32(self.b_sh_stage)
+                + Int32(self.b_sh_stride) * kk
+                + b_sh_rd,
+            )
+            q0, q1, q2, q3 = ld_shared_v4_u32(b_addr)
 
         warp_id = tid // Int32(32)
         warp_row = warp_id // Int32(self.tb_n_warps)
@@ -2106,228 +2097,135 @@ class W4A16GemmKernel:
         return source_n
 
     @cute.jit
-    def _load_modelopt_nibble(
+    def _stage_b_tile_modelopt_native(
         self,
         b_u8_flat: cute.Tensor,
+        smem_addr: Int32,
         expert_idx: Int32,
-        logical_n: Int32,
-        k: Int32,
-        high_nibble: cutlass.Constexpr[bool],
-    ) -> Uint32:
+        output_n_tile: Int32,
+        tile_idx: Int32,
+        local_int4: Int32,
+    ):
+        chunks_per_row = Int32(self.tile_k // 32)
+        local_n = local_int4 // chunks_per_row
+        local_k_vec = local_int4 - local_n * chunks_per_row
+        logical_n = output_n_tile * Int32(self.tile_n) + local_n
         source_n = self._source_n_from_logical(logical_n)
         packed_cols = Int32(self.size_k // 2)
         byte_offset = (
             Int64(expert_idx) * Int64(self.size_n * (self.size_k // 2))
             + Int64(source_n) * Int64(packed_cols)
-            + Int64(k // Int32(2))
+            + Int64(tile_idx * Int32(self.tile_k // 2))
+            + Int64(local_k_vec * Int32(16))
         )
-        q = _ld_global_nc_u8(get_ptr_as_int64(b_u8_flat, byte_offset))
-        if cutlass.const_expr(high_nibble):
-            q = q >> Uint32(4)
-        return q & Uint32(0xF)
+        cp_async4_shared_global(
+            smem_addr,
+            get_ptr_as_int64(b_u8_flat, byte_offset),
+        )
 
     @cute.jit
-    def _load_modelopt_slot_nibble(
+    def _load_modelopt_shared_byte(
         self,
-        b_u8_flat: cute.Tensor,
-        expert_idx: Int32,
+        smem_base: Int32,
+        pipe: Int32,
         n_tile: Int32,
         k_tile: Int32,
         warp_id: Int32,
         tc_col: Int32,
         tc_row: Int32,
-        offset: cutlass.Constexpr[int],
         n_delta: cutlass.Constexpr[int],
-        high_nibble: cutlass.Constexpr[bool],
+        k_delta: cutlass.Constexpr[int],
     ) -> Uint32:
-        logical_n = (
+        local_n = (
             n_tile * Int32(64)
             + warp_id * Int32(16)
             + tc_col
             + Int32(n_delta)
         )
-        k = k_tile * Int32(16) + tc_row + Int32(offset)
-        return self._load_modelopt_nibble(
-            b_u8_flat,
-            expert_idx,
-            logical_n,
-            k,
-            high_nibble,
+        local_k = k_tile * Int32(16) + tc_row + Int32(k_delta)
+        byte_offset = local_n * Int32(self.tile_k // 2) + local_k // Int32(2)
+        word_byte_offset = byte_offset - (byte_offset & Int32(3))
+        word = ld_shared_u32(
+            smem_base
+            + Int32(self.sh_b_off * 16)
+            + pipe * Int32(self.b_sh_stage * 16)
+            + word_byte_offset
         )
+        shift = Uint32((byte_offset - word_byte_offset) * Int32(8))
+        return (word >> shift) & Uint32(0xFF)
 
     @cute.jit
-    def _pack_modelopt_slot(
+    def _pack_modelopt_byte_pair(
         self,
-        b_u8_flat: cute.Tensor,
-        expert_idx: Int32,
+        word: Uint32,
+        q: Uint32,
+        low_shift: cutlass.Constexpr[int],
+        high_shift: cutlass.Constexpr[int],
+    ) -> Uint32:
+        low = q & Uint32(0xF)
+        high = (q >> Uint32(4)) & Uint32(0xF)
+        return word | (low << Uint32(low_shift)) | (high << Uint32(high_shift))
+
+    @cute.jit
+    def _load_modelopt_shared_packed_word_for_lane(
+        self,
+        smem_base: Int32,
+        pipe: Int32,
         n_tile: Int32,
         k_tile: Int32,
         warp_id: Int32,
         tc_col: Int32,
         tc_row: Int32,
-        slot: cutlass.Constexpr[int],
     ) -> Uint32:
-        if cutlass.const_expr(slot == 0):
-            return self._load_modelopt_slot_nibble(
-                b_u8_flat,
-                expert_idx,
-                n_tile,
-                k_tile,
-                warp_id,
-                tc_col,
-                tc_row,
-                0,
-                0,
-                False,
-            )
-        if cutlass.const_expr(slot == 1):
-            return self._load_modelopt_slot_nibble(
-                b_u8_flat,
-                expert_idx,
-                n_tile,
-                k_tile,
-                warp_id,
-                tc_col,
-                tc_row,
-                8,
-                0,
-                False,
-            )
-        if cutlass.const_expr(slot == 2):
-            return self._load_modelopt_slot_nibble(
-                b_u8_flat,
-                expert_idx,
-                n_tile,
-                k_tile,
-                warp_id,
-                tc_col,
-                tc_row,
-                0,
-                8,
-                False,
-            )
-        if cutlass.const_expr(slot == 3):
-            return self._load_modelopt_slot_nibble(
-                b_u8_flat,
-                expert_idx,
-                n_tile,
-                k_tile,
-                warp_id,
-                tc_col,
-                tc_row,
-                8,
-                8,
-                False,
-            )
-        if cutlass.const_expr(slot == 4):
-            return self._load_modelopt_slot_nibble(
-                b_u8_flat,
-                expert_idx,
-                n_tile,
-                k_tile,
-                warp_id,
-                tc_col,
-                tc_row,
-                1,
-                0,
-                True,
-            )
-        if cutlass.const_expr(slot == 5):
-            return self._load_modelopt_slot_nibble(
-                b_u8_flat,
-                expert_idx,
-                n_tile,
-                k_tile,
-                warp_id,
-                tc_col,
-                tc_row,
-                9,
-                0,
-                True,
-            )
-        if cutlass.const_expr(slot == 6):
-            return self._load_modelopt_slot_nibble(
-                b_u8_flat,
-                expert_idx,
-                n_tile,
-                k_tile,
-                warp_id,
-                tc_col,
-                tc_row,
-                1,
-                8,
-                True,
-            )
-        return self._load_modelopt_slot_nibble(
-            b_u8_flat,
-            expert_idx,
-            n_tile,
-            k_tile,
-            warp_id,
-            tc_col,
-            tc_row,
-            9,
-            8,
-            True,
+        q0 = self._load_modelopt_shared_byte(
+            smem_base, pipe, n_tile, k_tile, warp_id, tc_col, tc_row, 0, 0
         )
-
-    @cute.jit
-    def _load_modelopt_packed_word(
-        self,
-        b_u8_flat: cute.Tensor,
-        expert_idx: Int32,
-        packed_vec_index: Int32,
-        word_lane: cutlass.Constexpr[int],
-    ) -> Uint32:
-        packed_word_index = packed_vec_index * Int32(4) + Int32(word_lane)
-        expert_base_words = Int32((self.size_n * self.size_k) // _PACK_FACTOR)
-        word_in_expert = packed_word_index - expert_idx * expert_base_words
-        words_per_k_tile = Int32((self.size_n // 64) * 128)
-        k_tile = word_in_expert // words_per_k_tile
-        pos_in_k_tile = word_in_expert - k_tile * words_per_k_tile
-        n_tile = pos_in_k_tile // Int32(128)
-        pos = pos_in_k_tile - n_tile * Int32(128)
-        th_id = pos // Int32(4)
-        warp_id = pos - th_id * Int32(4)
-        tc_col = th_id // Int32(4)
-        tc_row = (th_id - tc_col * Int32(4)) * Int32(2)
-
+        q1 = self._load_modelopt_shared_byte(
+            smem_base, pipe, n_tile, k_tile, warp_id, tc_col, tc_row, 0, 8
+        )
+        q2 = self._load_modelopt_shared_byte(
+            smem_base, pipe, n_tile, k_tile, warp_id, tc_col, tc_row, 8, 0
+        )
+        q3 = self._load_modelopt_shared_byte(
+            smem_base, pipe, n_tile, k_tile, warp_id, tc_col, tc_row, 8, 8
+        )
         word = Uint32(0)
-        for slot in cutlass.range_constexpr(8):
-            nibble = self._pack_modelopt_slot(
-                b_u8_flat,
-                expert_idx,
-                n_tile,
-                k_tile,
-                warp_id,
-                tc_col,
-                tc_row,
-                slot,
-            )
-            word = word | (nibble << Uint32(slot * 4))
+        word = self._pack_modelopt_byte_pair(word, q0, 0, 16)
+        word = self._pack_modelopt_byte_pair(word, q1, 4, 20)
+        word = self._pack_modelopt_byte_pair(word, q2, 8, 24)
+        word = self._pack_modelopt_byte_pair(word, q3, 12, 28)
         return word
 
     @cute.jit
-    def _stage_b_tile_modelopt(
+    def _load_b_registers_modelopt_shared(
         self,
-        b_u8_flat: cute.Tensor,
-        smem_addr: Int32,
-        expert_idx: Int32,
-        packed_vec_index: Int32,
+        smem_base: Int32,
+        b_sh_rd: Int32,
+        pipe: Int32,
+        kk: Int32,
     ):
-        w0 = self._load_modelopt_packed_word(
-            b_u8_flat, expert_idx, packed_vec_index, 0
+        packed_word_index = (Int32(self.b_sh_stride) * kk + b_sh_rd) * Int32(4)
+        words_per_k_tile = Int32((self.tile_n // 64) * 128)
+        k_tile = packed_word_index // words_per_k_tile
+        pos_in_k_tile = packed_word_index - k_tile * words_per_k_tile
+        n_tile = pos_in_k_tile // Int32(128)
+        pos = pos_in_k_tile - n_tile * Int32(128)
+        th_id = pos // Int32(4)
+        tc_col = th_id // Int32(4)
+        tc_row = (th_id - tc_col * Int32(4)) * Int32(2)
+        q0 = self._load_modelopt_shared_packed_word_for_lane(
+            smem_base, pipe, n_tile, k_tile, Int32(0), tc_col, tc_row
         )
-        w1 = self._load_modelopt_packed_word(
-            b_u8_flat, expert_idx, packed_vec_index, 1
+        q1 = self._load_modelopt_shared_packed_word_for_lane(
+            smem_base, pipe, n_tile, k_tile, Int32(1), tc_col, tc_row
         )
-        w2 = self._load_modelopt_packed_word(
-            b_u8_flat, expert_idx, packed_vec_index, 2
+        q2 = self._load_modelopt_shared_packed_word_for_lane(
+            smem_base, pipe, n_tile, k_tile, Int32(2), tc_col, tc_row
         )
-        w3 = self._load_modelopt_packed_word(
-            b_u8_flat, expert_idx, packed_vec_index, 3
+        q3 = self._load_modelopt_shared_packed_word_for_lane(
+            smem_base, pipe, n_tile, k_tile, Int32(3), tc_col, tc_row
         )
-        st_shared_v4_u32(smem_addr, w0, w1, w2, w3)
+        return q0, q1, q2, q3
 
     @cute.jit
     def _stage_k_tile_async(
@@ -2397,11 +2295,13 @@ class W4A16GemmKernel:
                     get_ptr_as_int64(b_i32_flat, b_src_int4 * Int32(4)),
                 )
             else:
-                self._stage_b_tile_modelopt(
+                self._stage_b_tile_modelopt_native(
                     b_i32_flat,
                     b_dst,
                     expert_idx,
-                    b_src_int4,
+                    output_n_tile,
+                    tile_idx,
+                    Int32(i * self.cta_threads) + tid,
                 )
 
         if tid < Int32(self.s_sh_stage):
