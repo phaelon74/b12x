@@ -2130,6 +2130,7 @@ def run_sparse_nsa_extend_logits_kernel(
             k_start=k_start,
             k_end=k_end,
             preinitialize_invalid_logits=preinitialize_invalid_logits,
+            requires_full_logits=not (_tiled_output and _use_prefill),
         )
         q_u32 = staged["q_u32"]
         q_bytes_kernel = q_fp8.contiguous().view(torch.uint8)

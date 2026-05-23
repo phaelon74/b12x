@@ -1919,6 +1919,21 @@ class B12XAttentionWorkspace:
             )
         return self.indexer_extend_lengths[:row_count]
 
+    def get_paged_indexer_runtime_lengths(self, *, row_count: int) -> torch.Tensor:
+        self._allocate_paged_indexer_runtime_metadata()
+        if self.paged_indexer_seqlens_per_query_runtime is None:
+            raise RuntimeError("fixed-capacity workspace is missing paged indexer length buffer")
+        row_count = int(row_count)
+        if row_count < 0:
+            raise ValueError(f"row_count must be non-negative, got {row_count}")
+        if row_count > self.paged_indexer_seqlens_per_query_runtime.shape[0]:
+            raise ValueError(
+                "row_count "
+                f"{row_count} exceeds paged indexer length capacity "
+                f"{self.paged_indexer_seqlens_per_query_runtime.shape[0]}"
+            )
+        return self.paged_indexer_seqlens_per_query_runtime[:row_count]
+
     def get_indexer_extend_topk_result(self, *, row_count: int) -> torch.Tensor:
         if self.indexer_extend_topk_indices is None:
             raise RuntimeError("fixed-capacity workspace is missing NSA extend top-k result buffer")
@@ -2330,6 +2345,13 @@ class B12XAttentionWorkspace:
         from b12x.attention.nsa_indexer.kernel import (
             run_sparse_nsa_paged_windowed_tiled_logits_kernel,
         )
+        from b12x.attention.nsa_indexer.extend_kernel import (
+            resolve_sparse_nsa_extend_prefill_block_k,
+            run_sparse_nsa_extend_logits_kernel,
+        )
+        from b12x.integration.paged_mqa_indexer import (
+            _prepare_shared_paged_mqa_supertile,
+        )
 
         block_q = _NSA_INDEXER_TILE_BLOCK_Q
         block_k = _PAGED_INDEXER_TILE_BLOCK_K
@@ -2383,6 +2405,42 @@ class B12XAttentionWorkspace:
                 workspace=self,
                 preinitialize_tile_logits=False,
             )
+            if (
+                self.indexer_k_quant_bytes is not None
+                and plan.q_rows >= 1024
+                and plan.width_tokens <= int(self.indexer_k_quant_bytes.shape[0])
+                and resolve_sparse_nsa_extend_prefill_block_k(
+                    valid_q_rows=plan.q_rows,
+                    k_rows=plan.width_tokens,
+                    num_heads=self.indexer_num_q_heads,
+                )
+                == block_k
+            ):
+                page_table.fill_(0)
+                lengths.fill_(plan.width_tokens)
+                k_quant, k_scale, k_start, k_end = _prepare_shared_paged_mqa_supertile(
+                    index_k_cache=index_k_cache,
+                    real_page_table=page_table,
+                    seqlens_per_query=lengths,
+                    workspace=self,
+                    q_rows=plan.q_rows,
+                    page_table_width=plan.source_page_width,
+                    page_begin=0,
+                    supertile_tokens=plan.width_tokens,
+                )
+                run_sparse_nsa_extend_logits_kernel(
+                    q_fp8=q_fp8,
+                    weights=weights,
+                    k_quant=k_quant,
+                    k_scale=k_scale,
+                    k_start=k_start,
+                    k_end=k_end,
+                    contract_phantoms=self.get_indexer_contract_phantoms(),
+                    workspace=self,
+                    tile_logits=self.indexer_extend_tile_logits,
+                    tile_k_offset=0,
+                    tile_num_k_tiles=plan.width_tokens // plan.block_k,
+                )
             torch.cuda.synchronize(self.device)
 
         self._paged_indexer_tiled_scorer_plan = plan
@@ -2443,11 +2501,12 @@ class B12XAttentionWorkspace:
         k_start: torch.Tensor,
         k_end: torch.Tensor,
         preinitialize_invalid_logits: bool = True,
+        requires_full_logits: bool = True,
     ) -> dict[str, torch.Tensor]:
         if (
             self.indexer_k_quant_bytes is None
             or self.indexer_k_scales is None
-            or self.indexer_extend_logits is None
+            or (requires_full_logits and self.indexer_extend_logits is None)
         ):
             raise RuntimeError("fixed-capacity workspace is missing NSA indexer buffers")
         if not q_fp8.is_contiguous():
@@ -2532,11 +2591,17 @@ class B12XAttentionWorkspace:
                 "both alias the workspace gather buffers or both use live storage"
             )
 
-        logits_view = self.indexer_extend_logits.narrow(0, 0, q_rows_total * k_rows).view(
-            q_rows_total, k_rows
-        )
-        if preinitialize_invalid_logits and q_rows_total != 0 and k_rows != 0:
-            logits_view.fill_(float("-inf"))
+        if requires_full_logits:
+            assert self.indexer_extend_logits is not None
+            logits_view = self.indexer_extend_logits.narrow(0, 0, q_rows_total * k_rows).view(
+                q_rows_total, k_rows
+            )
+            if preinitialize_invalid_logits and q_rows_total != 0 and k_rows != 0:
+                logits_view.fill_(float("-inf"))
+        else:
+            if self.indexer_extend_tile_logits is None:
+                raise RuntimeError("fixed-capacity workspace is missing NSA tiled-logits buffer")
+            logits_view = self.indexer_extend_tile_logits.narrow(0, 0, 1).view(1, 1)
         return {
             "q_u32": q_u32,
             "weights": weights,

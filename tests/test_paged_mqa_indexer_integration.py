@@ -722,6 +722,186 @@ def test_paged_mqa_index_decode_supertile_topk_fp8_graph_matches_reference(
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+def test_paged_mqa_index_shared_supertile_prefill_graph_matches_reference(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("B12X_PAGED_MQA_INDEX_SUPERTILE_K", "4096")
+
+    device = torch.device("cuda")
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(91_006)
+
+    rows = 1024
+    num_heads = 32
+    width_blocks = 64
+    topk = 512
+    supertile_k = 4096
+    graph_real_page_table = torch.full(
+        (rows, width_blocks),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    graph_seqlens = torch.empty((rows,), dtype=torch.int32, device=device)
+    q_fp8 = _rand_fp8_q((rows, num_heads, 128), gen=gen, device=device)
+    weights = torch.randn((rows, num_heads), generator=gen, dtype=torch.float32).to(
+        device=device
+    )
+    api_weights = weights.unsqueeze(-1)
+    index_k_cache = pack_paged_mqa_index_k_cache_reference(
+        torch.randn((128 * 64, 128), generator=gen, dtype=torch.float32).to(device=device)
+        / 3
+    )
+    workspace = B12XAttentionWorkspace.for_fixed_capacity(
+        mode="decode",
+        device=device,
+        dtype=torch.bfloat16,
+        kv_dtype=torch.float8_e4m3fn,
+        num_q_heads=num_heads,
+        indexer_num_q_heads=num_heads,
+        head_dim=576,
+        v_head_dim=512,
+        topk=topk,
+        max_page_table_width=width_blocks,
+        max_total_q=rows,
+        max_batch=rows,
+        max_paged_q_rows=rows,
+        max_kv_rows=0,
+        indexer_max_k_rows=supertile_k,
+        page_size=64,
+        use_cuda_graph=True,
+        reserve_paged_indexer_logits=False,
+        paged_indexer_tile_logits_k_rows=supertile_k,
+    )
+    reference_workspace = B12XAttentionWorkspace.for_fixed_capacity(
+        mode="decode",
+        device=device,
+        dtype=torch.bfloat16,
+        kv_dtype=torch.float8_e4m3fn,
+        num_q_heads=num_heads,
+        indexer_num_q_heads=num_heads,
+        head_dim=576,
+        v_head_dim=512,
+        topk=topk,
+        max_page_table_width=width_blocks,
+        max_total_q=rows,
+        max_batch=rows,
+        max_paged_q_rows=rows,
+        max_kv_rows=0,
+        page_size=64,
+        use_cuda_graph=True,
+        reserve_paged_indexer_logits=False,
+        paged_indexer_tile_logits_k_rows=supertile_k,
+    )
+    actual = torch.empty((rows, topk), dtype=torch.int32, device=device)
+    expected = torch.empty((rows, topk), dtype=torch.int32, device=device)
+
+    def prepare(page_start: int, seq_len: int, *, shared_page_table: bool):
+        base_table = _make_real_page_table(
+            page_starts=[page_start],
+            seqlens=[seq_len],
+            width_blocks=width_blocks,
+            device=device,
+        )
+        graph_real_page_table.copy_(base_table.expand(rows, -1))
+        graph_seqlens.fill_(seq_len)
+        return prepare_paged_mqa_indexer_metadata(
+            real_page_table=graph_real_page_table,
+            cache_seqlens_int32=graph_seqlens,
+            expected_num_q_heads=num_heads,
+            build_schedule=False,
+            shared_page_table=shared_page_table,
+        )
+
+    clear_nsa_indexer_caches()
+    workspace.prewarm_paged_indexer_tiled_topk()
+    workspace.prewarm_paged_indexer_tiled_scorer(
+        index_k_cache=index_k_cache,
+        width_tokens=supertile_k,
+    )
+    reference_workspace.prewarm_paged_indexer_tiled_topk()
+    reference_workspace.prewarm_paged_indexer_tiled_scorer(
+        index_k_cache=index_k_cache,
+        width_tokens=supertile_k,
+    )
+
+    def fail_paged_scorer_staging(**_kwargs):
+        raise AssertionError("shared C4 prefill must not use the row-wise paged scorer")
+
+    monkeypatch.setattr(
+        workspace,
+        "stage_nsa_indexer_paged_tiled_decode",
+        fail_paged_scorer_staging,
+    )
+
+    metadata = prepare(3, 4096, shared_page_table=True)
+    reference_metadata = prepare(3, 4096, shared_page_table=False)
+    paged_mqa_index_decode_supertile_topk_fp8(
+        q_fp8=q_fp8,
+        weights=api_weights,
+        index_k_cache=index_k_cache,
+        metadata=reference_metadata,
+        topk=topk,
+        expected_num_q_heads=num_heads,
+        workspace=reference_workspace,
+        out_indices=expected,
+        supertile_k=supertile_k,
+    )
+    paged_mqa_index_decode_supertile_topk_fp8(
+        q_fp8=q_fp8,
+        weights=api_weights,
+        index_k_cache=index_k_cache,
+        metadata=metadata,
+        topk=topk,
+        expected_num_q_heads=num_heads,
+        workspace=workspace,
+        out_indices=actual,
+        supertile_k=supertile_k,
+    )
+    torch.cuda.synchronize(device)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        paged_mqa_index_decode_supertile_topk_fp8(
+            q_fp8=q_fp8,
+            weights=api_weights,
+            index_k_cache=index_k_cache,
+            metadata=metadata,
+            topk=topk,
+            expected_num_q_heads=num_heads,
+            workspace=workspace,
+            out_indices=actual,
+            supertile_k=supertile_k,
+        )
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert torch.equal(
+        torch.sort(actual, dim=1).values,
+        torch.sort(expected, dim=1).values,
+    )
+
+    metadata = prepare(24, 3584, shared_page_table=True)
+    reference_metadata = prepare(24, 3584, shared_page_table=False)
+    paged_mqa_index_decode_supertile_topk_fp8(
+        q_fp8=q_fp8,
+        weights=api_weights,
+        index_k_cache=index_k_cache,
+        metadata=reference_metadata,
+        topk=topk,
+        expected_num_q_heads=num_heads,
+        workspace=reference_workspace,
+        out_indices=expected,
+        supertile_k=supertile_k,
+    )
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert torch.equal(
+        torch.sort(actual, dim=1).values,
+        torch.sort(expected, dim=1).values,
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for workspace allocation")
 def test_paged_mqa_supertile_workspace_sizes_candidate_chunks() -> None:
     device = torch.device("cuda")

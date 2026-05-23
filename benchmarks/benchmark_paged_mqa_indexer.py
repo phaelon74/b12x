@@ -205,6 +205,7 @@ def main() -> None:
         expected_num_q_heads=num_heads,
         schedule_out=schedule_out,
         build_schedule=build_schedule,
+        shared_page_table=page_stride == 0,
     )
 
     clear_nsa_indexer_caches()

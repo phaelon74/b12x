@@ -11,6 +11,8 @@ import os
 from dataclasses import dataclass
 
 import torch
+import triton
+import triton.language as tl
 
 from b12x.attention.nsa_indexer import (
     NSAIndexerPagedDecodeMetadata,
@@ -21,6 +23,10 @@ from b12x.attention.nsa_indexer import (
     sparse_nsa_paged_logits_reference,
     unpack_nsa_index_k_cache_reference,
     uses_paged_mqa_schedule_metadata,
+)
+from b12x.attention.nsa_indexer.extend_kernel import (
+    resolve_sparse_nsa_extend_prefill_block_k,
+    run_sparse_nsa_extend_logits_kernel,
 )
 from b12x.attention.nsa_indexer.kernel import (
     run_sparse_nsa_paged_windowed_tiled_logits_kernel,
@@ -38,6 +44,80 @@ _PAGED_MQA_INDEX_SUPERTILE_K_ENV = "B12X_PAGED_MQA_INDEX_SUPERTILE_K"
 _PAGED_MQA_INDEX_SUPERTILE_K_DEFAULT = 32768
 _PAGED_MQA_INDEX_TILE_BLOCK_Q = 32
 _PAGED_MQA_INDEX_TILE_BLOCK_K = 512
+_PAGED_MQA_INDEX_CACHE_ROW_BYTES = PAGED_MQA_INDEX_PAGE_SIZE * (INDEX_HEAD_DIM + 4)
+_PAGED_MQA_INDEX_CACHE_DATA_BYTES = PAGED_MQA_INDEX_PAGE_SIZE * INDEX_HEAD_DIM
+
+
+@triton.jit
+def _gather_shared_paged_mqa_supertile_kernel(
+    index_k_cache,
+    real_page_table,
+    seqlens_per_query,
+    k_quant_out,
+    k_scale_bytes_out,
+    k_start_out,
+    k_end_out,
+    q_rows,
+    page_table_width,
+    source_page_offset,
+    supertile_tokens: tl.constexpr,
+    block_tokens: tl.constexpr,
+    page_size: tl.constexpr,
+    index_head_dim: tl.constexpr,
+    cache_row_bytes: tl.constexpr,
+    cache_data_bytes: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    token_offsets = pid * block_tokens + tl.arange(0, block_tokens)
+    token_mask = token_offsets < supertile_tokens
+
+    page_cols = source_page_offset + token_offsets // page_size
+    slot_offsets = token_offsets % page_size
+    page_ids = tl.load(
+        real_page_table + page_cols,
+        mask=token_mask & (page_cols < page_table_width),
+        other=-1,
+    )
+    valid_tokens = token_mask & (page_ids >= 0)
+
+    byte_offsets = tl.arange(0, index_head_dim)
+    k_bytes = tl.load(
+        index_k_cache
+        + page_ids[:, None] * cache_row_bytes
+        + slot_offsets[:, None] * index_head_dim
+        + byte_offsets[None, :],
+        mask=valid_tokens[:, None],
+        other=0,
+    )
+    tl.store(
+        k_quant_out + token_offsets[:, None] * index_head_dim + byte_offsets[None, :],
+        k_bytes,
+        mask=token_mask[:, None],
+    )
+
+    scale_byte_offsets = tl.arange(0, 4)
+    scale_bytes = tl.load(
+        index_k_cache
+        + page_ids[:, None] * cache_row_bytes
+        + cache_data_bytes
+        + slot_offsets[:, None] * 4
+        + scale_byte_offsets[None, :],
+        mask=valid_tokens[:, None],
+        other=0,
+    )
+    tl.store(
+        k_scale_bytes_out + token_offsets[:, None] * 4 + scale_byte_offsets[None, :],
+        scale_bytes,
+        mask=token_mask[:, None],
+    )
+
+    row_offsets = token_offsets
+    row_mask = row_offsets < q_rows
+    row_lengths = tl.load(seqlens_per_query + row_offsets, mask=row_mask, other=0)
+    local_ends = row_lengths - source_page_offset * page_size
+    local_ends = tl.minimum(tl.maximum(local_ends, 0), supertile_tokens)
+    tl.store(k_start_out + row_offsets, tl.zeros((block_tokens,), tl.int32), mask=row_mask)
+    tl.store(k_end_out + row_offsets, local_ends, mask=row_mask)
 
 
 @dataclass(frozen=True)
@@ -54,6 +134,7 @@ class PagedMQAIndexerMetadata:
     cache_seqlens_int32: torch.Tensor
     paged_mqa_schedule_metadata: torch.Tensor | None = None
     expected_num_q_heads: int | None = None
+    shared_page_table: bool = False
 
 
 def resolve_replicated_num_q_heads(
@@ -213,6 +294,7 @@ def prepare_paged_mqa_indexer_metadata(
     schedule_num_sms: int | None = None,
     build_schedule: bool | None = None,
     validate_raw_lengths: bool = True,
+    shared_page_table: bool = False,
 ) -> PagedMQAIndexerMetadata:
     """Validate and optionally build metadata for paged-MQA indexer logits.
 
@@ -290,6 +372,7 @@ def prepare_paged_mqa_indexer_metadata(
         cache_seqlens_int32=cache_seqlens_int32,
         paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
         expected_num_q_heads=expected_num_q_heads,
+        shared_page_table=bool(shared_page_table),
     )
 
 
@@ -298,6 +381,73 @@ def _metadata_to_nsa(metadata: PagedMQAIndexerMetadata) -> NSAIndexerPagedDecode
         real_page_table=metadata.real_page_table,
         cache_seqlens_int32=metadata.cache_seqlens_int32,
         paged_mqa_schedule_metadata=metadata.paged_mqa_schedule_metadata,
+    )
+
+
+def _prepare_shared_paged_mqa_supertile(
+    *,
+    index_k_cache: torch.Tensor,
+    real_page_table: torch.Tensor,
+    seqlens_per_query: torch.Tensor,
+    workspace,
+    q_rows: int,
+    page_table_width: int,
+    page_begin: int,
+    supertile_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if index_k_cache.ndim != 2 or index_k_cache.dtype != torch.uint8:
+        raise ValueError(
+            "shared paged-MQA supertile gather requires uint8 index_k_cache with "
+            f"rank 2, got shape={tuple(index_k_cache.shape)} dtype={index_k_cache.dtype}"
+        )
+    if not index_k_cache.is_contiguous():
+        raise ValueError("shared paged-MQA supertile gather requires contiguous index_k_cache")
+    expected_width = PAGED_MQA_INDEX_PAGE_SIZE * (INDEX_HEAD_DIM + 4)
+    if int(index_k_cache.shape[1]) != expected_width:
+        raise ValueError(
+            f"index_k_cache width must be {expected_width}, got {int(index_k_cache.shape[1])}"
+        )
+
+    k_quant_bytes, k_scale_bytes = workspace.get_indexer_gather_outputs(
+        row_count=supertile_tokens,
+    )
+    k_start = workspace.get_indexer_extend_lengths(row_count=q_rows)
+    get_end = getattr(workspace, "get_paged_indexer_runtime_lengths", None)
+    if get_end is None:
+        raise RuntimeError("workspace is missing paged indexer runtime length scratch")
+    k_end = get_end(row_count=q_rows)
+
+    block_tokens = 128
+    grid_elems = max(int(supertile_tokens), int(q_rows))
+    grid = (triton.cdiv(grid_elems, block_tokens),)
+    _gather_shared_paged_mqa_supertile_kernel[grid](
+        index_k_cache,
+        real_page_table,
+        seqlens_per_query,
+        k_quant_bytes,
+        k_scale_bytes,
+        k_start,
+        k_end,
+        q_rows,
+        int(page_table_width),
+        int(page_begin),
+        int(supertile_tokens),
+        block_tokens,
+        PAGED_MQA_INDEX_PAGE_SIZE,
+        INDEX_HEAD_DIM,
+        _PAGED_MQA_INDEX_CACHE_ROW_BYTES,
+        _PAGED_MQA_INDEX_CACHE_DATA_BYTES,
+        num_warps=4,
+    )
+
+    fp8_dtype = getattr(torch, "float8_e4m3fn", None)
+    if fp8_dtype is None:
+        raise RuntimeError("torch.float8_e4m3fn is required for shared paged-MQA scoring")
+    return (
+        k_quant_bytes.view(fp8_dtype),
+        k_scale_bytes.view(torch.float32).view(-1),
+        k_start,
+        k_end,
     )
 
 
@@ -534,6 +684,45 @@ def paged_mqa_index_decode_supertile_topk_fp8(
     active_width = workspace.get_paged_indexer_active_width_cap()
     page_table_for_kernel = metadata.real_page_table
     lengths_for_kernel = metadata.cache_seqlens_int32
+    shared_prefill_candidate = bool(metadata.shared_page_table) and q_rows >= 1024
+    if shared_prefill_candidate:
+        shared_prefill_block_k = resolve_sparse_nsa_extend_prefill_block_k(
+            valid_q_rows=q_rows,
+            k_rows=supertile_tokens,
+            num_heads=int(q_fp8.shape[1]),
+        )
+        if shared_prefill_block_k != _PAGED_MQA_INDEX_TILE_BLOCK_K:
+            raise RuntimeError(
+                "shared paged-MQA prefill scorer requires the 512-wide NSA prefill "
+                "scorer to match the C4 tiled top-k contract: "
+                f"resolved_block_k={shared_prefill_block_k}, "
+                f"q_rows={q_rows}, k_rows={supertile_tokens}, "
+                f"num_heads={int(q_fp8.shape[1])}"
+            )
+        if supertile_tokens % _PAGED_MQA_INDEX_TILE_BLOCK_K != 0:
+            raise RuntimeError(
+                "shared paged-MQA prefill scorer requires a supertile width "
+                f"that is divisible by {_PAGED_MQA_INDEX_TILE_BLOCK_K}, got {supertile_tokens}"
+            )
+        if int(getattr(workspace, "max_total_q", 0)) < q_rows:
+            raise RuntimeError(
+                "shared paged-MQA prefill scorer requires an extend-capable workspace: "
+                f"q_rows={q_rows}, max_total_q={getattr(workspace, 'max_total_q', None)}"
+            )
+        if int(getattr(workspace, "max_paged_q_rows", 0)) < q_rows:
+            raise RuntimeError(
+                "shared paged-MQA prefill scorer requires paged metadata capacity: "
+                f"q_rows={q_rows}, max_paged_q_rows={getattr(workspace, 'max_paged_q_rows', None)}"
+            )
+        if getattr(workspace, "indexer_k_quant_bytes", None) is None:
+            raise RuntimeError(
+                "shared paged-MQA prefill scorer requires workspace-backed indexer gather buffers"
+            )
+    use_shared_prefill_scorer = shared_prefill_candidate
+    paged_contract_phantoms = contract_phantoms
+    extend_contract_phantoms = (
+        workspace.get_indexer_contract_phantoms() if use_shared_prefill_scorer else None
+    )
 
     for chunk_idx in range(num_chunks):
         page_begin = chunk_idx * supertile_pages
@@ -548,24 +737,51 @@ def paged_mqa_index_decode_supertile_topk_fp8(
                 f"{chunk_width_tokens} tokens"
             )
 
-        logits = run_sparse_nsa_paged_windowed_tiled_logits_kernel(
-            q_fp8=q_fp8,
-            weights=weights,
-            index_k_cache=index_k_cache,
-            real_page_table=page_table_for_kernel,
-            seqlens_per_query=lengths_for_kernel,
-            active_width=active_width,
-            tile_logits=tile_logits,
-            source_page_offset=page_begin,
-            output_width_tokens=supertile_tokens,
-            page_size=page_size,
-            tile_block_q=_PAGED_MQA_INDEX_TILE_BLOCK_Q,
-            tile_block_k=_PAGED_MQA_INDEX_TILE_BLOCK_K,
-            workspace=workspace,
-            preinitialize_tile_logits=False,
-            contract_phantoms=contract_phantoms,
-            stage_runtime_metadata=False,
-        )
+        if use_shared_prefill_scorer:
+            k_quant, k_scale, k_start, k_end = _prepare_shared_paged_mqa_supertile(
+                index_k_cache=index_k_cache,
+                real_page_table=page_table_for_kernel,
+                seqlens_per_query=lengths_for_kernel,
+                workspace=workspace,
+                q_rows=q_rows,
+                page_table_width=page_table_width,
+                page_begin=page_begin,
+                supertile_tokens=supertile_tokens,
+            )
+            logits = run_sparse_nsa_extend_logits_kernel(
+                q_fp8=q_fp8,
+                weights=weights,
+                k_quant=k_quant,
+                k_scale=k_scale,
+                k_start=k_start,
+                k_end=k_end,
+                contract_phantoms=extend_contract_phantoms,
+                workspace=workspace,
+                tile_logits=tile_logits,
+                tile_k_offset=0,
+                tile_num_k_tiles=supertile_k_tiles,
+            )
+            topk_lengths = k_end
+        else:
+            logits = run_sparse_nsa_paged_windowed_tiled_logits_kernel(
+                q_fp8=q_fp8,
+                weights=weights,
+                index_k_cache=index_k_cache,
+                real_page_table=page_table_for_kernel,
+                seqlens_per_query=lengths_for_kernel,
+                active_width=active_width,
+                tile_logits=tile_logits,
+                source_page_offset=page_begin,
+                output_width_tokens=supertile_tokens,
+                page_size=page_size,
+                tile_block_q=_PAGED_MQA_INDEX_TILE_BLOCK_Q,
+                tile_block_k=_PAGED_MQA_INDEX_TILE_BLOCK_K,
+                workspace=workspace,
+                preinitialize_tile_logits=False,
+                contract_phantoms=contract_phantoms,
+                stage_runtime_metadata=False,
+            )
+            topk_lengths = lengths_for_kernel
         if not logits.is_contiguous():
             raise RuntimeError("C4 supertile scorer returned non-contiguous tiled logits")
 
@@ -577,7 +793,7 @@ def paged_mqa_index_decode_supertile_topk_fp8(
         run_tiled_topk(
             tile_logits=tile_logits,
             k_start=None,
-            lengths=lengths_for_kernel,
+            lengths=topk_lengths,
             topk=topk,
             block_q=_PAGED_MQA_INDEX_TILE_BLOCK_Q,
             block_k=_PAGED_MQA_INDEX_TILE_BLOCK_K,
@@ -588,7 +804,7 @@ def paged_mqa_index_decode_supertile_topk_fp8(
             input_extent=chunk_width_tokens,
             output_index_offset=chunk_start_token,
             zero_row_start=True,
-            contract_phantoms=contract_phantoms,
+            contract_phantoms=paged_contract_phantoms,
         )
 
     if candidate_values is not None and candidate_indices is not None:
