@@ -60,6 +60,14 @@ class _FakeMLAWorkspace:
             (self.max_total_q, self.num_q_heads, self.max_chunks_per_row),
             dtype=torch.float32,
         )
+        self.output_buffer = torch.empty(
+            (self.max_total_q, self.num_q_heads, self.v_head_dim),
+            dtype=self.dtype,
+        )
+        self.final_lse = torch.empty(
+            (self.max_total_q, self.num_q_heads),
+            dtype=torch.float32,
+        )
         self.ragged_kv_cache = None
         self._contract_kv_rows = None
         self._contract_kv_scales = None
@@ -247,7 +255,9 @@ def test_sparse_mla_decode_with_lse_reduces_split_chunks(monkeypatch) -> None:
     )
 
     assert output.shape == (2, 8, 256)
+    assert output.data_ptr() == workspace.output_buffer[:2, :8, :256].data_ptr()
     assert lse_base2.shape == (2, 8)
+    assert lse_base2.data_ptr() == workspace.final_lse[:2, :8].data_ptr()
     expected_row0 = math.log2(3.0)
     assert torch.allclose(lse_base2[0], torch.full((8,), expected_row0))
     assert torch.allclose(lse_base2[1], torch.full((8,), 2.0))
@@ -312,7 +322,9 @@ def test_sparse_mla_decode_with_lse_natural_reduces_in_natural_units(
     )
 
     assert output.shape == (2, 8, 256)
+    assert output.data_ptr() == workspace.output_buffer[:2, :8, :256].data_ptr()
     assert lse_natural.shape == (2, 8)
+    assert lse_natural.data_ptr() == workspace.final_lse[:2, :8].data_ptr()
     expected_row0 = math.log(3.0)
     assert torch.allclose(lse_natural[0], torch.full((8,), expected_row0))
     assert torch.allclose(lse_natural[1], torch.full((8,), 2.0 * math.log(2.0)))
@@ -810,6 +822,10 @@ def test_mla_decode_workspace_allocates_split_buffers_and_chunk_scalars() -> Non
     assert workspace.tmp_output.shape == (8, 8, workspace.max_chunks_per_row, 256)
     assert workspace.tmp_lse is not None
     assert workspace.tmp_lse.shape == (8, 8, workspace.max_chunks_per_row)
+    assert workspace.output_buffer is not None
+    assert workspace.output_buffer.shape == (8, 8, 256)
+    assert workspace.final_lse is not None
+    assert workspace.final_lse.shape == (8, 8)
     workspace.set_decode_chunk_config(kv_chunk_size=256, num_chunks=8)
     assert workspace.kv_chunk_size_ptr is not None
     assert workspace.num_chunks_ptr is not None
@@ -821,9 +837,9 @@ def test_sparse_mla_split_config_supports_wide_compressed_contexts() -> None:
     cfg = mla_split.default_sparse_mla_split_decode_config_for_width(36224)
 
     assert cfg is not None
-    assert cfg.chunk_size == 1024
-    assert cfg.num_chunks == math.ceil(36224 / 1024)
-    assert cfg.num_chunks <= 64
+    assert cfg.chunk_size == 256
+    assert cfg.num_chunks == math.ceil(36224 / 256)
+    assert cfg.num_chunks <= 256
 
 
 def test_mla_workspace_enforces_capacity_limits() -> None:

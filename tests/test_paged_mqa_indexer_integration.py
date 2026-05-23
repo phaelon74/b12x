@@ -406,6 +406,58 @@ def test_paged_mqa_index_decode_dense_topk_fp8_graph_matches_reference() -> None
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for workspace allocation")
+def test_paged_mqa_index_decode_stage_keeps_contiguous_metadata_aliases() -> None:
+    device = torch.device("cuda")
+    rows = 1
+    num_heads = 64
+    width_blocks = 16
+    workspace = B12XAttentionWorkspace.for_fixed_capacity(
+        mode="decode",
+        device=device,
+        dtype=torch.bfloat16,
+        kv_dtype=torch.float8_e4m3fn,
+        num_q_heads=num_heads,
+        indexer_num_q_heads=num_heads,
+        head_dim=576,
+        v_head_dim=512,
+        topk=512,
+        max_page_table_width=width_blocks,
+        max_total_q=rows,
+        max_batch=rows,
+        max_paged_q_rows=rows,
+        max_kv_rows=0,
+        page_size=64,
+        use_cuda_graph=True,
+        reserve_paged_indexer_logits=True,
+        paged_indexer_logits_q_rows=rows,
+        paged_indexer_logits_k_rows=width_blocks * 64,
+        paged_indexer_tile_logits_k_rows=0,
+    )
+    q_fp8 = torch.empty((rows, num_heads, 128), dtype=torch.float8_e4m3fn, device=device)
+    weights = torch.empty((rows, num_heads), dtype=torch.float32, device=device)
+    real_page_table = torch.empty((rows, width_blocks), dtype=torch.int32, device=device)
+    seqlens = torch.empty((rows,), dtype=torch.int32, device=device)
+    active_width = workspace.get_paged_indexer_active_width_cap()
+    schedule = torch.empty((4, 2), dtype=torch.int32, device=device)
+
+    staged = workspace.stage_nsa_indexer_paged_decode(
+        q_fp8=q_fp8,
+        weights=weights,
+        real_page_table=real_page_table,
+        seqlens_per_query=seqlens,
+        active_width=active_width,
+        schedule_metadata=schedule,
+        width_tokens=width_blocks * 64,
+        preinitialize_invalid_logits=False,
+    )
+
+    assert staged["real_page_table"].data_ptr() == real_page_table.data_ptr()
+    assert staged["seqlens_per_query"].data_ptr() == seqlens.data_ptr()
+    assert staged["active_width"].data_ptr() == active_width.data_ptr()
+    assert staged["schedule_metadata"].data_ptr() == schedule.data_ptr()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
 def test_paged_mqa_index_decode_dense_topk_fp8_compacts_padded_page_table() -> None:
     device = torch.device("cuda")

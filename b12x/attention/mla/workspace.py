@@ -379,6 +379,8 @@ class _B12XAttentionArenaLayout:
     paged_logits_width_tokens: int
     paged_tile_logits_width_tokens: int
     ragged_kv_nbytes: int
+    output_buffer_nbytes: int
+    final_lse_nbytes: int
     indexer_logits_nbytes: int
     indexer_extend_logits_nbytes: int
     indexer_extend_tile_logits_nbytes: int
@@ -400,6 +402,8 @@ class _B12XAttentionArenaLayout:
     ragged_kv_offset_bytes: int
     tmp_output_offset_bytes: int
     tmp_lse_offset_bytes: int
+    output_buffer_offset_bytes: int
+    final_lse_offset_bytes: int
     indexer_k_quant_offset_bytes: int
     indexer_k_scale_offset_bytes: int
     indexer_extend_logits_offset_bytes: int
@@ -433,6 +437,8 @@ class B12XAttentionArena:
     paged_logits_width_tokens: int
     paged_tile_logits_width_tokens: int
     ragged_kv_nbytes: int
+    output_buffer_nbytes: int
+    final_lse_nbytes: int
     indexer_logits_nbytes: int
     indexer_extend_logits_nbytes: int
     indexer_extend_tile_logits_nbytes: int
@@ -454,6 +460,8 @@ class B12XAttentionArena:
     ragged_kv_offset_bytes: int
     tmp_output_offset_bytes: int
     tmp_lse_offset_bytes: int
+    output_buffer_offset_bytes: int
+    final_lse_offset_bytes: int
     indexer_k_quant_offset_bytes: int
     indexer_k_scale_offset_bytes: int
     indexer_extend_logits_offset_bytes: int
@@ -529,6 +537,24 @@ class B12XAttentionArena:
             * int(caps.num_q_heads)
             * _dtype_nbytes(torch.float32)
         )
+        mla_offset = _align_up(mla_offset, _ARENA_ALIGN_BYTES)
+        output_buffer_offset_bytes = mla_offset
+        output_buffer_nbytes = (
+            mla_max_total_q
+            * int(caps.num_q_heads)
+            * int(caps.max_v_head_dim)
+            * _dtype_nbytes(caps.dtype)
+        )
+        mla_offset += output_buffer_nbytes
+        mla_offset = _align_up(mla_offset, _ARENA_ALIGN_BYTES)
+        final_lse_offset_bytes = mla_offset
+        final_lse_nbytes = (
+            mla_max_total_q
+            * int(caps.num_q_heads)
+            * _dtype_nbytes(torch.float32)
+        )
+        mla_offset += final_lse_nbytes
+        mla_offset = _align_up(mla_offset, _ARENA_ALIGN_BYTES)
         mla_phase_nbytes = int(mla_offset)
 
         extend_offset = 0
@@ -737,6 +763,8 @@ class B12XAttentionArena:
             paged_logits_width_tokens=int(paged_logits_width_tokens),
             paged_tile_logits_width_tokens=int(paged_tile_logits_width_tokens),
             ragged_kv_nbytes=ragged_kv_nbytes,
+            output_buffer_nbytes=output_buffer_nbytes,
+            final_lse_nbytes=final_lse_nbytes,
             indexer_logits_nbytes=max(
                 extend_logits_nbytes,
                 extend_tile_logits_nbytes,
@@ -770,6 +798,8 @@ class B12XAttentionArena:
             ragged_kv_offset_bytes=ragged_kv_offset_bytes,
             tmp_output_offset_bytes=tmp_output_offset_bytes,
             tmp_lse_offset_bytes=tmp_lse_offset_bytes,
+            output_buffer_offset_bytes=output_buffer_offset_bytes,
+            final_lse_offset_bytes=final_lse_offset_bytes,
             indexer_k_quant_offset_bytes=indexer_k_quant_offset_bytes,
             indexer_k_scale_offset_bytes=indexer_k_scale_offset_bytes,
             indexer_extend_logits_offset_bytes=indexer_extend_logits_offset_bytes,
@@ -825,6 +855,8 @@ class B12XAttentionArena:
             paged_logits_width_tokens=layout.paged_logits_width_tokens,
             paged_tile_logits_width_tokens=layout.paged_tile_logits_width_tokens,
             ragged_kv_nbytes=layout.ragged_kv_nbytes,
+            output_buffer_nbytes=layout.output_buffer_nbytes,
+            final_lse_nbytes=layout.final_lse_nbytes,
             indexer_logits_nbytes=layout.indexer_logits_nbytes,
             indexer_extend_logits_nbytes=layout.indexer_extend_logits_nbytes,
             indexer_extend_tile_logits_nbytes=layout.indexer_extend_tile_logits_nbytes,
@@ -846,6 +878,8 @@ class B12XAttentionArena:
             ragged_kv_offset_bytes=layout.ragged_kv_offset_bytes,
             tmp_output_offset_bytes=layout.tmp_output_offset_bytes,
             tmp_lse_offset_bytes=layout.tmp_lse_offset_bytes,
+            output_buffer_offset_bytes=layout.output_buffer_offset_bytes,
+            final_lse_offset_bytes=layout.final_lse_offset_bytes,
             indexer_k_quant_offset_bytes=layout.indexer_k_quant_offset_bytes,
             indexer_k_scale_offset_bytes=layout.indexer_k_scale_offset_bytes,
             indexer_extend_logits_offset_bytes=layout.indexer_extend_logits_offset_bytes,
@@ -1084,6 +1118,8 @@ class B12XAttentionWorkspace:
     paged_indexer_schedule_metadata_runtime: torch.Tensor | None = None
     tmp_output: torch.Tensor | None = None
     tmp_lse: torch.Tensor | None = None
+    output_buffer: torch.Tensor | None = None
+    final_lse: torch.Tensor | None = None
     ragged_kv_cache: torch.Tensor | None = None
     kv_chunk_size_ptr: torch.Tensor | None = None
     num_chunks_ptr: torch.Tensor | None = None
@@ -1100,6 +1136,8 @@ class B12XAttentionWorkspace:
     paged_logits_width_tokens: int = 0
     paged_tile_logits_width_tokens: int = 0
     ragged_kv_nbytes: int = 0
+    output_buffer_nbytes: int = 0
+    final_lse_nbytes: int = 0
     indexer_logits_nbytes: int = 0
     indexer_extend_logits_nbytes: int = 0
     indexer_extend_tile_logits_nbytes: int = 0
@@ -1405,6 +1443,8 @@ class B12XAttentionWorkspace:
         self.mla_phase_nbytes = self.arena.mla_phase_nbytes
         self.indexer_phase_nbytes = self.arena.indexer_phase_nbytes
         self.ragged_kv_nbytes = self.arena.ragged_kv_nbytes
+        self.output_buffer_nbytes = self.arena.output_buffer_nbytes
+        self.final_lse_nbytes = self.arena.final_lse_nbytes
         self.paged_logits_q_rows = self.arena.paged_logits_q_rows
         self.indexer_extend_logits_nbytes = self.arena.indexer_extend_logits_nbytes
         self.indexer_extend_tile_logits_nbytes = self.arena.indexer_extend_tile_logits_nbytes
@@ -1441,6 +1481,18 @@ class B12XAttentionWorkspace:
             self.shared_arena,
             offset_bytes=self.arena.tmp_lse_offset_bytes,
             shape=(max_total_q, int(self.num_q_heads), int(self.max_chunks_per_row)),
+            dtype=torch.float32,
+        )
+        self.output_buffer, mla_offset = _materialize_arena_view(
+            self.shared_arena,
+            offset_bytes=self.arena.output_buffer_offset_bytes,
+            shape=(max_total_q, int(self.num_q_heads), int(self.v_head_dim)),
+            dtype=self.dtype,
+        )
+        self.final_lse, _ = _materialize_arena_view(
+            self.shared_arena,
+            offset_bytes=self.arena.final_lse_offset_bytes,
+            shape=(max_total_q, int(self.num_q_heads)),
             dtype=torch.float32,
         )
 
@@ -1587,6 +1639,18 @@ class B12XAttentionWorkspace:
         if self.tmp_lse is None:
             self.tmp_lse = torch.empty(
                 (self.max_total_q, self.num_q_heads, self.max_chunks_per_row),
+                dtype=torch.float32,
+                device=self.device,
+            )
+        if self.output_buffer is None:
+            self.output_buffer = torch.empty(
+                (self.max_total_q, self.num_q_heads, self.v_head_dim),
+                dtype=self.dtype,
+                device=self.device,
+            )
+        if self.final_lse is None:
+            self.final_lse = torch.empty(
+                (self.max_total_q, self.num_q_heads),
                 dtype=torch.float32,
                 device=self.device,
             )
@@ -2565,60 +2629,17 @@ class B12XAttentionWorkspace:
         seqlens_per_query_kernel = seqlens_per_query
         active_width_kernel = active_width
         schedule_metadata_kernel = schedule_metadata
-        if self.use_cuda_graph:
+        if self.use_cuda_graph and not real_page_table.is_contiguous():
             self._allocate_paged_indexer_runtime_metadata()
             assert self.paged_indexer_real_page_table_runtime is not None
-            assert self.paged_indexer_seqlens_per_query_runtime is not None
-            assert self.paged_indexer_active_width_runtime is not None
             rows, page_width = real_page_table.shape
             page_table_target = self.paged_indexer_real_page_table_runtime[
                 :rows, :page_width
             ]
-            if (
-                page_table_target.data_ptr() != real_page_table.data_ptr()
-                or page_table_target.storage_offset() != real_page_table.storage_offset()
-            ):
-                page_table_target.copy_(real_page_table)
-            seqlens_target = self.paged_indexer_seqlens_per_query_runtime[:q_rows]
-            if (
-                seqlens_target.data_ptr() != seqlens_per_query.data_ptr()
-                or seqlens_target.storage_offset() != seqlens_per_query.storage_offset()
-            ):
-                seqlens_target.copy_(seqlens_per_query)
-            if self.paged_indexer_active_width_cap is not None and (
-                self.paged_indexer_active_width_cap.data_ptr() == active_width.data_ptr()
-                and self.paged_indexer_active_width_cap.storage_offset()
-                == active_width.storage_offset()
-            ):
-                active_width_kernel = self.paged_indexer_active_width_cap
-            elif (
-                self.paged_indexer_active_width_runtime.data_ptr() != active_width.data_ptr()
-                or self.paged_indexer_active_width_runtime.storage_offset()
-                != active_width.storage_offset()
-            ):
-                self.paged_indexer_active_width_runtime.copy_(active_width)
-                active_width_kernel = self.paged_indexer_active_width_runtime
-            else:
-                active_width_kernel = self.paged_indexer_active_width_runtime
+            page_table_target.copy_(real_page_table)
             real_page_table_kernel = self.paged_indexer_real_page_table_runtime[
                 :rows, :page_width
             ]
-            seqlens_per_query_kernel = self.paged_indexer_seqlens_per_query_runtime[:q_rows]
-            if schedule_metadata is not None:
-                assert self.paged_indexer_schedule_metadata_runtime is not None
-                schedule_rows = schedule_metadata.shape[0]
-                if schedule_rows > self.paged_indexer_schedule_metadata_runtime.shape[0]:
-                    raise ValueError(
-                        "schedule_metadata rows "
-                        f"{schedule_rows} exceed workspace schedule capacity "
-                        f"{self.paged_indexer_schedule_metadata_runtime.shape[0]}"
-                    )
-                self.paged_indexer_schedule_metadata_runtime[
-                    :schedule_rows, :
-                ].copy_(schedule_metadata)
-                schedule_metadata_kernel = self.paged_indexer_schedule_metadata_runtime[
-                    :schedule_rows, :
-                ]
         return {
             "q_bytes": q_bytes,
             "weights": weights,

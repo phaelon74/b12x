@@ -7,7 +7,11 @@ from typing import Literal
 
 import torch
 
-from .api import _final_lse_from_split_workspace, _get_sm_scale_tensor
+from .api import (
+    _final_lse_from_split_workspace,
+    _get_mla_output_view,
+    _get_sm_scale_tensor,
+)
 from .compressed_reference import (
     COMPRESSED_MLA_HEAD_DIM,
     COMPRESSED_MLA_LOCAL_Q_HEADS_TP2,
@@ -230,10 +234,10 @@ def compressed_mla_decode_forward(
         else split_cfg.num_chunks
     )
 
-    output = torch.empty(
-        (rows, heads, COMPRESSED_MLA_HEAD_DIM),
-        dtype=q3.dtype,
-        device=q3.device,
+    output = _get_mla_output_view(
+        workspace=workspace,
+        q_all=q3,
+        v_head_dim=COMPRESSED_MLA_HEAD_DIM,
     )
     fused_sink_output = attn_sink is not None and not return_lse
     needs_lse = return_lse or (attn_sink is not None and not fused_sink_output)
@@ -276,7 +280,7 @@ def compressed_mla_decode_forward(
     if direct_single_chunk_output:
         pass
     elif split_cfg.num_chunks == 1 and attn_sink is None:
-        output.copy_(workspace.tmp_output[:, :, 0, :])
+        output.copy_(workspace.tmp_output[:rows, :heads, 0, :COMPRESSED_MLA_HEAD_DIM])
     else:
         run_sparse_mla_split_decode_merge(
             tmp_output=workspace.tmp_output,
@@ -306,7 +310,8 @@ def compressed_mla_decode_forward(
     if not return_lse:
         return output
     if lse_scale == "base2":
-        return output, lse_natural / _LN2
+        lse_natural.div_(_LN2)
+        return output, lse_natural
     return output, lse_natural
 
 

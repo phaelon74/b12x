@@ -112,6 +112,42 @@ def _apply_mla_prefill_strategy(
     return split_cfg
 
 
+def _get_mla_output_view(
+    *,
+    workspace: B12XAttentionWorkspace,
+    q_all: torch.Tensor,
+    v_head_dim: int,
+) -> torch.Tensor:
+    rows = int(q_all.shape[0])
+    heads = int(q_all.shape[1])
+    v_head_dim = int(v_head_dim)
+    output_buffer = workspace.output_buffer
+    if output_buffer is None:
+        raise RuntimeError("workspace is missing MLA output buffer")
+    if output_buffer.device != q_all.device:
+        raise ValueError(
+            f"workspace MLA output buffer is on {output_buffer.device}, expected {q_all.device}"
+        )
+    if output_buffer.dtype != q_all.dtype:
+        raise TypeError(
+            f"workspace MLA output buffer has dtype {output_buffer.dtype}, expected {q_all.dtype}"
+        )
+    if output_buffer.ndim != 3:
+        raise ValueError(
+            f"workspace MLA output buffer must be rank 3, got {output_buffer.ndim}"
+        )
+    if (
+        int(output_buffer.shape[0]) < rows
+        or int(output_buffer.shape[1]) < heads
+        or int(output_buffer.shape[2]) < v_head_dim
+    ):
+        raise ValueError(
+            "workspace MLA output buffer is too small: "
+            f"buffer={tuple(output_buffer.shape)} required=({rows}, {heads}, {v_head_dim})"
+        )
+    return output_buffer[:rows, :heads, :v_head_dim]
+
+
 def sparse_mla_decode_forward(
     *,
     q_all: torch.Tensor,
@@ -361,10 +397,10 @@ def _run_sparse_mla(
             if (workspace.fixed_capacity or workspace.use_cuda_graph)
             else split_cfg.num_chunks
         )
-        output = torch.empty(
-            (q_all.shape[0], q_all.shape[1], v_head_dim),
-            dtype=q_all.dtype,
-            device=q_all.device,
+        output = _get_mla_output_view(
+            workspace=workspace,
+            q_all=q_all,
+            v_head_dim=v_head_dim,
         )
         assert workspace.kv_chunk_size_ptr is not None
         assert workspace.num_chunks_ptr is not None
@@ -408,10 +444,10 @@ def _run_sparse_mla(
                 "B12X sparse MLA attn_sink output requires the split path, but no split "
                 "configuration was available for this contract."
             )
-        output = torch.empty(
-            (q_all.shape[0], q_all.shape[1], v_head_dim),
-            dtype=q_all.dtype,
-            device=q_all.device,
+        output = _get_mla_output_view(
+            workspace=workspace,
+            q_all=q_all,
+            v_head_dim=v_head_dim,
         )
         run_sparse_mla_kernel(
             q_all=q_all,
@@ -461,14 +497,25 @@ def _final_lse_from_split_workspace(
 ) -> torch.Tensor:
     if workspace.tmp_lse is None:
         raise RuntimeError("workspace is missing split MLA LSE buffer")
+    if workspace.final_lse is None:
+        raise RuntimeError("workspace is missing final MLA LSE buffer")
     chunk_count = max(1, min(int(launch_num_chunks), int(workspace.tmp_lse.shape[-1])))
-    chunk_lse_base2 = workspace.tmp_lse[:q_rows, :num_heads, :chunk_count].to(
-        torch.float32
-    )
-    lse_natural = torch.logsumexp(chunk_lse_base2 * _LN2, dim=-1)
+    final_lse = workspace.final_lse[:q_rows, :num_heads]
+    if final_lse.dtype != torch.float32:
+        raise TypeError(
+            f"workspace final MLA LSE buffer must be FP32, got {final_lse.dtype}"
+        )
+    chunk_lse = workspace.tmp_lse[:q_rows, :num_heads, :chunk_count]
+    if chunk_lse.dtype != torch.float32:
+        raise TypeError(
+            f"workspace split MLA LSE buffer must be FP32, got {chunk_lse.dtype}"
+        )
+    chunk_lse.mul_(_LN2)
+    torch.logsumexp(chunk_lse, dim=-1, out=final_lse)
     if scale == "natural":
-        return lse_natural
-    return lse_natural / _LN2
+        return final_lse
+    final_lse.div_(_LN2)
+    return final_lse
 
 
 def _get_sm_scale_tensor(
