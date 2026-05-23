@@ -116,10 +116,15 @@ class B12XMoEArenaCaps:
             object.__setattr__(
                 self,
                 "core_token_counts",
-                tuple(max(int(token_count), 1) for token_count in self.core_token_counts),
+                tuple(
+                    max(int(token_count), 1)
+                    for token_count in self.core_token_counts
+                ),
             )
         if self.route_num_experts is not None:
-            object.__setattr__(self, "route_num_experts", max(int(self.route_num_experts), 1))
+            object.__setattr__(
+                self, "route_num_experts", max(int(self.route_num_experts), 1)
+            )
 
     def layout(self) -> TPMoEArenaLayout:
         return plan_tp_moe_arena_layout(
@@ -138,12 +143,47 @@ class B12XMoEArenaCaps:
         )
 
 
+def _moe_caps_tuple(
+    caps: B12XMoEArenaCaps | tuple[B12XMoEArenaCaps, ...] | None,
+) -> tuple[B12XMoEArenaCaps, ...]:
+    if caps is None:
+        return ()
+    if isinstance(caps, B12XMoEArenaCaps):
+        return (caps,)
+    return tuple(caps)
+
+
+def _combined_moe_layout(
+    caps: tuple[B12XMoEArenaCaps, ...],
+) -> TPMoEArenaLayout | None:
+    if not caps:
+        return None
+    layouts = tuple(cap.layout() for cap in caps)
+    route_nbytes = max(layout.route_workspace_nbytes for layout in layouts)
+    core_nbytes = max(layout.core_workspace_nbytes for layout in layouts)
+    core_token_counts = tuple(
+        sorted(
+            {
+                token_count
+                for layout in layouts
+                for token_count in layout.core_token_counts
+            }
+        )
+    )
+    return TPMoEArenaLayout(
+        route_workspace_nbytes=route_nbytes,
+        core_workspace_nbytes=core_nbytes,
+        total_nbytes=max(route_nbytes + core_nbytes, 1),
+        core_token_counts=core_token_counts,
+    )
+
+
 @dataclass(frozen=True, kw_only=True)
 class B12XJointArenaSpec:
     device: torch.device
     attention_caps: B12XAttentionArenaCaps | None = None
     paged_attention_caps: PagedAttentionArenaCaps | None = None
-    moe_caps: B12XMoEArenaCaps | None = None
+    moe_caps: B12XMoEArenaCaps | tuple[B12XMoEArenaCaps, ...] | None = None
 
     def __post_init__(self) -> None:
         device = _canonical_device(self.device)
@@ -157,10 +197,13 @@ class B12XJointArenaSpec:
                 "paged attention caps device "
                 f"{self.paged_attention_caps.device} does not match joint arena device {device}"
             )
-        if self.moe_caps is not None and self.moe_caps.device != device:
-            raise ValueError(
-                f"MoE caps device {self.moe_caps.device} does not match joint arena device {device}"
-            )
+        moe_caps = _moe_caps_tuple(self.moe_caps)
+        for caps in moe_caps:
+            if caps.device != device:
+                raise ValueError(
+                    f"MoE caps device {caps.device} does not match joint arena device {device}"
+                )
+        object.__setattr__(self, "moe_caps", moe_caps or None)
 
 
 def _field_matches(existing: object, requested: object, field: str) -> bool:
@@ -277,21 +320,19 @@ def _paged_attention_caps_cover(
 
 
 def _moe_route_num_experts(caps: B12XMoEArenaCaps) -> int:
-    return int(caps.route_num_experts if caps.route_num_experts is not None else caps.weight_E)
+    return int(
+        caps.route_num_experts if caps.route_num_experts is not None else caps.weight_E
+    )
 
 
 def _moe_route_logits_dtype(caps: B12XMoEArenaCaps) -> torch.dtype:
     return caps.route_logits_dtype or caps.dtype
 
 
-def _moe_caps_cover(
-    existing: B12XMoEArenaCaps | None,
-    requested: B12XMoEArenaCaps | None,
+def _single_moe_caps_cover(
+    existing: B12XMoEArenaCaps,
+    requested: B12XMoEArenaCaps,
 ) -> bool:
-    if requested is None:
-        return True
-    if existing is None:
-        return False
     if not _fields_match(
         existing,
         requested,
@@ -322,6 +363,25 @@ def _moe_caps_cover(
     return (
         existing_layout.route_workspace_nbytes >= requested_layout.route_workspace_nbytes
         and existing_layout.core_workspace_nbytes >= requested_layout.core_workspace_nbytes
+    )
+
+
+def _moe_caps_cover(
+    existing: B12XMoEArenaCaps | tuple[B12XMoEArenaCaps, ...] | None,
+    requested: B12XMoEArenaCaps | tuple[B12XMoEArenaCaps, ...] | None,
+) -> bool:
+    requested_caps = _moe_caps_tuple(requested)
+    if not requested_caps:
+        return True
+    existing_caps = _moe_caps_tuple(existing)
+    if not existing_caps:
+        return False
+    return all(
+        any(
+            _single_moe_caps_cover(existing_cap, requested_cap)
+            for existing_cap in existing_caps
+        )
+        for requested_cap in requested_caps
     )
 
 
@@ -356,6 +416,7 @@ class B12XExecutionLaneArena:
 
     @classmethod
     def allocate(cls, spec: B12XJointArenaSpec) -> "B12XExecutionLaneArena":
+        moe_caps = _moe_caps_tuple(spec.moe_caps)
         attention_nbytes = (
             B12XAttentionArena.required_nbytes(spec.attention_caps)
             if spec.attention_caps is not None
@@ -366,7 +427,7 @@ class B12XExecutionLaneArena:
             if spec.paged_attention_caps is not None
             else 0
         )
-        moe_layout = spec.moe_caps.layout() if spec.moe_caps is not None else None
+        moe_layout = _combined_moe_layout(moe_caps)
         moe_nbytes = moe_layout.total_nbytes if moe_layout is not None else 0
         shared_arena_nbytes = max(
             attention_nbytes,
@@ -451,22 +512,22 @@ class B12XExecutionLaneArena:
                 core_workspace_nbytes=moe_layout.core_workspace_nbytes,
                 frozen=True,
             )
-            assert spec.moe_caps is not None
-            materialize_tp_moe_arena_workspaces(
-                moe_workspace_pool,
-                max_tokens=spec.moe_caps.max_tokens,
-                weight_E=spec.moe_caps.weight_E,
-                k=spec.moe_caps.k,
-                n=spec.moe_caps.n,
-                num_topk=spec.moe_caps.num_topk,
-                device=spec.moe_caps.device,
-                dtype=spec.moe_caps.dtype,
-                core_token_counts=spec.moe_caps.core_token_counts,
-                quant_mode=spec.moe_caps.quant_mode,
-                activation=spec.moe_caps.activation,
-                apply_router_weight_on_input=spec.moe_caps.apply_router_weight_on_input,
-                swiglu_limit=spec.moe_caps.swiglu_limit,
-            )
+            for caps in moe_caps:
+                materialize_tp_moe_arena_workspaces(
+                    moe_workspace_pool,
+                    max_tokens=caps.max_tokens,
+                    weight_E=caps.weight_E,
+                    k=caps.k,
+                    n=caps.n,
+                    num_topk=caps.num_topk,
+                    device=caps.device,
+                    dtype=caps.dtype,
+                    core_token_counts=caps.core_token_counts,
+                    quant_mode=caps.quant_mode,
+                    activation=caps.activation,
+                    apply_router_weight_on_input=caps.apply_router_weight_on_input,
+                    swiglu_limit=caps.swiglu_limit,
+                )
 
         lane = cls(
             spec=spec,

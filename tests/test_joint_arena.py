@@ -353,6 +353,49 @@ def test_w4a16_joint_arena_materializes_planned_workspace(
         )
 
 
+def test_w4a16_preplanned_launches_are_weight_layout_specific() -> None:
+    empty = torch.empty(0)
+    workspace = tp_moe.TPW4A16Workspace(
+        implementation="w4a16",
+        quant_mode="w4a16",
+        activation="silu",
+        state_E=8,
+        weight_E=8,
+        max_rows=8,
+        k=16,
+        n=16,
+        num_topk=2,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        routed_rows_capacity=8,
+        intermediate_cache13=empty,
+        intermediate_cache2=empty,
+        fc1_c_tmp=empty,
+        fc2_c_tmp=empty,
+        packed_route_indices=empty,
+        block_expert_ids=empty,
+        packed_route_count=empty,
+        expert_offsets=empty,
+        planned_token_counts=frozenset({4}),
+        planned_fused_moe_launches={
+            ("modelopt", 4): "modelopt-launch",
+            ("packed", 4): "packed-launch",
+        },
+        planned_topk_sum_launches={4: "topk-sum"},
+    )
+
+    assert tp_moe._w4a16_preplanned_launches(
+        workspace,
+        token_count=4,
+        weight_layout="modelopt",
+    ) == ("modelopt-launch", "topk-sum")
+    assert tp_moe._w4a16_preplanned_launches(
+        workspace,
+        token_count=4,
+        weight_layout="packed",
+    ) == ("packed-launch", "topk-sum")
+
+
 def test_nvfp4_joint_arena_materializes_planned_workspaces(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -450,6 +493,101 @@ def test_nvfp4_joint_arena_materializes_planned_workspaces(
             input_scales_static=True,
         )
         is dynamic_workspace
+    )
+
+
+def test_joint_arena_materializes_mixed_moe_quant_modes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _fake_w4a16_prewarm(workspace, *, token_counts, **_kwargs) -> None:
+        counts = tuple(int(token_count) for token_count in token_counts)
+        workspace.planned_fused_moe_launches = {
+            ("modelopt", token_count): object() for token_count in counts
+        }
+        workspace.planned_topk_sum_launches = {
+            token_count: object() for token_count in counts
+        }
+
+    monkeypatch.setattr(
+        tp_moe,
+        "_prewarm_w4a16_planned_launches",
+        _fake_w4a16_prewarm,
+    )
+    monkeypatch.setattr(tp_moe, "get_num_sm", lambda _device: 48)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    device = torch.device("cpu")
+    num_topk = 8
+    dynamic_tokens = tp_moe._get_static_compact_cutover_pairs("nvfp4") // num_topk + 1
+    nvfp4_caps = B12XMoEArenaCaps(
+        device=device,
+        dtype=torch.bfloat16,
+        quant_mode="nvfp4",
+        weight_E=32,
+        route_num_experts=32,
+        k=128,
+        n=128,
+        num_topk=num_topk,
+        max_tokens=dynamic_tokens,
+        core_token_counts=(1, dynamic_tokens),
+    )
+    w4a16_caps = replace(nvfp4_caps, quant_mode="w4a16")
+    lane = B12XExecutionLaneArena.allocate(
+        B12XJointArenaSpec(device=device, moe_caps=(nvfp4_caps, w4a16_caps))
+    )
+    pool = lane.get_moe_workspace_pool()
+    nvfp4_layout = nvfp4_caps.layout()
+    w4a16_layout = w4a16_caps.layout()
+
+    assert lane.moe_nbytes == max(
+        nvfp4_layout.route_workspace_nbytes,
+        w4a16_layout.route_workspace_nbytes,
+    ) + max(
+        nvfp4_layout.core_workspace_nbytes,
+        w4a16_layout.core_workspace_nbytes,
+    )
+
+    def _key(plan: tp_moe.TPMoEPlan) -> tuple:
+        return tp_moe._workspace_pool_key(
+            plan.implementation,
+            quant_mode=plan.quant_mode,
+            activation=plan.activation,
+            state_E=plan.state_E,
+            weight_E=plan.weight_E,
+            max_rows=plan.max_rows,
+            k=plan.k,
+            n=plan.n,
+            num_topk=plan.num_topk,
+            device=plan.device,
+            dtype=plan.dtype,
+        )
+
+    nvfp4_plan = tp_moe._make_workspace_plan(
+        num_tokens=dynamic_tokens,
+        weight_E=32,
+        k=128,
+        n=128,
+        num_topk=num_topk,
+        device=device,
+        dtype=torch.bfloat16,
+        quant_mode="nvfp4",
+    )
+    w4a16_plan = tp_moe._make_workspace_plan(
+        num_tokens=dynamic_tokens,
+        weight_E=32,
+        k=128,
+        n=128,
+        num_topk=num_topk,
+        device=device,
+        dtype=torch.bfloat16,
+        quant_mode="w4a16",
+    )
+
+    assert isinstance(pool.workspaces.get(_key(nvfp4_plan)), tp_moe.TPDynamicWorkspace)
+    w4a16_workspace = pool.workspaces.get(_key(w4a16_plan))
+    assert isinstance(w4a16_workspace, tp_moe.TPW4A16Workspace)
+    assert w4a16_workspace.planned_token_counts == frozenset(
+        w4a16_layout.core_token_counts
     )
 
 

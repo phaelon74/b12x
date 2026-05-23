@@ -14,6 +14,7 @@ from b12x.moe.fused.w4a16.kernel import (
 )
 from b12x.moe.fused.w4a16.prepare import (
     make_w4a16_packed_buffers as make_w4a16_buffers,
+    prepare_w4a16_modelopt_weights,
     prepare_w4a16_packed_weights as prepare_w4a16_weights,
 )
 from tests.w4a16_reference import compare_to_reference, moe_reference_w4a16
@@ -71,8 +72,14 @@ def _run_w4a16(
     activation: str,
     expert_map: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
+    weight_layout: str = "packed",
 ) -> torch.Tensor:
-    prepared = prepare_w4a16_weights(
+    prepare_weights = (
+        prepare_w4a16_modelopt_weights
+        if weight_layout == "modelopt"
+        else prepare_w4a16_weights
+    )
+    prepared = prepare_weights(
         w13,
         w13_blockscale,
         w13_global_scale,
@@ -199,6 +206,103 @@ def test_w4a16_moe_matches_oracle(
     )
     torch.cuda.synchronize()
 
+    _assert_matches_oracle(actual, expected, activation=activation)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("activation", ["relu2", "silu"])
+def test_w4a16_modelopt_layout_moe_matches_oracle(
+    activation: str,
+) -> None:
+    torch.manual_seed(20260523 + (1000 if activation == "silu" else 0))
+    experts, hidden_size, intermediate_size = 8, 128, 128
+    topk, m = 2, 24
+    weights = _make_weights(
+        experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+    )
+    x = (torch.randn(m, hidden_size, device="cuda") * 0.25).to(torch.bfloat16)
+    topk_ids = torch.randint(0, experts, (m, topk), device="cuda", dtype=torch.int32)
+    topk_weights = torch.softmax(torch.randn(m, topk, device="cuda"), dim=-1)
+
+    actual = _run_w4a16(
+        x,
+        *weights,
+        topk_ids,
+        topk_weights,
+        activation=activation,
+        weight_layout="modelopt",
+    )
+    expected = _reference_w4a16(
+        x,
+        *weights,
+        topk_ids,
+        topk_weights,
+        activation=activation,
+    )
+    torch.cuda.synchronize()
+
+    _assert_matches_oracle(actual, expected, activation=activation)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("activation", ["relu2", "silu"])
+def test_tp_moe_w4a16_modelopt_uses_normal_nvfp4_scale_contract(
+    activation: str,
+) -> None:
+    torch.manual_seed(20260524 + (1000 if activation == "silu" else 0))
+    experts, hidden_size, intermediate_size = 8, 128, 128
+    topk, m = 2, 24
+    weights = _make_weights(
+        experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+    )
+    w13, w13_blockscale, w13_global_scale, w2, w2_blockscale, w2_global_scale = weights
+    w13_input_scale = (torch.rand(experts, device="cuda") * 2.0 + 1.5).to(
+        torch.float32
+    )
+    w2_input_scale = (torch.rand(experts, device="cuda") * 2.0 + 1.5).to(torch.float32)
+    a1_gscale = (1.0 / w13_input_scale).contiguous()
+    a2_gscale = (1.0 / w2_input_scale).contiguous()
+    fused_w13_global_scale = (w13_global_scale * w13_input_scale).contiguous()
+    fused_w2_global_scale = (w2_global_scale * w2_input_scale).contiguous()
+
+    x = (torch.randn(m, hidden_size, device="cuda") * 0.25).to(torch.bfloat16)
+    topk_ids = torch.randint(0, experts, (m, topk), device="cuda", dtype=torch.int32)
+    topk_weights = torch.softmax(torch.randn(m, topk, device="cuda"), dim=-1)
+    output = torch.empty_like(x)
+    actual = b12x_moe_fp4(
+        x,
+        a1_gscale,
+        w13,
+        w13_blockscale,
+        fused_w13_global_scale,
+        a2_gscale,
+        w2,
+        w2_blockscale,
+        fused_w2_global_scale,
+        topk_weights,
+        topk_ids,
+        workspace=allocate_tp_moe_workspace_pool(),
+        output=output,
+        activation=activation,
+        quant_mode="w4a16",
+        source_format="modelopt",
+    )
+    expected = _reference_w4a16(
+        x,
+        *weights,
+        topk_ids,
+        topk_weights,
+        activation=activation,
+    )
+    torch.cuda.synchronize()
+
+    assert actual is output
     _assert_matches_oracle(actual, expected, activation=activation)
 
 

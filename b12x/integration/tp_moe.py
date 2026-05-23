@@ -145,7 +145,7 @@ class TPW4A16Workspace:
     planned_token_counts: frozenset[int] = field(default_factory=frozenset)
     planned_apply_router_weight_on_input: bool = False
     planned_swiglu_limit: float | None = None
-    planned_fused_moe_launches: dict[int, object] = field(default_factory=dict)
+    planned_fused_moe_launches: dict[object, object] = field(default_factory=dict)
     planned_topk_sum_launches: dict[int, object] = field(default_factory=dict)
     route_workspace: "_TPRouteWorkspace | None" = None
     volatile_launch_state: bool = False
@@ -466,6 +466,7 @@ def _dynamic_tile_m(quant_mode: str = "nvfp4") -> int:
 
 _WEIGHT_CACHE: Dict[Tuple[int, int, int], _WeightViews] = {}
 _W4A16_PACKED_WEIGHT_CACHE: Dict[Tuple[object, ...], object] = {}
+_W4A16_MODEL_OPT_WEIGHT_CACHE: Dict[Tuple[object, ...], object] = {}
 _MICRO_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 _STATIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 _DYNAMIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
@@ -474,7 +475,7 @@ _PLAIN_PARAM_CACHE: Dict[
     Tuple[int, Tuple[int, ...], Tuple[int, ...], torch.dtype, torch.dtype, int],
     torch.Tensor,
 ] = {}
-_W4A16_ALPHA_CACHE: Dict[Tuple, torch.Tensor] = {}
+_W4A16_ALPHA_CACHE: Dict[Tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 _MICRO_COMPACT_CUTOVER_PAIRS_DEFAULT = 20
 _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK_DEFAULT = 80
 _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 640
@@ -530,6 +531,7 @@ def clear_tp_moe_caches() -> None:
     global _DYNAMIC_DOWN_SCALE_CACHE
     _WEIGHT_CACHE.clear()
     _W4A16_PACKED_WEIGHT_CACHE.clear()
+    _W4A16_MODEL_OPT_WEIGHT_CACHE.clear()
     clear_w4a16_kernel_cache()
     _MICRO_KERNEL_CACHE.clear()
     _STATIC_KERNEL_CACHE.clear()
@@ -738,13 +740,15 @@ def _w4a16_default_alpha(
     )
     cached = _W4A16_ALPHA_CACHE.get(key)
     if cached is not None:
-        return cached
+        cached_alpha, cached_input_scale, cached_adjusted = cached
+        if cached_alpha is alpha and cached_input_scale is input_scale:
+            return cached_adjusted
 
     alpha_plain = _get_plain_cuda_tensor(alpha, dtype=torch.float32)
     scale_plain = _prepare_expert_scale(input_scale, weight_E)
     adjusted = torch.empty_like(alpha_plain)
     torch.mul(alpha_plain, scale_plain, out=adjusted)
-    _W4A16_ALPHA_CACHE[key] = adjusted
+    _W4A16_ALPHA_CACHE[key] = (alpha, input_scale, adjusted)
     return adjusted
 
 
@@ -1606,6 +1610,50 @@ def _get_w4a16_packed_weights(
     return prepared
 
 
+def _get_w4a16_modelopt_weights(
+    w1_fp4: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w1_alphas: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_alphas: torch.Tensor,
+    *,
+    activation: str,
+    params_dtype: torch.dtype,
+    source_format: str = "modelopt",
+):
+    from b12x.moe.fused.w4a16.prepare import prepare_w4a16_modelopt_weights
+
+    source_format = _normalize_fp4_source_format(source_format)
+    key = (
+        w1_fp4.data_ptr(),
+        w1_blockscale.data_ptr(),
+        w1_alphas.data_ptr(),
+        w2_fp4.data_ptr(),
+        w2_blockscale.data_ptr(),
+        w2_alphas.data_ptr(),
+        activation,
+        params_dtype,
+        source_format,
+    )
+    cached = _W4A16_MODEL_OPT_WEIGHT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    prepared = prepare_w4a16_modelopt_weights(
+        w1_fp4,
+        w1_blockscale,
+        w1_alphas,
+        w2_fp4,
+        w2_blockscale,
+        w2_alphas,
+        activation=activation,
+        params_dtype=params_dtype,
+        source_format=source_format,
+    )
+    _W4A16_MODEL_OPT_WEIGHT_CACHE[key] = prepared
+    return prepared
+
+
 def prepare_b12x_w4a16_packed_weights(
     w1_fp4: torch.Tensor,
     w1_blockscale: torch.Tensor,
@@ -1649,6 +1697,56 @@ def prepare_b12x_w4a16_packed_weights(
         params_dtype=params_dtype,
         source_format=source_format,
         reuse_input_storage=reuse_input_storage,
+    )
+
+
+def prepare_b12x_w4a16_modelopt_weights(
+    w1_fp4: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w1_alphas: torch.Tensor,
+    a1_gscale: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_alphas: torch.Tensor,
+    a2_gscale: torch.Tensor,
+    *,
+    activation: str,
+    params_dtype: torch.dtype,
+    quant_mode: str | None = "w4a16",
+    source_format: str = "modelopt",
+) -> object:
+    """Prepare modelopt W4A16 weights from the normal NVFP4 scale contract.
+
+    The modelopt/vLLM tensors use the same fused ``w*_alphas`` consumed by
+    W4A4: activation input scale multiplied by weight global scale. W4A16 uses
+    BF16 activations directly, so recover the weight global scale by applying
+    the reciprocal input scales before the W4A16 weight preparation step.
+    """
+    quant_mode = _normalize_quant_mode(quant_mode)
+    if quant_mode != "w4a16":
+        raise ValueError("W4A16 modelopt weights require quant_mode='w4a16'")
+    source_format = _normalize_fp4_source_format(source_format)
+    _validate_fp4_source_format_for_quant_mode(
+        source_format=source_format,
+        quant_mode=quant_mode,
+    )
+    if source_format != "modelopt":
+        raise ValueError("W4A16 modelopt weights require source_format='modelopt'")
+
+    weight_E = int(w1_fp4.shape[0])
+    w1_alphas = _w4a16_default_alpha(w1_alphas, a1_gscale, weight_E)
+    w2_alphas = _w4a16_default_alpha(w2_alphas, a2_gscale, weight_E)
+
+    return _get_w4a16_modelopt_weights(
+        w1_fp4,
+        w1_blockscale,
+        w1_alphas,
+        w2_fp4,
+        w2_blockscale,
+        w2_alphas,
+        activation=activation,
+        params_dtype=params_dtype,
+        source_format=source_format,
     )
 
 
@@ -1952,6 +2050,7 @@ def _validate_frozen_w4a16_launch(
     plan: TPMoEPlan,
     apply_router_weight_on_input: bool,
     swiglu_limit: float | None,
+    weight_layout: str,
 ) -> None:
     token_count = int(plan.max_tokens_per_launch)
     planned_capacity = min(
@@ -1977,10 +2076,15 @@ def _validate_frozen_w4a16_launch(
             "frozen W4A16 MoE workspace swiglu_limit mismatch: "
             f"requested={requested_limit}, planned={workspace.planned_swiglu_limit}"
         )
-    if planned_capacity not in workspace.planned_fused_moe_launches:
+    fused = workspace.planned_fused_moe_launches.get((weight_layout, planned_capacity))
+    if fused is None:
+        legacy_fused = workspace.planned_fused_moe_launches.get(planned_capacity)
+        if getattr(legacy_fused, "weight_layout", "packed") == weight_layout:
+            fused = legacy_fused
+    if fused is None:
         raise RuntimeError(
             "frozen W4A16 MoE workspace is missing its preplanned fused launch "
-            f"for capacity={planned_capacity}"
+            f"for capacity={planned_capacity}, weight_layout={weight_layout!r}"
         )
     if planned_capacity not in workspace.planned_topk_sum_launches:
         raise RuntimeError(
@@ -1993,6 +2097,7 @@ def _w4a16_preplanned_launches(
     workspace: TPW4A16Workspace,
     *,
     token_count: int,
+    weight_layout: str,
 ) -> tuple[object | None, object | None]:
     token_count = int(token_count)
     if not workspace.planned_token_counts:
@@ -2006,12 +2111,16 @@ def _w4a16_preplanned_launches(
             "W4A16 MoE workspace was asked to launch an unplanned token count: "
             f"tokens={token_count}, planned={sorted(workspace.planned_token_counts)}"
         )
-    fused = workspace.planned_fused_moe_launches.get(planned_capacity)
+    fused = workspace.planned_fused_moe_launches.get((weight_layout, planned_capacity))
+    if fused is None:
+        legacy_fused = workspace.planned_fused_moe_launches.get(planned_capacity)
+        if getattr(legacy_fused, "weight_layout", "packed") == weight_layout:
+            fused = legacy_fused
     topk_sum = workspace.planned_topk_sum_launches.get(planned_capacity)
     if fused is None or topk_sum is None:
         raise RuntimeError(
             "W4A16 MoE workspace is missing preplanned launches for "
-            f"capacity={planned_capacity}"
+            f"capacity={planned_capacity}, weight_layout={weight_layout!r}"
         )
     return fused, topk_sum
 
@@ -2025,6 +2134,7 @@ def _resolve_workspace(
     input_scales_static: bool,
     apply_router_weight_on_input: bool = False,
     swiglu_limit: float | None = None,
+    weight_layout: str = "packed",
 ) -> object:
     if isinstance(workspace, (TPMoEWorkspace, TPW4A16Workspace)):
         _validate_workspace(workspace, plan=plan)
@@ -2171,6 +2281,7 @@ def _resolve_workspace(
             plan=plan,
             apply_router_weight_on_input=apply_router_weight_on_input,
             swiglu_limit=swiglu_limit,
+            weight_layout=weight_layout,
         )
 
     if isinstance(resolved, TPDynamicWorkspace):
@@ -2421,7 +2532,7 @@ def _prewarm_w4a16_planned_launches(
             getattr(props, "shared_memory_per_block_optin", _DEFAULT_MAX_SHARED_MEM)
         )
         element_dtype = _w4a16_element_dtype(workspace.dtype)
-        fused_launches: dict[int, object] = {}
+        fused_launches: dict[object, object] = {}
         topk_sum_launches: dict[int, object] = {}
         for token_count in token_counts:
             block_size_m = select_route_block_size_m(
@@ -2436,22 +2547,24 @@ def _prewarm_w4a16_planned_launches(
                 workspace.weight_E,
             )
             max_m_blocks = (route_slots + block_size_m - 1) // block_size_m
-            fused_launches[token_count] = compile_w4a16_fused_moe(
-                size_m=token_count,
-                hidden_size=workspace.k,
-                intermediate_size=workspace.n,
-                num_experts=workspace.weight_E,
-                top_k=workspace.num_topk,
-                activation=workspace.activation,
-                apply_router_weight_on_input=bool(apply_router_weight_on_input),
-                zero_fc2_output=False,
-                moe_block_size=block_size_m,
-                max_m_blocks=max_m_blocks,
-                element_dtype=element_dtype,
-                sms=sms,
-                max_shared_mem=max_shared_mem,
-                swiglu_limit=swiglu_limit,
-            )
+            for weight_layout in ("modelopt", "packed"):
+                fused_launches[(weight_layout, token_count)] = compile_w4a16_fused_moe(
+                    size_m=token_count,
+                    hidden_size=workspace.k,
+                    intermediate_size=workspace.n,
+                    num_experts=workspace.weight_E,
+                    top_k=workspace.num_topk,
+                    activation=workspace.activation,
+                    apply_router_weight_on_input=bool(apply_router_weight_on_input),
+                    zero_fc2_output=False,
+                    moe_block_size=block_size_m,
+                    max_m_blocks=max_m_blocks,
+                    element_dtype=element_dtype,
+                    sms=sms,
+                    max_shared_mem=max_shared_mem,
+                    swiglu_limit=swiglu_limit,
+                    weight_layout=weight_layout,
+                )
             topk_sum_launches[token_count] = compile_w4a16_topk_sum(
                 m=token_count,
                 topk=workspace.num_topk,
@@ -4096,7 +4209,12 @@ def b12x_moe_fp4(
         raise NotImplementedError("swiglu_limit is implemented only for W4A16 MoE")
     if fast_math is None:
         fast_math = _FAST_MATH_DEFAULT
-    if prepared_w4a16 is None and quant_mode_arg is None and quant_mode == "w4a16":
+    if (
+        prepared_w4a16 is None
+        and quant_mode_arg is None
+        and quant_mode == "w4a16"
+        and source_format != "modelopt"
+    ):
         w1_alphas = _w4a16_default_alpha(
             w1_alphas,
             a1_gscale,
@@ -4140,17 +4258,41 @@ def b12x_moe_fp4(
 
         prepared = prepared_w4a16
         if prepared is None:
-            prepared = _get_w4a16_packed_weights(
-                w1_fp4,
-                w1_blockscale,
-                w1_alphas,
-                w2_fp4,
-                w2_blockscale,
-                w2_alphas,
-                activation=activation,
-                params_dtype=a.dtype,
-                source_format=source_format,
-            )
+            if source_format == "modelopt":
+                w1_prepare_alphas = _w4a16_default_alpha(
+                    w1_alphas,
+                    a1_gscale,
+                    weight_E,
+                )
+                w2_prepare_alphas = _w4a16_default_alpha(
+                    w2_alphas,
+                    a2_gscale,
+                    weight_E,
+                )
+                prepared = _get_w4a16_modelopt_weights(
+                    w1_fp4,
+                    w1_blockscale,
+                    w1_prepare_alphas,
+                    w2_fp4,
+                    w2_blockscale,
+                    w2_prepare_alphas,
+                    activation=activation,
+                    params_dtype=a.dtype,
+                    source_format=source_format,
+                )
+            else:
+                prepared = _get_w4a16_packed_weights(
+                    w1_fp4,
+                    w1_blockscale,
+                    w1_alphas,
+                    w2_fp4,
+                    w2_blockscale,
+                    w2_alphas,
+                    activation=activation,
+                    params_dtype=a.dtype,
+                    source_format=source_format,
+                )
+        weight_layout = getattr(prepared, "weight_layout", "packed")
         plan = _make_workspace_plan(
             num_tokens=m,
             weight_E=weight_E,
@@ -4170,6 +4312,7 @@ def b12x_moe_fp4(
             input_scales_static=effective_input_scales_static,
             apply_router_weight_on_input=apply_router_weight_on_input,
             swiglu_limit=swiglu_limit,
+            weight_layout=weight_layout,
         )
         if not isinstance(w4a16_workspace, TPW4A16Workspace):
             raise TypeError("expected a TPW4A16Workspace for the W4A16 backend")
@@ -4188,6 +4331,7 @@ def b12x_moe_fp4(
         fused_launch, topk_sum_launch = _w4a16_preplanned_launches(
             w4a16_workspace,
             token_count=m,
+            weight_layout=weight_layout,
         )
         return run_w4a16_moe(
             a,

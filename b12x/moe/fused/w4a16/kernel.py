@@ -9,7 +9,8 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass.cutlass_dsl import Int32, Uint32
+from cutlass.cutlass_dsl import Int32, Int64, T, Uint32, dsl_user_op
+from cutlass._mlir.dialects import llvm
 
 from b12x.cute.fp4 import (
     atomic_add_global_i32,
@@ -52,6 +53,7 @@ from b12x.cute.fp4 import (
     st_shared_i32,
     st_shared_u32,
     st_shared_v4_f32,
+    st_shared_v4_u32,
     threadfence,
 )
 from b12x.cute.utils import current_cuda_stream, make_ptr
@@ -74,6 +76,24 @@ _PACK_FACTOR = 8
 _STAGES = 4
 _DEVICE_MAX_REG_BYTES = 255 * 1024
 _DEFAULT_MAX_SHARED_MEM = 101_376
+_WEIGHT_LAYOUTS = {"packed", "modelopt"}
+
+
+@dsl_user_op
+def _ld_global_nc_u8(base_ptr: Int64, *, loc=None, ip=None) -> Uint32:
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
+            "ld.global.nc.u8 $0, [$1];",
+            "=r,l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 # The W4A16 launch model chooses blocks/SM from static resource usage
 # for each specialization.  These register counts were measured from the local
@@ -298,6 +318,7 @@ class W4A16GemmCompileResult:
     moe_block_size: int
     max_m_blocks: int
     blocks_per_sm: int
+    weight_layout: str = "packed"
 
 
 @dataclass(frozen=True)
@@ -337,6 +358,7 @@ class W4A16FusedMoeCompileResult:
     moe_block_size: int
     max_m_blocks: int
     blocks_per_sm: int
+    weight_layout: str = "packed"
 
 
 @dataclass(frozen=True)
@@ -361,9 +383,13 @@ class W4A16GemmKernel:
         max_m_blocks: int,
         element_dtype: str = "bf16",
         epilogue_activation: str | None = None,
+        weight_layout: str = "packed",
+        source_n_rotation: int = 0,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
+        if weight_layout not in _WEIGHT_LAYOUTS:
+            raise ValueError(f"unsupported W4A16 weight_layout {weight_layout!r}")
         if epilogue_activation not in (None, "relu2"):
             raise ValueError(
                 "W4A16 GEMM epilogue activation currently supports only relu2"
@@ -396,6 +422,8 @@ class W4A16GemmKernel:
         self.element_dtype = element_dtype
         self.is_fp16 = element_dtype == "fp16"
         self.epilogue_relu2 = epilogue_activation == "relu2"
+        self.weight_layout = weight_layout
+        self.source_n_rotation = int(source_n_rotation)
         self.cta_m_blocks = int(_covering_count(moe_block_size, 16))
         self.uses_m_block_8 = moe_block_size == 8
         self.max_m_blocks = int(max_m_blocks)
@@ -1151,6 +1179,7 @@ class W4A16GemmKernel:
             a_sh_wr,
             a_rows_per_iter,
             output_n_tile,
+            expert_idx,
         )
 
         b_scale_cur = cute.make_rmem_tensor((2, 4), Uint32)
@@ -1201,6 +1230,7 @@ class W4A16GemmKernel:
             a_sh_wr,
             a_rows_per_iter,
             output_n_tile,
+            expert_idx,
             True,
         )
 
@@ -1294,6 +1324,7 @@ class W4A16GemmKernel:
             a_sh_wr,
             a_rows_per_iter,
             output_n_tile,
+            expert_idx,
         )
 
         b_scale_cur = cute.make_rmem_tensor((2, 4), Uint32)
@@ -1344,6 +1375,7 @@ class W4A16GemmKernel:
             a_sh_wr,
             a_rows_per_iter,
             output_n_tile,
+            expert_idx,
             False,
         )
 
@@ -1392,6 +1424,7 @@ class W4A16GemmKernel:
         a_sh_wr: Int32,
         a_rows_per_iter: Int32,
         output_n_tile: Int32,
+        expert_idx: Int32,
         uses_m_block_8: cutlass.Constexpr[bool],
     ):
         b_frag = cute.make_rmem_tensor((2, 2), Uint32)
@@ -1437,6 +1470,7 @@ class W4A16GemmKernel:
                             a_sh_wr,
                             a_rows_per_iter,
                             output_n_tile,
+                            expert_idx,
                         )
 
                         for jj in cutlass.range_constexpr(4):
@@ -2063,6 +2097,239 @@ class W4A16GemmKernel:
         acc[mb, jj, 1, 3] = d3
 
     @cute.jit
+    def _source_n_from_logical(self, logical_n: Int32) -> Int32:
+        source_n = logical_n
+        if cutlass.const_expr(self.source_n_rotation != 0):
+            source_n += Int32(self.source_n_rotation)
+            if source_n >= Int32(self.size_n):
+                source_n -= Int32(self.size_n)
+        return source_n
+
+    @cute.jit
+    def _load_modelopt_nibble(
+        self,
+        b_u8_flat: cute.Tensor,
+        expert_idx: Int32,
+        logical_n: Int32,
+        k: Int32,
+        high_nibble: cutlass.Constexpr[bool],
+    ) -> Uint32:
+        source_n = self._source_n_from_logical(logical_n)
+        packed_cols = Int32(self.size_k // 2)
+        byte_offset = (
+            Int64(expert_idx) * Int64(self.size_n * (self.size_k // 2))
+            + Int64(source_n) * Int64(packed_cols)
+            + Int64(k // Int32(2))
+        )
+        q = _ld_global_nc_u8(get_ptr_as_int64(b_u8_flat, byte_offset))
+        if cutlass.const_expr(high_nibble):
+            q = q >> Uint32(4)
+        return q & Uint32(0xF)
+
+    @cute.jit
+    def _load_modelopt_slot_nibble(
+        self,
+        b_u8_flat: cute.Tensor,
+        expert_idx: Int32,
+        n_tile: Int32,
+        k_tile: Int32,
+        warp_id: Int32,
+        tc_col: Int32,
+        tc_row: Int32,
+        offset: cutlass.Constexpr[int],
+        n_delta: cutlass.Constexpr[int],
+        high_nibble: cutlass.Constexpr[bool],
+    ) -> Uint32:
+        logical_n = (
+            n_tile * Int32(64)
+            + warp_id * Int32(16)
+            + tc_col
+            + Int32(n_delta)
+        )
+        k = k_tile * Int32(16) + tc_row + Int32(offset)
+        return self._load_modelopt_nibble(
+            b_u8_flat,
+            expert_idx,
+            logical_n,
+            k,
+            high_nibble,
+        )
+
+    @cute.jit
+    def _pack_modelopt_slot(
+        self,
+        b_u8_flat: cute.Tensor,
+        expert_idx: Int32,
+        n_tile: Int32,
+        k_tile: Int32,
+        warp_id: Int32,
+        tc_col: Int32,
+        tc_row: Int32,
+        slot: cutlass.Constexpr[int],
+    ) -> Uint32:
+        if cutlass.const_expr(slot == 0):
+            return self._load_modelopt_slot_nibble(
+                b_u8_flat,
+                expert_idx,
+                n_tile,
+                k_tile,
+                warp_id,
+                tc_col,
+                tc_row,
+                0,
+                0,
+                False,
+            )
+        if cutlass.const_expr(slot == 1):
+            return self._load_modelopt_slot_nibble(
+                b_u8_flat,
+                expert_idx,
+                n_tile,
+                k_tile,
+                warp_id,
+                tc_col,
+                tc_row,
+                8,
+                0,
+                False,
+            )
+        if cutlass.const_expr(slot == 2):
+            return self._load_modelopt_slot_nibble(
+                b_u8_flat,
+                expert_idx,
+                n_tile,
+                k_tile,
+                warp_id,
+                tc_col,
+                tc_row,
+                0,
+                8,
+                False,
+            )
+        if cutlass.const_expr(slot == 3):
+            return self._load_modelopt_slot_nibble(
+                b_u8_flat,
+                expert_idx,
+                n_tile,
+                k_tile,
+                warp_id,
+                tc_col,
+                tc_row,
+                8,
+                8,
+                False,
+            )
+        if cutlass.const_expr(slot == 4):
+            return self._load_modelopt_slot_nibble(
+                b_u8_flat,
+                expert_idx,
+                n_tile,
+                k_tile,
+                warp_id,
+                tc_col,
+                tc_row,
+                1,
+                0,
+                True,
+            )
+        if cutlass.const_expr(slot == 5):
+            return self._load_modelopt_slot_nibble(
+                b_u8_flat,
+                expert_idx,
+                n_tile,
+                k_tile,
+                warp_id,
+                tc_col,
+                tc_row,
+                9,
+                0,
+                True,
+            )
+        if cutlass.const_expr(slot == 6):
+            return self._load_modelopt_slot_nibble(
+                b_u8_flat,
+                expert_idx,
+                n_tile,
+                k_tile,
+                warp_id,
+                tc_col,
+                tc_row,
+                1,
+                8,
+                True,
+            )
+        return self._load_modelopt_slot_nibble(
+            b_u8_flat,
+            expert_idx,
+            n_tile,
+            k_tile,
+            warp_id,
+            tc_col,
+            tc_row,
+            9,
+            8,
+            True,
+        )
+
+    @cute.jit
+    def _load_modelopt_packed_word(
+        self,
+        b_u8_flat: cute.Tensor,
+        expert_idx: Int32,
+        packed_vec_index: Int32,
+        word_lane: cutlass.Constexpr[int],
+    ) -> Uint32:
+        packed_word_index = packed_vec_index * Int32(4) + Int32(word_lane)
+        expert_base_words = Int32((self.size_n * self.size_k) // _PACK_FACTOR)
+        word_in_expert = packed_word_index - expert_idx * expert_base_words
+        words_per_k_tile = Int32((self.size_n // 64) * 128)
+        k_tile = word_in_expert // words_per_k_tile
+        pos_in_k_tile = word_in_expert - k_tile * words_per_k_tile
+        n_tile = pos_in_k_tile // Int32(128)
+        pos = pos_in_k_tile - n_tile * Int32(128)
+        th_id = pos // Int32(4)
+        warp_id = pos - th_id * Int32(4)
+        tc_col = th_id // Int32(4)
+        tc_row = (th_id - tc_col * Int32(4)) * Int32(2)
+
+        word = Uint32(0)
+        for slot in cutlass.range_constexpr(8):
+            nibble = self._pack_modelopt_slot(
+                b_u8_flat,
+                expert_idx,
+                n_tile,
+                k_tile,
+                warp_id,
+                tc_col,
+                tc_row,
+                slot,
+            )
+            word = word | (nibble << Uint32(slot * 4))
+        return word
+
+    @cute.jit
+    def _stage_b_tile_modelopt(
+        self,
+        b_u8_flat: cute.Tensor,
+        smem_addr: Int32,
+        expert_idx: Int32,
+        packed_vec_index: Int32,
+    ):
+        w0 = self._load_modelopt_packed_word(
+            b_u8_flat, expert_idx, packed_vec_index, 0
+        )
+        w1 = self._load_modelopt_packed_word(
+            b_u8_flat, expert_idx, packed_vec_index, 1
+        )
+        w2 = self._load_modelopt_packed_word(
+            b_u8_flat, expert_idx, packed_vec_index, 2
+        )
+        w3 = self._load_modelopt_packed_word(
+            b_u8_flat, expert_idx, packed_vec_index, 3
+        )
+        st_shared_v4_u32(smem_addr, w0, w1, w2, w3)
+
+    @cute.jit
     def _stage_k_tile_async(
         self,
         a_bf16_flat: cute.Tensor,
@@ -2083,6 +2350,7 @@ class W4A16GemmKernel:
         a_sh_wr: Int32,
         a_rows_per_iter: Int32,
         output_n_tile: Int32,
+        expert_idx: Int32,
     ):
         for i in cutlass.range_constexpr(self.a_sh_wr_iters):
             row = a_rows_per_iter * Int32(i) + a_gl_rd_row
@@ -2123,10 +2391,18 @@ class W4A16GemmKernel:
                 + Int32(i * self.cta_threads)
                 + tid,
             )
-            cp_async4_shared_global(
-                b_dst,
-                get_ptr_as_int64(b_i32_flat, b_src_int4 * Int32(4)),
-            )
+            if cutlass.const_expr(self.weight_layout == "packed"):
+                cp_async4_shared_global(
+                    b_dst,
+                    get_ptr_as_int64(b_i32_flat, b_src_int4 * Int32(4)),
+                )
+            else:
+                self._stage_b_tile_modelopt(
+                    b_i32_flat,
+                    b_dst,
+                    expert_idx,
+                    b_src_int4,
+                )
 
         if tid < Int32(self.s_sh_stage):
             s_src_int4 = (
@@ -2171,6 +2447,7 @@ class W4A16GemmKernel:
         a_sh_wr: Int32,
         a_rows_per_iter: Int32,
         output_n_tile: Int32,
+        expert_idx: Int32,
     ):
         if cutlass.const_expr(kk == self.b_sh_wr_iters - 2):
             self._prefetch_lookahead_tile(
@@ -2194,6 +2471,7 @@ class W4A16GemmKernel:
                 a_sh_wr,
                 a_rows_per_iter,
                 output_n_tile,
+                expert_idx,
             )
 
     @cute.jit
@@ -2217,6 +2495,7 @@ class W4A16GemmKernel:
         a_sh_wr: Int32,
         a_rows_per_iter: Int32,
         output_n_tile: Int32,
+        expert_idx: Int32,
     ):
         for pipe in cutlass.range_constexpr(_STAGES - 1):
             if Int32(pipe) < k_tiles:
@@ -2239,6 +2518,7 @@ class W4A16GemmKernel:
                     a_sh_wr,
                     a_rows_per_iter,
                     output_n_tile,
+                    expert_idx,
                 )
             else:
                 cute.arch.cp_async_commit_group()
@@ -2268,6 +2548,7 @@ class W4A16GemmKernel:
         a_sh_wr: Int32,
         a_rows_per_iter: Int32,
         output_n_tile: Int32,
+        expert_idx: Int32,
     ):
         fetch_tile = tile_idx + Int32(_STAGES - 1)
         if fetch_tile < k_tiles:
@@ -2290,6 +2571,7 @@ class W4A16GemmKernel:
                 a_sh_wr,
                 a_rows_per_iter,
                 output_n_tile,
+                expert_idx,
             )
         else:
             cute.arch.cp_async_commit_group()
@@ -2693,11 +2975,14 @@ class W4A16FusedMoeKernel:
         max_m_blocks: int,
         element_dtype: str = "bf16",
         swiglu_limit: float | None = None,
+        weight_layout: str = "packed",
     ):
         is_gated = validate_activation(activation)
         swiglu_limit = _normalize_swiglu_limit(swiglu_limit)
         if swiglu_limit is not None and not is_gated:
             raise ValueError("swiglu_limit requires a gated W4A16 activation")
+        if weight_layout not in _WEIGHT_LAYOUTS:
+            raise ValueError(f"unsupported W4A16 weight_layout {weight_layout!r}")
         fc1_cols = int(intermediate_size) * (2 if is_gated else 1)
         routed_rows = int(size_m) * int(top_k)
         self.size_m = int(size_m)
@@ -2710,10 +2995,14 @@ class W4A16FusedMoeKernel:
         self.activation_is_gated = is_gated
         self.has_swiglu_limit = swiglu_limit is not None
         self.swiglu_limit = 0.0 if swiglu_limit is None else swiglu_limit
+        self.weight_layout = weight_layout
         self.apply_router_weight_on_input = bool(apply_router_weight_on_input)
         self.zero_fc2_output = bool(zero_fc2_output)
         self.element_dtype = element_dtype
         self.is_fp16 = element_dtype == "fp16"
+        fc1_source_n_rotation = (
+            int(intermediate_size) if weight_layout == "modelopt" and is_gated else 0
+        )
         self.fc1 = W4A16GemmKernel(
             size_m=size_m,
             size_n=fc1_cols,
@@ -2727,6 +3016,8 @@ class W4A16FusedMoeKernel:
             max_m_blocks=max_m_blocks,
             element_dtype=element_dtype,
             epilogue_activation=None if is_gated else "relu2",
+            weight_layout=weight_layout,
+            source_n_rotation=fc1_source_n_rotation,
         )
         self.fc2 = W4A16GemmKernel(
             size_m=routed_rows,
@@ -2740,6 +3031,7 @@ class W4A16FusedMoeKernel:
             moe_block_size=moe_block_size,
             max_m_blocks=max_m_blocks,
             element_dtype=element_dtype,
+            weight_layout=weight_layout,
         )
         self.cta_threads = max(self.fc1.cta_threads, self.fc2.cta_threads)
         if self.fc1.cta_threads != self.fc2.cta_threads:
@@ -3377,6 +3669,7 @@ def compile_w4a16_fused_moe(
     sms: int,
     max_shared_mem: int,
     swiglu_limit: float | None = None,
+    weight_layout: str = "packed",
 ) -> W4A16FusedMoeCompileResult:
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
     device = int(torch.cuda.current_device()) if torch.cuda.is_available() else None
@@ -3384,6 +3677,8 @@ def compile_w4a16_fused_moe(
     swiglu_limit = _normalize_swiglu_limit(swiglu_limit)
     if swiglu_limit is not None and not is_gated:
         raise ValueError("swiglu_limit requires a gated W4A16 activation")
+    if weight_layout not in _WEIGHT_LAYOUTS:
+        raise ValueError(f"unsupported W4A16 weight_layout {weight_layout!r}")
     fc1_cols = int(intermediate_size) * (2 if is_gated else 1)
     routed_rows = int(size_m) * int(top_k)
     fc1_tile_k, fc1_tile_n, fc1_cta_threads, _ = _select_tile_config(
@@ -3446,6 +3741,7 @@ def compile_w4a16_fused_moe(
         bool(apply_router_weight_on_input),
         bool(zero_fc2_output),
         swiglu_limit,
+        weight_layout,
         fc1_tile_n,
         fc1_tile_k,
         fc2_tile_n,
@@ -3458,16 +3754,28 @@ def compile_w4a16_fused_moe(
         return cached
 
     a_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    w13_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (num_experts * (hidden_size // 16) * (fc1_cols // 16 * 32),),
-        assumed_align=16,
-    )
-    w2_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (num_experts * (intermediate_size // 16) * (hidden_size // 16 * 32),),
-        assumed_align=16,
-    )
+    if weight_layout == "modelopt":
+        w13_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Uint8,
+            (num_experts * fc1_cols * (hidden_size // 2),),
+            assumed_align=16,
+        )
+        w2_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Uint8,
+            (num_experts * hidden_size * (intermediate_size // 2),),
+            assumed_align=16,
+        )
+    else:
+        w13_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (num_experts * (hidden_size // 16) * (fc1_cols // 16 * 32),),
+            assumed_align=16,
+        )
+        w2_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (num_experts * (intermediate_size // 16) * (hidden_size // 16 * 32),),
+            assumed_align=16,
+        )
     fc1_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
         (routed_rows * fc1_cols,),
@@ -3562,6 +3870,7 @@ def compile_w4a16_fused_moe(
         max_m_blocks=max_m_blocks,
         element_dtype=element_dtype,
         swiglu_limit=swiglu_limit,
+        weight_layout=weight_layout,
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
@@ -3607,6 +3916,7 @@ def compile_w4a16_fused_moe(
         moe_block_size=moe_block_size,
         max_m_blocks=max_m_blocks,
         blocks_per_sm=kernel.blocks_per_sm,
+        weight_layout=weight_layout,
     )
     _FUSED_CACHE[cache_key] = result
     return result
@@ -3910,6 +4220,9 @@ def run_w4a16_moe(
         raise TypeError(
             f"prepared weights were built for {prepared_dtype}, but a_input has dtype {a_input.dtype}"
         )
+    weight_layout = getattr(prepared, "weight_layout", "packed")
+    if weight_layout not in _WEIGHT_LAYOUTS:
+        raise ValueError(f"unsupported W4A16 weight_layout {weight_layout!r}")
     if topk_weights.dtype != torch.float32:
         raise TypeError("topk_weights must be torch.float32")
     _validate_topk_ids(topk_ids, require_cuda=False, require_contiguous=False)
@@ -4040,6 +4353,7 @@ def run_w4a16_moe(
             sms=sms,
             max_shared_mem=max_shared_mem,
             swiglu_limit=swiglu_limit,
+            weight_layout=weight_layout,
         )
     else:
         if int(fused_launch.size_m) < m:
@@ -4057,6 +4371,7 @@ def run_w4a16_moe(
             expert_map is not None,
             element_dtype,
             swiglu_limit,
+            weight_layout,
             block_size_m,
         )
         actual_fused = (
@@ -4069,6 +4384,7 @@ def run_w4a16_moe(
             bool(fused_launch.zero_fc2_output),
             fused_launch.element_dtype,
             fused_launch.swiglu_limit,
+            getattr(fused_launch, "weight_layout", "packed"),
             int(fused_launch.moe_block_size),
         )
         if actual_fused != expected_fused or int(fused_launch.max_m_blocks) < int(
@@ -4115,6 +4431,12 @@ def run_w4a16_moe(
         device=a_input.device,
         scratch=fc2_c_tmp,
     )
+    if weight_layout == "modelopt":
+        w13_arg = prepared.w13.view(torch.uint8).view(-1)
+        w2_arg = prepared.w2.view(torch.uint8).view(-1)
+    else:
+        w13_arg = prepared.w13.view(torch.int32).view(-1)
+        w2_arg = prepared.w2.view(torch.int32).view(-1)
     fused.compiled(
         make_ptr(
             _cutlass_element_dtype(element_dtype),
@@ -4122,8 +4444,8 @@ def run_w4a16_moe(
             cute.AddressSpace.gmem,
             assumed_align=16,
         ),
-        prepared.w13.view(torch.int32).view(-1),
-        prepared.w2.view(torch.int32).view(-1),
+        w13_arg,
+        w2_arg,
         fc1_out,
         activated,
         fc2_out,
