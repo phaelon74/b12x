@@ -91,6 +91,46 @@ def test_pack_topk_routes_by_expert_groups_and_pads_routes(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_pack_topk_routes_by_expert_handles_large_prefill_plan_shape() -> None:
+    tokens = 8192
+    topk = 6
+    num_experts = 256
+    block_size = 64
+    topk_ids = (
+        torch.arange(tokens * topk, dtype=torch.int32, device="cuda")
+        .reshape(tokens, topk)
+        .remainder_(num_experts)
+    )
+
+    local_packed_routes, local_block_experts, local_packed_route_count = (
+        pack_topk_routes_by_expert(
+            topk_ids,
+            block_size,
+            num_experts,
+        )
+    )
+    expected_ids, expected_valid, expected_packed_route_count, expected_block_experts = (
+        _expected_route_pack(topk_ids, block_size, num_experts)
+    )
+
+    sentinel = int(topk_ids.numel())
+    valid = int(expected_packed_route_count.item())
+    valid_blocks = valid // block_size
+    assert torch.equal(local_packed_route_count.cpu(), expected_packed_route_count)
+    assert torch.equal(local_block_experts[:valid_blocks].cpu(), expected_block_experts)
+    assert bool(torch.all(local_packed_routes[valid:] == sentinel).item())
+
+    host_packed_routes = local_packed_routes[:valid].detach().cpu().to(torch.int64)
+    host_route_payload = host_packed_routes[host_packed_routes < sentinel]
+    assert host_route_payload.numel() == int(expected_valid.sum().item())
+    for expert in range(num_experts):
+        actual = host_route_payload[expected_ids[host_route_payload] == expert].sort().values
+        expected = torch.nonzero(expected_valid & (expected_ids == expert), as_tuple=False)
+        expected = expected.flatten().sort().values
+        assert torch.equal(actual, expected), expert
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("block_size", [8, 16, 32, 48, 64])
 def test_pack_topk_routes_by_expert_applies_expert_map(
