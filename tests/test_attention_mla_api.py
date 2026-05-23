@@ -47,23 +47,27 @@ class _FakeMLAWorkspace:
         self.num_chunks_value = 1
         self.kv_chunk_size_ptr = torch.empty((1,), dtype=torch.int32)
         self.num_chunks_ptr = torch.empty((1,), dtype=torch.int32)
-        self.tmp_output = torch.empty(
+        tmp_shape = (
+            self.max_total_q,
+            self.num_q_heads,
+            self.max_chunks_per_row,
+            self.v_head_dim,
+        )
+        tmp_storage = torch.empty(math.prod(tmp_shape), dtype=self.dtype)
+        self.tmp_output = tmp_storage.as_strided(
+            tmp_shape,
             (
-                self.max_total_q,
-                self.num_q_heads,
-                self.max_chunks_per_row,
+                self.num_q_heads * self.v_head_dim,
                 self.v_head_dim,
+                self.max_total_q * self.num_q_heads * self.v_head_dim,
+                1,
             ),
-            dtype=self.dtype,
         )
         self.tmp_lse = torch.empty(
             (self.max_total_q, self.num_q_heads, self.max_chunks_per_row),
             dtype=torch.float32,
         )
-        self.output_buffer = torch.empty(
-            (self.max_total_q, self.num_q_heads, self.v_head_dim),
-            dtype=self.dtype,
-        )
+        self.output_buffer = self.tmp_output[:, :, 0, :]
         self.final_lse = torch.empty(
             (self.max_total_q, self.num_q_heads),
             dtype=torch.float32,
@@ -824,6 +828,8 @@ def test_mla_decode_workspace_allocates_split_buffers_and_chunk_scalars() -> Non
     assert workspace.tmp_lse.shape == (8, 8, workspace.max_chunks_per_row)
     assert workspace.output_buffer is not None
     assert workspace.output_buffer.shape == (8, 8, 256)
+    assert workspace.output_buffer.is_contiguous()
+    assert workspace.output_buffer.data_ptr() == workspace.tmp_output[:, :, 0, :].data_ptr()
     assert workspace.final_lse is not None
     assert workspace.final_lse.shape == (8, 8)
     workspace.set_decode_chunk_config(kv_chunk_size=256, num_chunks=8)

@@ -121,6 +121,73 @@ def _materialize_arena_view(
     return typed_view, offset_bytes + nbytes
 
 
+def _materialize_arena_strided_view(
+    arena: torch.Tensor,
+    *,
+    offset_bytes: int,
+    shape: tuple[int, ...],
+    stride: tuple[int, ...],
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, int]:
+    offset_bytes = _align_up(offset_bytes, max(_ARENA_ALIGN_BYTES, _dtype_nbytes(dtype)))
+    nbytes = _shape_numel(shape) * _dtype_nbytes(dtype)
+    view_bytes = arena.narrow(0, offset_bytes, nbytes)
+    typed_storage = view_bytes.view(dtype)
+    return typed_storage.as_strided(shape, stride), offset_bytes + nbytes
+
+
+def _split_tmp_output_stride(
+    *,
+    max_total_q: int,
+    num_q_heads: int,
+    max_chunks_per_row: int,
+    v_head_dim: int,
+) -> tuple[int, int, int, int]:
+    del max_chunks_per_row
+    row_stride = int(num_q_heads) * int(v_head_dim)
+    head_stride = int(v_head_dim)
+    chunk_stride = int(max_total_q) * int(num_q_heads) * int(v_head_dim)
+    return (row_stride, head_stride, chunk_stride, 1)
+
+
+def _allocate_split_tmp_output(
+    *,
+    max_total_q: int,
+    num_q_heads: int,
+    max_chunks_per_row: int,
+    v_head_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    shape = (
+        int(max_total_q),
+        int(num_q_heads),
+        int(max_chunks_per_row),
+        int(v_head_dim),
+    )
+    storage = torch.empty(_shape_numel(shape), dtype=dtype, device=device)
+    return storage.as_strided(
+        shape,
+        _split_tmp_output_stride(
+            max_total_q=max_total_q,
+            num_q_heads=num_q_heads,
+            max_chunks_per_row=max_chunks_per_row,
+            v_head_dim=v_head_dim,
+        ),
+    )
+
+
+def _split_output_buffer_from_tmp(tmp_output: torch.Tensor) -> torch.Tensor:
+    if tmp_output.ndim != 4:
+        raise ValueError(f"tmp_output must be rank 4, got {tmp_output.ndim}")
+    output = tmp_output[:, :, 0, :]
+    if not output.is_contiguous():
+        raise RuntimeError(
+            "split MLA tmp_output layout must make chunk 0 a contiguous output buffer"
+        )
+    return output
+
+
 def _encode_indexer_k_tma_descriptor(
     k_quant_bytes: torch.Tensor,
     *,
@@ -538,15 +605,8 @@ class B12XAttentionArena:
             * _dtype_nbytes(torch.float32)
         )
         mla_offset = _align_up(mla_offset, _ARENA_ALIGN_BYTES)
-        output_buffer_offset_bytes = mla_offset
-        output_buffer_nbytes = (
-            mla_max_total_q
-            * int(caps.num_q_heads)
-            * int(caps.max_v_head_dim)
-            * _dtype_nbytes(caps.dtype)
-        )
-        mla_offset += output_buffer_nbytes
-        mla_offset = _align_up(mla_offset, _ARENA_ALIGN_BYTES)
+        output_buffer_offset_bytes = tmp_output_offset_bytes
+        output_buffer_nbytes = 0
         final_lse_offset_bytes = mla_offset
         final_lse_nbytes = (
             mla_max_total_q
@@ -1466,7 +1526,7 @@ class B12XAttentionWorkspace:
             shape=(max_kv_rows, 1, _MLA_PACKED_DIM),
             dtype=self.kv_dtype,
         )
-        self.tmp_output, mla_offset = _materialize_arena_view(
+        self.tmp_output, mla_offset = _materialize_arena_strided_view(
             self.shared_arena,
             offset_bytes=self.arena.tmp_output_offset_bytes,
             shape=(
@@ -1474,6 +1534,12 @@ class B12XAttentionWorkspace:
                 int(self.num_q_heads),
                 int(self.max_chunks_per_row),
                 int(self.v_head_dim),
+            ),
+            stride=_split_tmp_output_stride(
+                max_total_q=max_total_q,
+                num_q_heads=int(self.num_q_heads),
+                max_chunks_per_row=int(self.max_chunks_per_row),
+                v_head_dim=int(self.v_head_dim),
             ),
             dtype=self.dtype,
         )
@@ -1483,12 +1549,7 @@ class B12XAttentionWorkspace:
             shape=(max_total_q, int(self.num_q_heads), int(self.max_chunks_per_row)),
             dtype=torch.float32,
         )
-        self.output_buffer, mla_offset = _materialize_arena_view(
-            self.shared_arena,
-            offset_bytes=self.arena.output_buffer_offset_bytes,
-            shape=(max_total_q, int(self.num_q_heads), int(self.v_head_dim)),
-            dtype=self.dtype,
-        )
+        self.output_buffer = _split_output_buffer_from_tmp(self.tmp_output)
         self.final_lse, _ = _materialize_arena_view(
             self.shared_arena,
             offset_bytes=self.arena.final_lse_offset_bytes,
@@ -1631,8 +1692,11 @@ class B12XAttentionWorkspace:
             if self.shared_arena is None:
                 self._allocate_fixed_capacity_views()
         elif self.tmp_output is None:
-            self.tmp_output = torch.empty(
-                (self.max_total_q, self.num_q_heads, self.max_chunks_per_row, self.v_head_dim),
+            self.tmp_output = _allocate_split_tmp_output(
+                max_total_q=self.max_total_q,
+                num_q_heads=self.num_q_heads,
+                max_chunks_per_row=self.max_chunks_per_row,
+                v_head_dim=self.v_head_dim,
                 dtype=self.dtype,
                 device=self.device,
             )
@@ -1643,11 +1707,9 @@ class B12XAttentionWorkspace:
                 device=self.device,
             )
         if self.output_buffer is None:
-            self.output_buffer = torch.empty(
-                (self.max_total_q, self.num_q_heads, self.v_head_dim),
-                dtype=self.dtype,
-                device=self.device,
-            )
+            if self.tmp_output is None:
+                raise RuntimeError("workspace is missing split MLA output scratch")
+            self.output_buffer = _split_output_buffer_from_tmp(self.tmp_output)
         if self.final_lse is None:
             self.final_lse = torch.empty(
                 (self.max_total_q, self.num_q_heads),

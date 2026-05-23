@@ -164,6 +164,7 @@ def test_compressed_mla_arena_scratch_uses_contract_q_chunks() -> None:
 
     assert max_chunks_per_row == 240
     assert layout.ragged_kv_nbytes <= 1024
+    assert layout.output_buffer_nbytes == 0
     assert legacy_ragged > capped * 3
     assert capped < int(1.5 * (1 << 30))
 
