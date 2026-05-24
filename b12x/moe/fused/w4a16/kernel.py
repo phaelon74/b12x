@@ -76,6 +76,7 @@ _STAGES = 4
 _DEVICE_MAX_REG_BYTES = 255 * 1024
 _DEFAULT_MAX_SHARED_MEM = 101_376
 _WEIGHT_LAYOUTS = {"packed"}
+_MAX_DIRECT_TOPK_ROUTE_M = 6
 
 
 # The W4A16 launch model chooses blocks/SM from static resource usage
@@ -333,6 +334,7 @@ class W4A16FusedMoeCompileResult:
     apply_router_weight_on_input: bool
     zero_fc2_output: bool
     element_dtype: str
+    fast_math: bool
     swiglu_limit: float | None
     fc1_tile_n: int
     fc1_tile_k: int
@@ -342,6 +344,7 @@ class W4A16FusedMoeCompileResult:
     max_m_blocks: int
     blocks_per_sm: int
     weight_layout: str = "packed"
+    direct_topk_routes: bool = False
 
 
 @dataclass(frozen=True)
@@ -367,6 +370,8 @@ class W4A16GemmKernel:
         element_dtype: str = "bf16",
         epilogue_activation: str | None = None,
         weight_layout: str = "packed",
+        single_token_route_fast_path: bool = False,
+        direct_topk_routes: bool = False,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
@@ -405,6 +410,8 @@ class W4A16GemmKernel:
         self.is_fp16 = element_dtype == "fp16"
         self.epilogue_relu2 = epilogue_activation == "relu2"
         self.weight_layout = weight_layout
+        self.single_token_route_fast_path = bool(single_token_route_fast_path)
+        self.direct_topk_routes = bool(direct_topk_routes)
         self.cta_m_blocks = int(_covering_count(moe_block_size, 16))
         self.uses_m_block_8 = moe_block_size == 8
         self.max_m_blocks = int(max_m_blocks)
@@ -686,9 +693,11 @@ class W4A16GemmKernel:
         active_size_m: Int32,
     ):
         n_tiles = Int32(self.size_n // self.tile_n)
-        route_blocks = packed_route_count[Int32(0)].to(Int32) // Int32(
-            self.moe_block_size
-        )
+        route_blocks = active_size_m * Int32(self.top_k)
+        if cutlass.const_expr(not self.direct_topk_routes):
+            route_blocks = packed_route_count[Int32(0)].to(Int32) // Int32(
+                self.moe_block_size
+            )
         k_tiles = Int32(self.size_k // self.tile_k)
         global_mn_tiles = route_blocks * n_tiles
 
@@ -795,7 +804,10 @@ class W4A16GemmKernel:
                 and reduce_tile_count > Int32(0)
                 and route_block_idx < route_blocks
             ):
-                expert_idx = block_expert_ids[route_block_idx].to(Int32)
+                if cutlass.const_expr(self.direct_topk_routes):
+                    expert_idx = packed_route_indices[route_block_idx].to(Int32)
+                else:
+                    expert_idx = block_expert_ids[route_block_idx].to(Int32)
                 if expert_idx >= Int32(0):
                     self._run_tile(
                         a_bf16_flat,
@@ -842,6 +854,44 @@ class W4A16GemmKernel:
         global_scale_f32: cutlass.Float32,
         active_size_m: Int32,
     ) -> Int32:
+        if cutlass.const_expr(self.direct_topk_routes):
+            if tid == Int32(0):
+                idx = route_block_idx
+                st_shared_i32(smem_base + Int32(self.sh_route_off * 16), idx)
+                rd_row = idx // Int32(self.top_k)
+                st_shared_i32(smem_base + Int32(self.sh_rd_route_off * 16), rd_row)
+                if cutlass.const_expr(self.mul_topk_weights):
+                    topk = topk_weights_flat[idx].to(cutlass.Float32) * global_scale_f32
+                    st_shared_u32(
+                        smem_base + Int32(self.sh_topk_off * 16),
+                        self._broadcast_f32_to_elem2(topk),
+                    )
+            cute.arch.sync_threads()
+            return Int32(1)
+
+        if cutlass.const_expr(self.single_token_route_fast_path):
+            if tid == Int32(0):
+                idx = packed_route_indices[
+                    route_block_idx * Int32(self.moe_block_size)
+                ].to(Int32)
+                st_shared_i32(smem_base + Int32(self.sh_route_off * 16), idx)
+                rd_row = idx // Int32(self.top_k)
+                st_shared_i32(smem_base + Int32(self.sh_rd_route_off * 16), rd_row)
+                if cutlass.const_expr(self.mul_topk_weights):
+                    safe_idx = idx
+                    if idx >= active_size_m * Int32(self.top_k):
+                        safe_idx = Int32(0)
+                    topk = (
+                        topk_weights_flat[safe_idx].to(cutlass.Float32)
+                        * global_scale_f32
+                    )
+                    st_shared_u32(
+                        smem_base + Int32(self.sh_topk_off * 16),
+                        self._broadcast_f32_to_elem2(topk),
+                    )
+            cute.arch.sync_threads()
+            return Int32(1)
+
         route_indices_int4_addr = self._int4_addr(
             smem_base, Int32(self.sh_route_off) + tid
         )
@@ -2714,8 +2764,10 @@ class W4A16FusedMoeKernel:
         moe_block_size: int,
         max_m_blocks: int,
         element_dtype: str = "bf16",
+        fast_math: bool = True,
         swiglu_limit: float | None = None,
         weight_layout: str = "packed",
+        direct_topk_routes: bool = False,
     ):
         is_gated = validate_activation(activation)
         swiglu_limit = _normalize_swiglu_limit(swiglu_limit)
@@ -2740,6 +2792,8 @@ class W4A16FusedMoeKernel:
         self.zero_fc2_output = bool(zero_fc2_output)
         self.element_dtype = element_dtype
         self.is_fp16 = element_dtype == "fp16"
+        self.fast_math = bool(fast_math)
+        self.direct_topk_routes = bool(direct_topk_routes)
         self.fc1 = W4A16GemmKernel(
             size_m=size_m,
             size_n=fc1_cols,
@@ -2754,6 +2808,9 @@ class W4A16FusedMoeKernel:
             element_dtype=element_dtype,
             epilogue_activation=None if is_gated else "relu2",
             weight_layout=weight_layout,
+            single_token_route_fast_path=size_m == 1
+            and not self.direct_topk_routes,
+            direct_topk_routes=self.direct_topk_routes,
         )
         self.fc2 = W4A16GemmKernel(
             size_m=routed_rows,
@@ -2768,6 +2825,9 @@ class W4A16FusedMoeKernel:
             max_m_blocks=max_m_blocks,
             element_dtype=element_dtype,
             weight_layout=weight_layout,
+            single_token_route_fast_path=size_m == 1
+            and not self.direct_topk_routes,
+            direct_topk_routes=self.direct_topk_routes,
         )
         self.cta_threads = max(self.fc1.cta_threads, self.fc2.cta_threads)
         if self.fc1.cta_threads != self.fc2.cta_threads:
@@ -3037,9 +3097,11 @@ class W4A16FusedMoeKernel:
                     cutlass.Float32
                 )
                 gate, up = self._clamp_swiglu_inputs(gate, up)
-                silu = gate / (
-                    cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=False)
-                )
+                if cutlass.const_expr(self.fast_math):
+                    exp_neg_gate = cute.math.exp(-gate, fastmath=True)
+                else:
+                    exp_neg_gate = cute.math.exp(-gate, fastmath=False)
+                silu = gate / (cutlass.Float32(1.0) + exp_neg_gate)
                 activated_bf16_flat[idx] = self._cast_elem(
                     self._cast_elem(silu) * self._cast_elem(up)
                 )
@@ -3135,9 +3197,11 @@ class W4A16ActivationKernel:
                     cutlass.Float32
                 )
                 gate, up = self._clamp_swiglu_inputs(gate, up)
-                silu = gate / (
-                    cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=False)
-                )
+                if cutlass.const_expr(self.fast_math):
+                    exp_neg_gate = cute.math.exp(-gate, fastmath=True)
+                else:
+                    exp_neg_gate = cute.math.exp(-gate, fastmath=False)
+                silu = gate / (cutlass.Float32(1.0) + exp_neg_gate)
                 activated_flat[idx] = self._cast_elem(
                     self._cast_elem(silu) * self._cast_elem(up)
                 )
@@ -3402,10 +3466,12 @@ def compile_w4a16_fused_moe(
     moe_block_size: int,
     max_m_blocks: int,
     element_dtype: str = "bf16",
+    fast_math: bool = True,
     sms: int,
     max_shared_mem: int,
     swiglu_limit: float | None = None,
     weight_layout: str = "packed",
+    direct_topk_routes: bool = False,
 ) -> W4A16FusedMoeCompileResult:
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
     device = int(torch.cuda.current_device()) if torch.cuda.is_available() else None
@@ -3415,6 +3481,15 @@ def compile_w4a16_fused_moe(
         raise ValueError("swiglu_limit requires a gated W4A16 activation")
     if weight_layout not in _WEIGHT_LAYOUTS:
         raise ValueError(f"unsupported W4A16 weight_layout {weight_layout!r}")
+    direct_topk_routes = bool(direct_topk_routes)
+    if direct_topk_routes and (
+        int(size_m) > _MAX_DIRECT_TOPK_ROUTE_M
+        or weight_layout != "packed"
+        or bool(zero_fc2_output)
+    ):
+        raise ValueError(
+            "direct_topk_routes is only valid for small-M packed W4A16 without expert_map"
+        )
     fc1_cols = int(intermediate_size) * (2 if is_gated else 1)
     routed_rows = int(size_m) * int(top_k)
     fc1_tile_k, fc1_tile_n, fc1_cta_threads, _ = _select_tile_config(
@@ -3476,6 +3551,7 @@ def compile_w4a16_fused_moe(
         activation,
         bool(apply_router_weight_on_input),
         bool(zero_fc2_output),
+        bool(fast_math),
         swiglu_limit,
         weight_layout,
         fc1_tile_n,
@@ -3484,11 +3560,17 @@ def compile_w4a16_fused_moe(
         fc2_tile_k,
         moe_block_size,
         max_m_blocks,
+        direct_topk_routes,
     )
     cached = _FUSED_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
+    packed_route_fake_elements = (
+        int(size_m) * int(top_k)
+        if direct_topk_routes
+        else int(max_m_blocks) * int(moe_block_size)
+    )
     a_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     w13_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
@@ -3537,7 +3619,7 @@ def compile_w4a16_fused_moe(
     )
     packed_routes_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (max_m_blocks * moe_block_size,),
+        (packed_route_fake_elements,),
         assumed_align=16,
     )
     block_experts_fake = cute.runtime.make_fake_compact_tensor(
@@ -3593,8 +3675,10 @@ def compile_w4a16_fused_moe(
         moe_block_size=moe_block_size,
         max_m_blocks=max_m_blocks,
         element_dtype=element_dtype,
+        fast_math=fast_math,
         swiglu_limit=swiglu_limit,
         weight_layout=weight_layout,
+        direct_topk_routes=direct_topk_routes,
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
@@ -3632,6 +3716,7 @@ def compile_w4a16_fused_moe(
         apply_router_weight_on_input=bool(apply_router_weight_on_input),
         zero_fc2_output=bool(zero_fc2_output),
         element_dtype=element_dtype,
+        fast_math=bool(fast_math),
         swiglu_limit=swiglu_limit,
         fc1_tile_n=fc1_tile_n,
         fc1_tile_k=fc1_tile_k,
@@ -3641,6 +3726,7 @@ def compile_w4a16_fused_moe(
         max_m_blocks=max_m_blocks,
         blocks_per_sm=kernel.blocks_per_sm,
         weight_layout=weight_layout,
+        direct_topk_routes=kernel.direct_topk_routes,
     )
     _FUSED_CACHE[cache_key] = result
     return result
@@ -3982,7 +4068,31 @@ def run_w4a16_moe(
         raise ValueError(f"unsupported W4A16 moe_block_size={block_size_m}")
 
     stream = current_cuda_stream() if stream is None else stream
-    if fused_launch is not None:
+    direct_topk_eligible = (
+        m <= _MAX_DIRECT_TOPK_ROUTE_M
+        and weight_layout == "packed"
+        and expert_map is None
+    )
+    use_direct_topk_routes = bool(
+        direct_topk_eligible
+        and topk_ids.dtype == torch.int32
+        and (
+            fused_launch is None
+            or bool(getattr(fused_launch, "direct_topk_routes", False))
+        )
+    )
+    if (
+        bool(getattr(fused_launch, "direct_topk_routes", False))
+        and not use_direct_topk_routes
+    ):
+        raise RuntimeError(
+            "preplanned W4A16 direct top-k routing requires small-M packed "
+            "int32 topk_ids without expert_map"
+        )
+
+    route_slots_for_scratch = int(m) * int(topk) * int(block_size_m)
+    required_m_blocks = int(m) * int(topk) if use_direct_topk_routes else 0
+    if fused_launch is not None and not use_direct_topk_routes:
         route_slots_capacity = max_packed_route_slots(
             int(fused_launch.size_m) * int(topk),
             int(block_size_m),
@@ -4003,19 +4113,28 @@ def run_w4a16_moe(
                     "block_expert_ids is smaller than the selected W4A16 launch capacity"
                 )
             block_expert_ids = block_expert_ids[:route_blocks_capacity]
-    packed_route_indices, block_expert_ids, packed_route_count = (
-        pack_topk_routes_by_expert(
-            topk_ids,
-            block_size_m,
-            route_num_experts,
-            expert_map=expert_map,
-            packed_route_indices=packed_route_indices,
-            block_expert_ids=block_expert_ids,
-            packed_route_count=packed_route_count,
-            expert_offsets=expert_offsets,
-            stream=stream,
+    if use_direct_topk_routes:
+        packed_route_indices = topk_ids.view(-1)
+        if block_expert_ids is None:
+            block_expert_ids = packed_route_indices
+        if packed_route_count is None:
+            packed_route_count = packed_route_indices
+    else:
+        packed_route_indices, block_expert_ids, packed_route_count = (
+            pack_topk_routes_by_expert(
+                topk_ids,
+                block_size_m,
+                route_num_experts,
+                expert_map=expert_map,
+                packed_route_indices=packed_route_indices,
+                block_expert_ids=block_expert_ids,
+                packed_route_count=packed_route_count,
+                expert_offsets=expert_offsets,
+                stream=stream,
+            )
         )
-    )
+        route_slots_for_scratch = int(packed_route_indices.numel())
+        required_m_blocks = int(block_expert_ids.numel())
 
     props = torch.cuda.get_device_properties(a_input.device)
     sms = int(props.multi_processor_count)
@@ -4058,7 +4177,6 @@ def run_w4a16_moe(
     intermediate_cache13_flat = intermediate_cache13.view(-1)
     intermediate_cache2_flat = intermediate_cache2.view(-1)
 
-    del fast_math
     if int(prepared.workspace.numel()) < sms * 4 + 2:
         raise ValueError("prepared W4A16 workspace is too small for fused FC1+FC2")
     if fused_launch is None:
@@ -4072,12 +4190,14 @@ def run_w4a16_moe(
             apply_router_weight_on_input=bool(apply_router_weight_on_input),
             zero_fc2_output=expert_map is not None,
             moe_block_size=block_size_m,
-            max_m_blocks=int(block_expert_ids.numel()),
+            max_m_blocks=int(required_m_blocks),
             element_dtype=element_dtype,
+            fast_math=bool(fast_math),
             sms=sms,
             max_shared_mem=max_shared_mem,
             swiglu_limit=swiglu_limit,
             weight_layout=weight_layout,
+            direct_topk_routes=use_direct_topk_routes,
         )
     else:
         if int(fused_launch.size_m) < m:
@@ -4094,8 +4214,10 @@ def run_w4a16_moe(
             bool(apply_router_weight_on_input),
             expert_map is not None,
             element_dtype,
+            bool(fast_math),
             swiglu_limit,
             weight_layout,
+            bool(use_direct_topk_routes),
             block_size_m,
         )
         actual_fused = (
@@ -4107,16 +4229,18 @@ def run_w4a16_moe(
             bool(fused_launch.apply_router_weight_on_input),
             bool(fused_launch.zero_fc2_output),
             fused_launch.element_dtype,
+            bool(fused_launch.fast_math),
             fused_launch.swiglu_limit,
             getattr(fused_launch, "weight_layout", "packed"),
+            bool(getattr(fused_launch, "direct_topk_routes", False)),
             int(fused_launch.moe_block_size),
         )
         if actual_fused != expected_fused or int(fused_launch.max_m_blocks) < int(
-            block_expert_ids.numel()
+            required_m_blocks
         ):
             raise RuntimeError(
                 "preplanned W4A16 fused MoE launch does not match requested contract: "
-                f"requested={expected_fused + (int(block_expert_ids.numel()),)}, "
+                f"requested={expected_fused + (int(required_m_blocks),)}, "
                 f"planned={actual_fused + (int(fused_launch.max_m_blocks),)}"
             )
         fused = fused_launch
@@ -4138,7 +4262,7 @@ def run_w4a16_moe(
     fc1_scratch = _get_c_tmp(
         packed_gemm_scratch_elements(
             size_n=fc1_cols,
-            route_slots=int(packed_route_indices.numel()),
+            route_slots=int(route_slots_for_scratch),
             moe_block_size=block_size_m,
             sms=sms,
         ),
@@ -4148,7 +4272,7 @@ def run_w4a16_moe(
     fc2_scratch = _get_c_tmp(
         packed_gemm_scratch_elements(
             size_n=hidden_size,
-            route_slots=int(packed_route_indices.numel()),
+            route_slots=int(route_slots_for_scratch),
             moe_block_size=block_size_m,
             sms=sms,
         ),

@@ -160,6 +160,65 @@ def _assert_matches_oracle(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("m", [1, 4, 6])
+def test_w4a16_small_m_packed_direct_topk_routes_matches_oracle(m: int) -> None:
+    torch.manual_seed(20260524 + m)
+    experts, hidden_size, intermediate_size = 8, 128, 128
+    topk, activation = 2, "silu"
+    weights = _make_weights(
+        experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+    )
+    x = (torch.randn(m, hidden_size, device="cuda") * 0.25).to(torch.bfloat16)
+    topk_ids = torch.randint(0, experts, (m, topk), device="cuda", dtype=torch.int32)
+    topk_weights = torch.softmax(torch.randn(m, topk, device="cuda"), dim=-1)
+
+    prepared = prepare_w4a16_weights(
+        *weights,
+        activation=activation,
+        params_dtype=x.dtype,
+    )
+    buffers = make_w4a16_buffers(
+        prepared,
+        m=m,
+        topk=topk,
+        dtype=x.dtype,
+        device=x.device,
+    )
+    tiny_route_workspace = torch.empty((1,), dtype=torch.int32, device=x.device)
+
+    actual = run_w4a16_moe(
+        x,
+        prepared,
+        topk_weights,
+        topk_ids,
+        activation=activation,
+        fast_math=True,
+        intermediate_cache13=buffers.intermediate_cache13,
+        intermediate_cache2=buffers.intermediate_cache2,
+        output=buffers.output,
+        fc1_c_tmp=buffers.fc1_c_tmp,
+        fc2_c_tmp=buffers.fc2_c_tmp,
+        packed_route_indices=tiny_route_workspace,
+        block_expert_ids=tiny_route_workspace,
+        packed_route_count=tiny_route_workspace,
+        expert_offsets=tiny_route_workspace,
+    )
+    expected = _reference_w4a16(
+        x,
+        *weights,
+        topk_ids,
+        topk_weights,
+        activation=activation,
+    )
+    torch.cuda.synchronize()
+
+    _assert_matches_oracle(actual, expected, activation=activation)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("activation", ["relu2", "silu"])
 @pytest.mark.parametrize(
     ("routed_size", "m"),
