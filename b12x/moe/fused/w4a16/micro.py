@@ -94,6 +94,10 @@ class _ShapeConfig:
     w1_sf_cols: int
     w2_sf_rows: int
     w2_sf_cols: int
+    w1_packed_words_per_expert: int
+    w1_packed_scale_bytes_per_expert: int
+    w2_packed_words_per_expert: int
+    w2_packed_scale_bytes_per_expert: int
     k_blocks: int
     k_segments: int
     k_segments_aligned: bool
@@ -106,6 +110,7 @@ class _ShapeConfig:
     inter_blocks: int
     inter_u32: int
     fc2_n_chunks: int
+    fc2_k16_chunks: int
 
 
 def _make_shape_config(
@@ -118,6 +123,10 @@ def _make_shape_config(
     w1_sf_cols = _align_up(k // _BLOCK_SIZE, 4)
     w2_sf_rows = _align_up(k, 128)
     w2_sf_cols = _align_up(n // _BLOCK_SIZE, 4)
+    w1_packed_words_per_expert = (k // _PACKED_TILE_K) * (two_n // _PACKED_TILE_N) * 128
+    w1_packed_scale_bytes_per_expert = (k // _PACKED_TILE_K) * two_n
+    w2_packed_words_per_expert = (n // _PACKED_TILE_K) * (k // _PACKED_TILE_N) * 128
+    w2_packed_scale_bytes_per_expert = (n // _PACKED_TILE_K) * k
     k_blocks = k // _BLOCK_SIZE
     k_segments = _direct_k_segments_for_k(k)
     k_segments_aligned = k_blocks == k_segments * 32
@@ -130,6 +139,7 @@ def _make_shape_config(
     inter_blocks = i_chunk // _BLOCK_SIZE
     fc2_n_chunks = (n // 2 + 127) // 128
     inter_u32 = fc2_n_chunks * 128 * num_topk
+    fc2_k16_chunks = _align_up(n // _PACKED_TILE_K, 32) // 32
     return _ShapeConfig(
         k_dim=k,
         n=n,
@@ -142,6 +152,10 @@ def _make_shape_config(
         w1_sf_cols=w1_sf_cols,
         w2_sf_rows=w2_sf_rows,
         w2_sf_cols=w2_sf_cols,
+        w1_packed_words_per_expert=w1_packed_words_per_expert,
+        w1_packed_scale_bytes_per_expert=w1_packed_scale_bytes_per_expert,
+        w2_packed_words_per_expert=w2_packed_words_per_expert,
+        w2_packed_scale_bytes_per_expert=w2_packed_scale_bytes_per_expert,
         k_blocks=k_blocks,
         k_segments=k_segments,
         k_segments_aligned=k_segments_aligned,
@@ -154,6 +168,7 @@ def _make_shape_config(
         inter_blocks=inter_blocks,
         inter_u32=inter_u32,
         fc2_n_chunks=fc2_n_chunks,
+        fc2_k16_chunks=fc2_k16_chunks,
     )
 
 
@@ -165,6 +180,7 @@ def _remake_shape_config_fc1(cfg: _ShapeConfig, fc1_chunks: int) -> _ShapeConfig
     inter_blocks = i_chunk // _BLOCK_SIZE
     fc2_n_chunks = (cfg.n // 2 + 127) // 128
     inter_u32 = fc2_n_chunks * 128 * cfg.num_topk
+    fc2_k16_chunks = _align_up(cfg.n // _PACKED_TILE_K, 32) // 32
     return _ShapeConfig(
         k_dim=cfg.k_dim,
         n=cfg.n,
@@ -177,6 +193,10 @@ def _remake_shape_config_fc1(cfg: _ShapeConfig, fc1_chunks: int) -> _ShapeConfig
         w1_sf_cols=cfg.w1_sf_cols,
         w2_sf_rows=cfg.w2_sf_rows,
         w2_sf_cols=cfg.w2_sf_cols,
+        w1_packed_words_per_expert=cfg.w1_packed_words_per_expert,
+        w1_packed_scale_bytes_per_expert=cfg.w1_packed_scale_bytes_per_expert,
+        w2_packed_words_per_expert=cfg.w2_packed_words_per_expert,
+        w2_packed_scale_bytes_per_expert=cfg.w2_packed_scale_bytes_per_expert,
         k_blocks=cfg.k_blocks,
         k_segments=cfg.k_segments,
         k_segments_aligned=cfg.k_segments_aligned,
@@ -189,6 +209,7 @@ def _remake_shape_config_fc1(cfg: _ShapeConfig, fc1_chunks: int) -> _ShapeConfig
         inter_blocks=inter_blocks,
         inter_u32=inter_u32,
         fc2_n_chunks=fc2_n_chunks,
+        fc2_k16_chunks=fc2_k16_chunks,
     )
 
 
@@ -455,6 +476,127 @@ class MoEMicroKernelBackend:
             return _block_dot4_pair(up_val, gate_val, smem_xh, xh_base)
         return _block_dot4_pair_f32acc(up_val, gate_val, smem_xh, xh_base)
 
+    @cute.jit
+    def _packed_row_local_permute(self, row: Int32) -> Tuple[Int32, Int32, Int32]:
+        row64 = row & Int32(_PACKED_TILE_N - 1)
+        warp_id = row64 >> Int32(4)
+        local16 = row64 - warp_id * Int32(16)
+        second = local16 >> Int32(3)
+        tc_col = local16 & Int32(7)
+        return warp_id, second, tc_col
+
+    @cute.jit
+    def _packed_scale_row_offset(self, row: Int32) -> Int32:
+        tile_base = (row >> Int32(6)) * Int32(64)
+        local = row & Int32(63)
+        transposed = (local & Int32(7)) * Int32(8) + (local >> Int32(3))
+        group_base = (transposed // Int32(4)) * Int32(4)
+        group_lane = transposed & Int32(3)
+        swapped_lane = ((group_lane & Int32(1)) << Int32(1)) | (
+            (group_lane & Int32(2)) >> Int32(1)
+        )
+        return tile_base + group_base + swapped_lane
+
+    @cute.jit
+    def _load_packed_scale_f32(
+        self,
+        scales_base_addr: Int64,
+        eid: Int32,
+        row: Int32,
+        k_tile: Int32,
+        size_n: cutlass.Constexpr[int],
+        expert_stride_bytes: cutlass.Constexpr[int],
+    ) -> Float32:
+        row_off = self._packed_scale_row_offset(row)
+        byte_off = (
+            Int64(eid) * Int64(expert_stride_bytes)
+            + Int64(k_tile) * Int64(size_n)
+            + Int64(row_off)
+        )
+        byte_addr = scales_base_addr + (byte_off // Int64(4)) * Int64(4)
+        shift = Uint32((row_off & Int32(3)) * Int32(8))
+        word = ld_global_nc_u32(byte_addr)
+        return cvt_e4m3_to_f32_via_f16((word >> shift) & Uint32(0xFF))
+
+    @cute.jit
+    def _load_packed_weight_k16_words(
+        self,
+        weights_base_addr: Int64,
+        eid: Int32,
+        row: Int32,
+        k_tile: Int32,
+        words_per_expert: cutlass.Constexpr[int],
+        n_tiles: cutlass.Constexpr[int],
+    ) -> Tuple[Uint32, Uint32]:
+        row_tile = row >> Int32(6)
+        _, second, tc_col = self._packed_row_local_permute(row)
+        expert_off = Int64(eid) * Int64(words_per_expert)
+        tile_off = Int64(k_tile) * Int64(n_tiles * 128) + Int64(row_tile) * Int64(128)
+
+        out0 = (tc_col * Int32(4) + Int32(0)) * Int32(4) + ((row & Int32(63)) >> Int32(4))
+        out1 = out0 + Int32(4)
+        out2 = out1 + Int32(4)
+        out3 = out2 + Int32(4)
+        q0 = ld_global_nc_u32(weights_base_addr + (expert_off + tile_off + Int64(out0)) * Int64(4))
+        q1 = ld_global_nc_u32(weights_base_addr + (expert_off + tile_off + Int64(out1)) * Int64(4))
+        q2 = ld_global_nc_u32(weights_base_addr + (expert_off + tile_off + Int64(out2)) * Int64(4))
+        q3 = ld_global_nc_u32(weights_base_addr + (expert_off + tile_off + Int64(out3)) * Int64(4))
+
+        b00 = q0 & Uint32(0xFF)
+        b01 = (q0 >> Uint32(16)) & Uint32(0xFF)
+        b10 = q1 & Uint32(0xFF)
+        b11 = (q1 >> Uint32(16)) & Uint32(0xFF)
+        b20 = q2 & Uint32(0xFF)
+        b21 = (q2 >> Uint32(16)) & Uint32(0xFF)
+        b30 = q3 & Uint32(0xFF)
+        b31 = (q3 >> Uint32(16)) & Uint32(0xFF)
+        if second != Int32(0):
+            b00 = (q0 >> Uint32(8)) & Uint32(0xFF)
+            b01 = (q0 >> Uint32(24)) & Uint32(0xFF)
+            b10 = (q1 >> Uint32(8)) & Uint32(0xFF)
+            b11 = (q1 >> Uint32(24)) & Uint32(0xFF)
+            b20 = (q2 >> Uint32(8)) & Uint32(0xFF)
+            b21 = (q2 >> Uint32(24)) & Uint32(0xFF)
+            b30 = (q3 >> Uint32(8)) & Uint32(0xFF)
+            b31 = (q3 >> Uint32(24)) & Uint32(0xFF)
+
+        u_a = b00 | (b01 << Uint32(8)) | (b10 << Uint32(16)) | (b11 << Uint32(24))
+        u_b = b20 | (b21 << Uint32(8)) | (b30 << Uint32(16)) | (b31 << Uint32(24))
+        return u_a, u_b
+
+    @cute.jit
+    def _packed_dot_hfma2_for_math(
+        self,
+        weights_base_addr: Int64,
+        scales_base_addr: Int64,
+        eid: Int32,
+        row: Int32,
+        k_tile: Int32,
+        smem_xh: cute.Tensor,
+        xh_base: Int32,
+        size_n: cutlass.Constexpr[int],
+        words_per_expert: cutlass.Constexpr[int],
+        n_tiles: cutlass.Constexpr[int],
+        scale_stride_bytes: cutlass.Constexpr[int],
+    ) -> Float32:
+        u_a, u_b = self._load_packed_weight_k16_words(
+            weights_base_addr,
+            eid,
+            row,
+            k_tile,
+            words_per_expert,
+            n_tiles,
+        )
+        sf = self._load_packed_scale_f32(
+            scales_base_addr,
+            eid,
+            row,
+            k_tile,
+            size_n,
+            scale_stride_bytes,
+        )
+        return sf * self._block_dot_hfma2_for_math(u_a, u_b, smem_xh, xh_base)
+
     @classmethod
     def is_supported(
         cls,
@@ -552,6 +694,194 @@ class MoEMicroKernelBackend:
             else:
                 spin_wait_global_eq_i32(barrier_epoch_addr, old_epoch)
         cute.arch.sync_threads()
+
+    @cute.jit
+    def _fc2_packed_dot_row(
+        self,
+        w2_base_addr: Int64,
+        w2s_base_addr: Int64,
+        intermediate: cute.Tensor,
+        token_inter_base: Int32,
+        kk: Int32,
+        eid: Int32,
+        out_row: Int32,
+        lane: Int32,
+    ) -> Float32:
+        cfg = self._cfg
+        acc = Float32(0.0)
+        route_inter_base = token_inter_base + kk * Int32(cfg.fc2_n_chunks * 128)
+        for kc in cutlass.range_constexpr(cfg.fc2_k16_chunks):
+            k_tile = Int32(kc * 32) + lane
+            if k_tile < Int32(cfg.n // _PACKED_TILE_K):
+                xh_base = route_inter_base + k_tile * Int32(_PACKED_TILE_K // 2)
+                acc = acc + self._packed_dot_hfma2_for_math(
+                    w2_base_addr,
+                    w2s_base_addr,
+                    eid,
+                    out_row,
+                    k_tile,
+                    intermediate,
+                    xh_base,
+                    cfg.k_dim,
+                    cfg.w2_packed_words_per_expert,
+                    cfg.k_dim // _PACKED_TILE_N,
+                    cfg.w2_packed_scale_bytes_per_expert,
+                )
+        return acc
+
+    @cute.jit
+    def _fc2_packed_rowpair(
+        self,
+        fc2_task: Int32,
+        warp_id: Int32,
+        lane: Int32,
+        w2_base_addr: Int64,
+        w2s_base_addr: Int64,
+        intermediate: cute.Tensor,
+        w2_alphas: cute.Tensor,
+        topk_ids: cute.Tensor,
+        topk_weights: cute.Tensor,
+        scatter_output: cute.Tensor,
+    ):
+        cfg = self._cfg
+        rows_per_cta = Int32(_K_PER_CTA * 2)
+        linear_row_base = fc2_task * rows_per_cta
+        t = linear_row_base // Int32(cfg.k_dim)
+        k_chunk_off = linear_row_base - t * Int32(cfg.k_dim)
+        k_row0 = k_chunk_off + warp_id * Int32(2)
+        k_row1 = k_row0 + Int32(1)
+        token_inter_base = t * Int32(cfg.inter_u32)
+        out_acc0 = Float32(0.0)
+        out_acc1 = Float32(0.0)
+
+        for kk in cutlass.range_constexpr(cfg.num_topk):
+            eid_addr = t * Int32(cfg.num_topk) + Int32(kk)
+            eid = Int32(topk_ids[eid_addr])
+            router_w = topk_weights[eid_addr]
+            if cutlass.const_expr(self.w4a16_mode and (not self.is_gated) and cfg.k_dim == 2688 and cfg.n == 1856):
+                scale_lane = router_w
+            else:
+                alpha_fc2 = w2_alphas[eid]
+                scale_lane = alpha_fc2 * router_w
+
+            out_acc0 = out_acc0 + scale_lane * self._fc2_packed_dot_row(
+                w2_base_addr,
+                w2s_base_addr,
+                intermediate,
+                token_inter_base,
+                Int32(kk),
+                eid,
+                k_row0,
+                lane,
+            )
+            out_acc1 = out_acc1 + scale_lane * self._fc2_packed_dot_row(
+                w2_base_addr,
+                w2s_base_addr,
+                intermediate,
+                token_inter_base,
+                Int32(kk),
+                eid,
+                k_row1,
+                lane,
+            )
+
+        sum_warp0 = cute.arch.warp_reduction_sum(out_acc0)
+        sum_warp1 = cute.arch.warp_reduction_sum(out_acc1)
+        if lane == Int32(0):
+            out_base = t * Int32(cfg.k_dim)
+            scatter_output[out_base + k_row0] = BFloat16(sum_warp0)
+            scatter_output[out_base + k_row1] = BFloat16(sum_warp1)
+
+    @cute.jit
+    def _fc2_packed_rowquad(
+        self,
+        fc2_task: Int32,
+        warp_id: Int32,
+        lane: Int32,
+        w2_base_addr: Int64,
+        w2s_base_addr: Int64,
+        intermediate: cute.Tensor,
+        w2_alphas: cute.Tensor,
+        topk_ids: cute.Tensor,
+        topk_weights: cute.Tensor,
+        scatter_output: cute.Tensor,
+    ):
+        cfg = self._cfg
+        rows_per_cta = Int32(_K_PER_CTA * 4)
+        linear_row_base = fc2_task * rows_per_cta
+        t = linear_row_base // Int32(cfg.k_dim)
+        k_chunk_off = linear_row_base - t * Int32(cfg.k_dim)
+        k_row0 = k_chunk_off + warp_id * Int32(4)
+        k_row1 = k_row0 + Int32(1)
+        k_row2 = k_row0 + Int32(2)
+        k_row3 = k_row0 + Int32(3)
+        token_inter_base = t * Int32(cfg.inter_u32)
+        out_acc0 = Float32(0.0)
+        out_acc1 = Float32(0.0)
+        out_acc2 = Float32(0.0)
+        out_acc3 = Float32(0.0)
+
+        for kk in cutlass.range_constexpr(cfg.num_topk):
+            eid_addr = t * Int32(cfg.num_topk) + Int32(kk)
+            eid = Int32(topk_ids[eid_addr])
+            router_w = topk_weights[eid_addr]
+            if cutlass.const_expr(self.w4a16_mode and (not self.is_gated) and cfg.k_dim == 2688 and cfg.n == 1856):
+                scale_lane = router_w
+            else:
+                alpha_fc2 = w2_alphas[eid]
+                scale_lane = alpha_fc2 * router_w
+
+            out_acc0 = out_acc0 + scale_lane * self._fc2_packed_dot_row(
+                w2_base_addr,
+                w2s_base_addr,
+                intermediate,
+                token_inter_base,
+                Int32(kk),
+                eid,
+                k_row0,
+                lane,
+            )
+            out_acc1 = out_acc1 + scale_lane * self._fc2_packed_dot_row(
+                w2_base_addr,
+                w2s_base_addr,
+                intermediate,
+                token_inter_base,
+                Int32(kk),
+                eid,
+                k_row1,
+                lane,
+            )
+            out_acc2 = out_acc2 + scale_lane * self._fc2_packed_dot_row(
+                w2_base_addr,
+                w2s_base_addr,
+                intermediate,
+                token_inter_base,
+                Int32(kk),
+                eid,
+                k_row2,
+                lane,
+            )
+            out_acc3 = out_acc3 + scale_lane * self._fc2_packed_dot_row(
+                w2_base_addr,
+                w2s_base_addr,
+                intermediate,
+                token_inter_base,
+                Int32(kk),
+                eid,
+                k_row3,
+                lane,
+            )
+
+        sum_warp0 = cute.arch.warp_reduction_sum(out_acc0)
+        sum_warp1 = cute.arch.warp_reduction_sum(out_acc1)
+        sum_warp2 = cute.arch.warp_reduction_sum(out_acc2)
+        sum_warp3 = cute.arch.warp_reduction_sum(out_acc3)
+        if lane == Int32(0):
+            out_base = t * Int32(cfg.k_dim)
+            scatter_output[out_base + k_row0] = BFloat16(sum_warp0)
+            scatter_output[out_base + k_row1] = BFloat16(sum_warp1)
+            scatter_output[out_base + k_row2] = BFloat16(sum_warp2)
+            scatter_output[out_base + k_row3] = BFloat16(sum_warp3)
 
     @cute.jit
     def _m1_fc2_rowpair_narrow(
@@ -1122,8 +1452,8 @@ class MoEMicroKernelBackend:
                     phys_base = in_blk * Int32(_BLOCK_SIZE // 2) + pad_off
                     if cutlass.const_expr(self.w4a16_mode):
                         for i in cutlass.range_constexpr(_BLOCK_SIZE // 2):
-                            v0 = Float32(a_input[x_base + Int32(i * 2)])
-                            v1 = Float32(a_input[x_base + Int32(i * 2 + 1)])
+                            v0 = Float32(a_input[x_base + Int32(i)])
+                            v1 = Float32(a_input[x_base + Int32(i + _BLOCK_SIZE // 2)])
                             smem_xh[phys_base + Int32(i)] = pack_f32x2_to_f16x2(v0, v1)
                     else:
                         blk_peak = Float32(0.0)
@@ -1188,8 +1518,8 @@ class MoEMicroKernelBackend:
                         phys_base = in_blk * Int32(_BLOCK_SIZE // 2) + pad_off
                         if cutlass.const_expr(self.w4a16_mode):
                             for i in cutlass.range_constexpr(_BLOCK_SIZE // 2):
-                                v0 = Float32(a_input[x_base + Int32(i * 2)])
-                                v1 = Float32(a_input[x_base + Int32(i * 2 + 1)])
+                                v0 = Float32(a_input[x_base + Int32(i)])
+                                v1 = Float32(a_input[x_base + Int32(i + _BLOCK_SIZE // 2)])
                                 smem_xh[phys_base + Int32(i)] = pack_f32x2_to_f16x2(v0, v1)
                         else:
                             blk_peak = Float32(0.0)
@@ -1258,7 +1588,49 @@ class MoEMicroKernelBackend:
                 gate_byte_addr = w1_base_addr + ebase_w + Int64(row_g) * Int64(cfg.k_half) + thread_byte_off
                 col_blk_off = Int64(lane) * Int64((cfg.k_segments // 4) * 512)
 
-                if cutlass.const_expr(cfg.k_segments_aligned and cfg.k_segments == 8):
+                if cutlass.const_expr(self.w4a16_mode):
+                    partial_up = Float32(0.0)
+                    partial_gate = Float32(0.0)
+                    gate_row = i
+                    if cutlass.const_expr(self.is_gated):
+                        up_row = Int32(cfg.n) + i
+                    for seg in cutlass.range_constexpr(cfg.k_segments):
+                        scale_col = lane * Int32(cfg.k_segments) + Int32(seg)
+                        valid_seg = Int32(1) if scale_col < Int32(cfg.k_blocks) else Int32(0)
+                        xh_base = (
+                            xh_buf_base
+                            + scale_col * Int32(_BLOCK_SIZE // 2)
+                            + scale_col // Int32(8)
+                        )
+                        if valid_seg > Int32(0):
+                            if cutlass.const_expr(self.is_gated):
+                                partial_up = partial_up + self._packed_dot_hfma2_for_math(
+                                    w1_base_addr,
+                                    w1s_base_addr,
+                                    eid,
+                                    up_row,
+                                    scale_col,
+                                    smem_xh,
+                                    xh_base,
+                                    cfg.two_n,
+                                    cfg.w1_packed_words_per_expert,
+                                    cfg.two_n // _PACKED_TILE_N,
+                                    cfg.w1_packed_scale_bytes_per_expert,
+                                )
+                            partial_gate = partial_gate + self._packed_dot_hfma2_for_math(
+                                w1_base_addr,
+                                w1s_base_addr,
+                                eid,
+                                gate_row,
+                                scale_col,
+                                smem_xh,
+                                xh_base,
+                                cfg.two_n,
+                                cfg.w1_packed_words_per_expert,
+                                cfg.two_n // _PACKED_TILE_N,
+                                cfg.w1_packed_scale_bytes_per_expert,
+                            )
+                elif cutlass.const_expr(cfg.k_segments_aligned and cfg.k_segments == 8):
                     if cutlass.const_expr(self.is_gated):
                         uw_a0, uw_a1, uw_a2, uw_a3 = ld_global_nc_v4_u32(up_byte_addr)
                         uw_b0, uw_b1, uw_b2, uw_b3 = ld_global_nc_v4_u32(up_byte_addr + Int64(16))
@@ -1786,8 +2158,8 @@ class MoEMicroKernelBackend:
                         phys_base = in_blk * Int32(_BLOCK_SIZE // 2) + pad_off
                         if cutlass.const_expr(self.w4a16_mode):
                             for i in cutlass.range_constexpr(_BLOCK_SIZE // 2):
-                                v0 = Float32(a_input[x_base + Int32(i * 2)])
-                                v1 = Float32(a_input[x_base + Int32(i * 2 + 1)])
+                                v0 = Float32(a_input[x_base + Int32(i)])
+                                v1 = Float32(a_input[x_base + Int32(i + _BLOCK_SIZE // 2)])
                                 smem_xh[next_buf_base + phys_base + Int32(i)] = pack_f32x2_to_f16x2(v0, v1)
                         else:
                             blk_peak = Float32(0.0)
@@ -1851,18 +2223,14 @@ class MoEMicroKernelBackend:
                 mid_blk = tidx
                 if cutlass.const_expr(self.w4a16_mode):
                     for i in cutlass.range_constexpr(_BLOCK_SIZE // 2):
-                        v0 = smem_int[mid_blk * Int32(_BLOCK_SIZE) + Int32(i * 2)]
-                        v1 = smem_int[mid_blk * Int32(_BLOCK_SIZE) + Int32(i * 2 + 1)]
-                        half_base = chunk_idx * Int32(cfg.i_chunk // 2) + mid_blk * Int32(_BLOCK_SIZE // 2)
-                        n_blk = half_base // Int32(128)
-                        h_local = half_base - n_blk * Int32(128)
-                        h_i = h_local + Int32(i)
+                        v0 = smem_int[mid_blk * Int32(_BLOCK_SIZE) + Int32(i)]
+                        v1 = smem_int[mid_blk * Int32(_BLOCK_SIZE) + Int32(i + _BLOCK_SIZE // 2)]
+                        k16_tile = chunk_idx * Int32(cfg.i_chunk // _BLOCK_SIZE) + mid_blk
                         packed_idx = (
                             t * Int32(cfg.inter_u32) +
                             k_idx * Int32(cfg.fc2_n_chunks * 128) +
-                            n_blk * Int32(128) +
-                            (h_i % Int32(4)) * Int32(32) +
-                            (h_i // Int32(4))
+                            k16_tile * Int32(_BLOCK_SIZE // 2) +
+                            Int32(i)
                         )
                         intermediate[packed_idx] = pack_f32x2_to_f16x2(v0, v1)
                 else:
@@ -1931,7 +2299,12 @@ class MoEMicroKernelBackend:
             if cutlass.const_expr(self.m1_fc2_onepass):
                 fc2_task = Int32(bidx_x)
                 if fc2_task < fc2_chunks_m1:
-                    if cutlass.const_expr(cfg.fc2_n_chunks > 1):
+                    if cutlass.const_expr(self.w4a16_mode):
+                        self._fc2_packed_rowpair(
+                            fc2_task, warp_id, lane, w2_base_addr, w2s_base_addr,
+                            intermediate, w2_alphas, topk_ids, topk_weights, scatter_output,
+                        )
+                    elif cutlass.const_expr(cfg.fc2_n_chunks > 1):
                         self._m1_fc2_rowpair_wide(
                             fc2_task, warp_id, lane, w2_base_addr, w2s_base_addr,
                             intermediate, w2_alphas, topk_ids, topk_weights, scatter_output,
@@ -1944,7 +2317,12 @@ class MoEMicroKernelBackend:
             else:
                 fc2_task = Int32(bidx_x)
                 while fc2_task < fc2_chunks_m1:
-                    if cutlass.const_expr(cfg.fc2_n_chunks > 1):
+                    if cutlass.const_expr(self.w4a16_mode):
+                        self._fc2_packed_rowpair(
+                            fc2_task, warp_id, lane, w2_base_addr, w2s_base_addr,
+                            intermediate, w2_alphas, topk_ids, topk_weights, scatter_output,
+                        )
+                    elif cutlass.const_expr(cfg.fc2_n_chunks > 1):
                         self._m1_fc2_rowpair_wide(
                             fc2_task, warp_id, lane, w2_base_addr, w2s_base_addr,
                             intermediate, w2_alphas, topk_ids, topk_weights, scatter_output,
@@ -1965,7 +2343,12 @@ class MoEMicroKernelBackend:
             fc2_task = Int32(bidx_x)
             while fc2_task < fc2_task_count:
                 if cutlass.const_expr(self.w4a16_mode and cfg.fc2_n_chunks == 1):
-                    self._m2_fc2_rowpair_narrow(
+                    self._fc2_packed_rowpair(
+                        fc2_task, warp_id, lane, w2_base_addr, w2s_base_addr,
+                        intermediate, w2_alphas, topk_ids, topk_weights, scatter_output,
+                    )
+                elif cutlass.const_expr(self.w4a16_mode):
+                    self._fc2_packed_rowquad(
                         fc2_task, warp_id, lane, w2_base_addr, w2s_base_addr,
                         intermediate, w2_alphas, topk_ids, topk_weights, scatter_output,
                     )
@@ -2005,14 +2388,26 @@ class MoEMicroKernelBackend:
     ):
         cfg = self._cfg
         a_input = cute.make_tensor(x_ptr, cute.make_layout(Int32(m_val * cfg.k_dim)))
-        w1_weights = cute.make_tensor(w1_ptr, cute.make_layout(Int64(cfg.weight_E * cfg.two_n * cfg.k_half)))
-        w1_scales = cute.make_tensor(w1s_ptr, cute.make_layout(Int64(cfg.weight_E * cfg.w1_sf_rows * cfg.w1_sf_cols)))
+        w1_weights = cute.make_tensor(
+            w1_ptr,
+            cute.make_layout(Int64(cfg.weight_E * cfg.w1_packed_words_per_expert * 4)),
+        )
+        w1_scales = cute.make_tensor(
+            w1s_ptr,
+            cute.make_layout(Int64(cfg.weight_E * cfg.w1_packed_scale_bytes_per_expert)),
+        )
         w1_alphas = cute.make_tensor(w1a_ptr, cute.make_layout(Int32(cfg.weight_E)))
         input_gs = cute.make_tensor(a1_ptr, cute.make_layout(Int32(cfg.weight_E)))
         down_input_scale = cute.make_tensor(a2_ptr, cute.make_layout(Int32(cfg.weight_E)))
         intermediate = cute.make_tensor(inter_ptr, cute.make_layout(Int32(m_val * cfg.inter_u32)))
-        w2_weights = cute.make_tensor(w2_ptr, cute.make_layout(Int64(cfg.weight_E * cfg.k_dim * cfg.n_half)))
-        w2_scales = cute.make_tensor(w2s_ptr, cute.make_layout(Int64(cfg.weight_E * cfg.w2_sf_rows * cfg.w2_sf_cols)))
+        w2_weights = cute.make_tensor(
+            w2_ptr,
+            cute.make_layout(Int64(cfg.weight_E * cfg.w2_packed_words_per_expert * 4)),
+        )
+        w2_scales = cute.make_tensor(
+            w2s_ptr,
+            cute.make_layout(Int64(cfg.weight_E * cfg.w2_packed_scale_bytes_per_expert)),
+        )
         w2_alphas = cute.make_tensor(w2a_ptr, cute.make_layout(Int32(cfg.weight_E)))
         topk_ids_tensor = cute.make_tensor(tid_ptr, cute.make_layout(Int32(m_val * cfg.num_topk)))
         topk_weights_tensor = cute.make_tensor(tw_ptr, cute.make_layout(Int32(m_val * cfg.num_topk)))
