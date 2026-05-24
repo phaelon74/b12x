@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Iterable, Sequence
 
 import torch
 import triton
@@ -296,11 +296,47 @@ def block_fp8_linear_mxfp8(
     return output.view(*source.shape[:-1], packed_weight.out_features)
 
 
+def prewarm_block_fp8_linear_mxfp8(
+    packed_weight: BlockFP8LinearWeight,
+    token_counts: Iterable[int],
+    *,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> None:
+    """Compile and warm the native block-FP8 linear kernels for planned M values."""
+
+    if not isinstance(packed_weight, BlockFP8LinearWeight):
+        raise TypeError("packed_weight must be a BlockFP8LinearWeight")
+    if output_dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"output_dtype must be bf16/fp16, got {output_dtype}")
+    device = packed_weight.weight.values.device
+    counts = sorted({int(tokens) for tokens in token_counts if int(tokens) > 0})
+    if not counts:
+        return
+
+    with torch.inference_mode():
+        for tokens in counts:
+            workspace = empty_block_fp8_linear_workspace(
+                tokens,
+                packed_weight.in_features,
+                packed_weight.out_features,
+                device=device,
+                output_dtype=output_dtype,
+            )
+            source = torch.zeros(
+                (tokens, packed_weight.in_features),
+                dtype=output_dtype,
+                device=device,
+            )
+            block_fp8_linear_mxfp8(source, packed_weight, workspace=workspace)
+        torch.cuda.synchronize(device)
+
+
 __all__ = [
     "BlockFP8LinearWeight",
     "BlockFP8LinearWorkspace",
     "block_fp8_linear_mxfp8",
     "empty_block_fp8_linear_workspace",
     "pack_block_fp8_linear_weight_mxfp8",
+    "prewarm_block_fp8_linear_mxfp8",
     "quantize_block_fp8_linear_input_mxfp8",
 ]

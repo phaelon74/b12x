@@ -5,6 +5,7 @@ from .block_fp8_linear import (
     block_fp8_linear_mxfp8,
     empty_block_fp8_linear_workspace,
     pack_block_fp8_linear_weight_mxfp8,
+    prewarm_block_fp8_linear_mxfp8,
     quantize_block_fp8_linear_input_mxfp8,
 )
 from .wo_projection import (
@@ -45,6 +46,7 @@ __all__ = [
     "pack_fp8_block_scaled_weight_mxfp8",
     "pack_mxfp8_scales_for_dense_gemm",
     "pack_wo_projection_fp8_block_scaled_weights_mxfp8",
+    "prewarm_block_fp8_linear_mxfp8",
     "quantize_block_fp8_linear_input_mxfp8",
     "quantize_mxfp8_rows_torch",
     "quantize_wo_a_input_mxfp8",

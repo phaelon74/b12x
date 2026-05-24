@@ -21,8 +21,6 @@ from b12x.integration.mla import (
     COMPRESSED_MLA_C128_PAGE_SIZE,
     COMPRESSED_MLA_C4_PAGE_SIZE,
     COMPRESSED_MLA_HEAD_DIM,
-    COMPRESSED_MLA_INDEX_TOPK,
-    COMPRESSED_MLA_LOCAL_Q_HEADS_TP2,
     COMPRESSED_MLA_NOPE_DIM,
     COMPRESSED_MLA_ROPE_DIM,
     COMPRESSED_MLA_SWA_PAGE_SIZE,
@@ -48,6 +46,8 @@ _ALGORITHM_COS_TOL = 0.995
 _DECODE_TARGET_US = 25.0
 _PREFILL4096_TARGET_US = 2_000.0
 _PAGE_INDEX_ALIGNMENT = 64
+_DEFAULT_NUM_Q_HEADS = 32
+_DEFAULT_INDEX_TOPK = 512
 
 
 @dataclass(frozen=True)
@@ -122,7 +122,7 @@ def _derive_dsv4_compressed_mla_profile(
     c128_pool_size: int | None = None,
 ) -> DSV4CompressedMLAProfile:
     sliding_window = int(config.get("sliding_window", COMPRESSED_MLA_SWA_TOKENS))
-    c4_topk = int(config.get("index_topk", COMPRESSED_MLA_INDEX_TOPK))
+    c4_topk = int(config.get("index_topk", _DEFAULT_INDEX_TOPK))
     max_positions = int(config.get("max_position_embeddings", 0))
     compress_ratios_raw = config.get("compress_ratios", ())
     if compress_ratios_raw is None:
@@ -175,8 +175,8 @@ def _parse_cases(
     raw: str,
     rows: list[int],
     *,
-    c4_indexed_width: int = COMPRESSED_MLA_INDEX_TOPK,
-    c128_indexed_width: int = COMPRESSED_MLA_INDEX_TOPK,
+    c4_indexed_width: int = _DEFAULT_INDEX_TOPK,
+    c128_indexed_width: int = _DEFAULT_INDEX_TOPK,
 ) -> list[BenchmarkCase]:
     names = [part.strip().lower() for part in raw.split(",") if part.strip()]
     if not names or names == ["all"]:
@@ -259,7 +259,7 @@ def _resolve_case_widths(args: argparse.Namespace) -> tuple[int, int]:
         c4_indexed_width = (
             profile.c4_indexed_width
             if profile is not None and profile.c4_indexed_width
-            else COMPRESSED_MLA_INDEX_TOPK
+            else _DEFAULT_INDEX_TOPK
         )
 
     c128_indexed_width = args.c128_indexed_width
@@ -267,7 +267,7 @@ def _resolve_case_widths(args: argparse.Namespace) -> tuple[int, int]:
         c128_indexed_width = (
             profile.c128_indexed_width
             if profile is not None and profile.c128_indexed_width
-            else COMPRESSED_MLA_INDEX_TOPK
+            else _DEFAULT_INDEX_TOPK
         )
 
     if c4_indexed_width <= 0 or c128_indexed_width <= 0:
@@ -284,11 +284,11 @@ def _planned_split_chunks(case: BenchmarkCase) -> int:
     )
 
 
-def _make_q(*, rows: int, seed: int, device: torch.device) -> torch.Tensor:
+def _make_q(*, rows: int, num_q_heads: int, seed: int, device: torch.device) -> torch.Tensor:
     gen = torch.Generator(device=device)
     gen.manual_seed(seed)
     q = torch.randn(
-        (rows, COMPRESSED_MLA_LOCAL_Q_HEADS_TP2, COMPRESSED_MLA_HEAD_DIM),
+        (rows, num_q_heads, COMPRESSED_MLA_HEAD_DIM),
         generator=gen,
         dtype=torch.float32,
         device=device,
@@ -350,6 +350,7 @@ def _make_indices(
 def _make_workspace(
     *,
     case: BenchmarkCase,
+    num_q_heads: int,
     device: torch.device,
 ) -> B12XAttentionWorkspace:
     return B12XAttentionWorkspace.for_contract(
@@ -357,7 +358,7 @@ def _make_workspace(
         device=device,
         dtype=torch.bfloat16,
         kv_dtype=torch.uint8,
-        num_q_heads=COMPRESSED_MLA_LOCAL_Q_HEADS_TP2,
+        num_q_heads=num_q_heads,
         head_dim=COMPRESSED_MLA_HEAD_DIM,
         v_head_dim=COMPRESSED_MLA_HEAD_DIM,
         topk=max(1, case.topk),
@@ -431,9 +432,10 @@ def _benchmark_case(
     replays: int,
     l2_flush,
     verify: bool,
+    num_q_heads: int,
 ) -> CaseReport:
     clear_mla_caches()
-    q = _make_q(rows=case.rows, seed=seed, device=device)
+    q = _make_q(rows=case.rows, num_q_heads=num_q_heads, seed=seed, device=device)
 
     swa_tokens = max(case.swa_width, 1)
     swa_cache = _make_compressed_cache(
@@ -467,6 +469,7 @@ def _benchmark_case(
 
     workspace = _make_workspace(
         case=case,
+        num_q_heads=num_q_heads,
         device=device,
     )
 
@@ -550,6 +553,7 @@ def collect_case_reports(args: argparse.Namespace, *, device: torch.device | Non
                 replays=args.replays,
                 l2_flush=l2_flush,
                 verify=not args.skip_verify,
+                num_q_heads=args.num_q_heads,
             )
         )
     return reports
@@ -655,6 +659,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="deprecated; compressed-layout algorithm verification is the default unless --skip-verify is set",
     )
+    parser.add_argument(
+        "--num-q-heads",
+        type=int,
+        default=_DEFAULT_NUM_Q_HEADS,
+        help="local query-head count to benchmark; default is the synthetic 32-head profile",
+    )
     return parser.parse_args(argv)
 
 
@@ -670,6 +680,8 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--c4-indexed-width must be positive")
     if args.c128_indexed_width is not None and args.c128_indexed_width <= 0:
         raise SystemExit("--c128-indexed-width must be positive")
+    if args.num_q_heads <= 0:
+        raise SystemExit("--num-q-heads must be positive")
     try:
         _resolve_case_widths(args)
     except (OSError, ValueError) as exc:

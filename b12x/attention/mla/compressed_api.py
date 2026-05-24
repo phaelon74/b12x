@@ -14,7 +14,6 @@ from .api import (
 )
 from .compressed_reference import (
     COMPRESSED_MLA_HEAD_DIM,
-    COMPRESSED_MLA_LOCAL_Q_HEADS_TP2,
     COMPRESSED_MLA_SWA_PAGE_SIZE,
     compressed_mla_page_nbytes,
 )
@@ -108,7 +107,7 @@ def compressed_mla_decode_forward(
     indexed_page_size: int | None = None,
     indexed_page_table: torch.Tensor | None = None,
     attn_sink: torch.Tensor | None = None,
-    expected_num_q_heads: int | None = COMPRESSED_MLA_LOCAL_Q_HEADS_TP2,
+    expected_num_q_heads: int | None = None,
     return_lse: bool = False,
     lse_scale: Literal["base2", "natural"] = "base2",
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -121,7 +120,7 @@ def compressed_mla_decode_forward(
     rows, heads, _ = q3.shape
     if expected_num_q_heads is not None and heads != int(expected_num_q_heads):
         raise ValueError(
-            f"q_all local heads must be {int(expected_num_q_heads)} for this contract, got {heads}"
+            f"q_all local heads must match expected_num_q_heads={int(expected_num_q_heads)}, got {heads}"
         )
 
     if attn_sink is not None:

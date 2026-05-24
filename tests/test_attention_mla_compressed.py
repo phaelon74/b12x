@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import math
 
 import torch
@@ -96,6 +97,11 @@ def test_compressed_mla_page_byte_widths_match_padded_layout() -> None:
     assert compressed_mla_page_nbytes(COMPRESSED_MLA_SWA_PAGE_SIZE) == 74880
     assert compressed_mla_page_nbytes(COMPRESSED_MLA_C4_PAGE_SIZE) == 37440
     assert compressed_mla_page_nbytes(COMPRESSED_MLA_C128_PAGE_SIZE) == 1728
+
+
+def test_compressed_mla_decode_does_not_pin_flash_tp2_heads_by_default() -> None:
+    signature = inspect.signature(compressed_mla_decode_forward)
+    assert signature.parameters["expected_num_q_heads"].default is None
 
 
 def test_compressed_mla_arena_scratch_uses_contract_q_chunks() -> None:

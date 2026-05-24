@@ -111,6 +111,12 @@ def test_parse_cases_accepts_distinct_c4_and_c128_widths() -> None:
     assert benchmark_compressed_mla._planned_split_chunks(cases[1]) == 192
 
 
+def test_parse_args_accepts_non_flash_local_q_heads() -> None:
+    args = benchmark_compressed_mla._parse_args(["--num-q-heads", "16"])
+
+    assert args.num_q_heads == 16
+
+
 def test_model_config_derives_live_dsv4_selected_widths() -> None:
     profile = benchmark_compressed_mla._derive_dsv4_compressed_mla_profile(
         {
