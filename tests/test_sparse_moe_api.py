@@ -18,7 +18,7 @@ def _make_experts(
     hidden_size: int,
     num_experts: int = 3,
     *,
-    source_format: str = "modelopt",
+    source_format: str = "modelopt_nvfp4",
 ) -> B12XFP4ExpertWeights:
     return B12XFP4ExpertWeights(
         a1_gscale=torch.ones(num_experts, dtype=torch.float32),
@@ -137,7 +137,7 @@ def test_sparse_moe_fp4_accepts_precomputed_router_logits() -> None:
         fast_math=None,
         activation="silu",
         quant_mode="nvfp4",
-        source_format="modelopt",
+        source_format="modelopt_nvfp4",
     ):
         del a1_gscale, w1_fp4, w1_blockscale, w1_alphas
         del a2_gscale, w2_fp4, w2_blockscale, w2_alphas
@@ -178,7 +178,7 @@ def test_sparse_moe_fp4_accepts_precomputed_router_logits() -> None:
 
 def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
     hidden_states = torch.randn(2, 4)
-    experts = _make_experts(hidden_size=4, source_format="compressed-tensors")
+    experts = _make_experts(hidden_size=4, source_format="compressed_tensors")
     workspace = object()
     routing = B12XTopKRouting(
         topk_weights=torch.ones(2, 2, dtype=torch.float32),
@@ -194,7 +194,7 @@ def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
         fast_math=None,
         activation="silu",
         quant_mode="nvfp4",
-        source_format="modelopt",
+        source_format="modelopt_nvfp4",
     ):
         del args
         captured["workspace"] = workspace
@@ -235,10 +235,10 @@ def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
     }
 
 
-def test_fp4_expert_weights_default_to_modelopt_source_format() -> None:
+def test_fp4_expert_weights_default_to_modelopt_nvfp4_source_format() -> None:
     experts = _make_experts(hidden_size=4)
 
-    assert experts.source_format == "modelopt"
+    assert experts.source_format == "modelopt_nvfp4"
 
 
 def test_moe_fp4_rejects_compressed_tensors_with_nvfp4() -> None:
@@ -262,20 +262,20 @@ def test_moe_fp4_rejects_compressed_tensors_with_nvfp4() -> None:
             topk_ids,
             workspace=object(),
             quant_mode="nvfp4",
-            source_format="compressed-tensors",
+            source_format="compressed_tensors",
         )
     except ValueError as exc:
         message = str(exc)
         assert "source_format='compressed_tensors'" in message
         assert "quant_mode='w4a16'" in message
-        assert "source_format='modelopt'" in message
+        assert "source_format='modelopt_nvfp4'" in message
     else:
-        raise AssertionError("expected compressed-tensors NVFP4 validation to fire")
+        raise AssertionError("expected compressed_tensors NVFP4 validation to fire")
 
 
 def test_sparse_moe_fp4_rejects_compressed_tensors_with_nvfp4() -> None:
     hidden_states = torch.randn(2, 4)
-    experts = _make_experts(hidden_size=4, source_format="compressed-tensors")
+    experts = _make_experts(hidden_size=4, source_format="compressed_tensors")
     routing = B12XTopKRouting(
         topk_weights=torch.ones(2, 1, dtype=torch.float32),
         topk_ids=torch.zeros(2, 1, dtype=torch.int64),
@@ -293,9 +293,9 @@ def test_sparse_moe_fp4_rejects_compressed_tensors_with_nvfp4() -> None:
         message = str(exc)
         assert "source_format='compressed_tensors'" in message
         assert "quant_mode='w4a16'" in message
-        assert "source_format='modelopt'" in message
+        assert "source_format='modelopt_nvfp4'" in message
     else:
-        raise AssertionError("expected compressed-tensors NVFP4 validation to fire")
+        raise AssertionError("expected compressed_tensors NVFP4 validation to fire")
 
 
 def test_moe_fp4_rejects_false_deprecated_reciprocal_flag() -> None:
@@ -369,7 +369,7 @@ def test_sparse_moe_fp4_env_defaults_to_w4a16(monkeypatch) -> None:
         fast_math=None,
         activation="silu",
         quant_mode=None,
-        source_format="modelopt",
+        source_format="modelopt_nvfp4",
     ):
         del args, workspace, output
         del input_scales_static, fast_math, activation, source_format

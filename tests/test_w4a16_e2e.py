@@ -14,8 +14,7 @@ from b12x.moe.fused.w4a16.kernel import (
 )
 from b12x.moe.fused.w4a16.prepare import (
     make_w4a16_packed_buffers as make_w4a16_buffers,
-    prepare_w4a16_modelopt_weights,
-    prepare_w4a16_packed_weights as prepare_w4a16_weights,
+    prepare_w4a16_modelopt_nvfp4_weights as prepare_w4a16_weights,
 )
 from tests.w4a16_reference import compare_to_reference, moe_reference_w4a16
 
@@ -72,14 +71,8 @@ def _run_w4a16(
     activation: str,
     expert_map: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
-    weight_layout: str = "packed",
 ) -> torch.Tensor:
-    prepare_weights = (
-        prepare_w4a16_modelopt_weights
-        if weight_layout == "modelopt"
-        else prepare_w4a16_weights
-    )
-    prepared = prepare_weights(
+    prepared = prepare_w4a16_weights(
         w13,
         w13_blockscale,
         w13_global_scale,
@@ -211,7 +204,7 @@ def test_w4a16_moe_matches_oracle(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("activation", ["relu2", "silu"])
-def test_w4a16_modelopt_layout_moe_matches_oracle(
+def test_w4a16_modelopt_nvfp4_prepare_moe_matches_oracle(
     activation: str,
 ) -> None:
     torch.manual_seed(20260523 + (1000 if activation == "silu" else 0))
@@ -233,7 +226,6 @@ def test_w4a16_modelopt_layout_moe_matches_oracle(
         topk_ids,
         topk_weights,
         activation=activation,
-        weight_layout="modelopt",
     )
     expected = _reference_w4a16(
         x,
@@ -249,7 +241,7 @@ def test_w4a16_modelopt_layout_moe_matches_oracle(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("activation", ["relu2", "silu"])
-def test_tp_moe_w4a16_modelopt_uses_normal_nvfp4_scale_contract(
+def test_tp_moe_w4a16_modelopt_nvfp4_uses_normal_nvfp4_scale_contract(
     activation: str,
 ) -> None:
     torch.manual_seed(20260524 + (1000 if activation == "silu" else 0))
@@ -291,7 +283,7 @@ def test_tp_moe_w4a16_modelopt_uses_normal_nvfp4_scale_contract(
         output=output,
         activation=activation,
         quant_mode="w4a16",
-        source_format="modelopt",
+        source_format="modelopt_nvfp4",
     )
     expected = _reference_w4a16(
         x,

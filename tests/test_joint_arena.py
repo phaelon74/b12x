@@ -353,7 +353,7 @@ def test_w4a16_joint_arena_materializes_planned_workspace(
         )
 
 
-def test_w4a16_preplanned_launches_are_weight_layout_specific() -> None:
+def test_w4a16_preplanned_launches_use_packed_layout() -> None:
     empty = torch.empty(0)
     workspace = tp_moe.TPW4A16Workspace(
         implementation="w4a16",
@@ -378,17 +378,11 @@ def test_w4a16_preplanned_launches_are_weight_layout_specific() -> None:
         expert_offsets=empty,
         planned_token_counts=frozenset({4}),
         planned_fused_moe_launches={
-            ("modelopt", 4): "modelopt-launch",
             ("packed", 4): "packed-launch",
         },
         planned_topk_sum_launches={4: "topk-sum"},
     )
 
-    assert tp_moe._w4a16_preplanned_launches(
-        workspace,
-        token_count=4,
-        weight_layout="modelopt",
-    ) == ("modelopt-launch", "topk-sum")
     assert tp_moe._w4a16_preplanned_launches(
         workspace,
         token_count=4,
@@ -502,7 +496,7 @@ def test_joint_arena_materializes_mixed_moe_quant_modes(
     def _fake_w4a16_prewarm(workspace, *, token_counts, **_kwargs) -> None:
         counts = tuple(int(token_count) for token_count in token_counts)
         workspace.planned_fused_moe_launches = {
-            ("modelopt", token_count): object() for token_count in counts
+            ("packed", token_count): object() for token_count in counts
         }
         workspace.planned_topk_sum_launches = {
             token_count: object() for token_count in counts

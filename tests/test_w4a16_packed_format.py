@@ -5,12 +5,14 @@ import torch
 
 from b12x.cute.fp4 import swizzle_block_scale
 from b12x.integration.tp_moe import (
-    prepare_b12x_w4a16_modelopt_weights,
+    prepare_b12x_w4a16_modelopt_nvfp4_weights,
     prepare_b12x_w4a16_packed_weights,
 )
 from b12x.moe.fused.w4a16.prepare import (
-    prepare_w4a16_modelopt_weights,
-    prepare_w4a16_packed_weights as prepare_w4a16_weights,
+    prepare_w4a16_compressed_tensors_weights,
+    prepare_w4a16_modelopt_nvfp4_weights as prepare_w4a16_weights,
+    prepare_w4a16_mxfp4_native_weights,
+    prepare_w4a16_packed_weights,
 )
 
 
@@ -96,7 +98,7 @@ def test_packed_weight_preparation_shapes_and_dtypes(
     assert prepared.w2_global_scale.dtype == torch.float32
     assert prepared.workspace.dtype == torch.int32
     assert prepared.params_dtype == params_dtype
-    assert prepared.source_format == "modelopt"
+    assert prepared.source_format == "modelopt_nvfp4"
     assert prepared.w13.is_contiguous()
     assert prepared.w2.is_contiguous()
     assert prepared.w13_scale.is_contiguous()
@@ -106,7 +108,7 @@ def test_packed_weight_preparation_shapes_and_dtypes(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("activation", ["relu2", "silu"])
 @pytest.mark.parametrize("params_dtype", [torch.bfloat16, torch.float16])
-def test_modelopt_weight_preparation_preserves_weight_storage(
+def test_modelopt_nvfp4_preparation_packs_runtime_weights(
     activation: str,
     params_dtype: torch.dtype,
 ) -> None:
@@ -121,17 +123,7 @@ def test_modelopt_weight_preparation_preserves_weight_storage(
     w13_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(torch.float32)
     w2_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(torch.float32)
 
-    expected = prepare_w4a16_weights(
-        w13.clone(),
-        w13_blockscale,
-        w13_global_scale,
-        w2.clone(),
-        w2_blockscale,
-        w2_global_scale,
-        activation=activation,
-        params_dtype=params_dtype,
-    )
-    actual = prepare_w4a16_modelopt_weights(
+    actual = prepare_w4a16_weights(
         w13,
         w13_blockscale,
         w13_global_scale,
@@ -142,24 +134,20 @@ def test_modelopt_weight_preparation_preserves_weight_storage(
         params_dtype=params_dtype,
     )
 
-    assert actual.weight_layout == "modelopt"
-    assert actual.w13.data_ptr() == w13.data_ptr()
-    assert actual.w2.data_ptr() == w2.data_ptr()
-    assert actual.w13.shape == w13.shape
-    assert actual.w2.shape == w2.shape
+    assert actual.weight_layout == "packed"
+    assert actual.source_format == "modelopt_nvfp4"
+    assert actual.w13.dtype == torch.int32
+    assert actual.w2.dtype == torch.int32
+    assert actual.w13.data_ptr() != w13.data_ptr()
+    assert actual.w2.data_ptr() != w2.data_ptr()
+    assert actual.w13.shape != w13.shape
+    assert actual.w2.shape != w2.shape
     assert actual.w13_scale.dtype == torch.float8_e4m3fn
     assert actual.w2_scale.dtype == torch.float8_e4m3fn
-    for name in (
-        "w13_scale",
-        "w13_global_scale",
-        "w2_scale",
-        "w2_global_scale",
-    ):
-        assert torch.equal(getattr(actual, name), getattr(expected, name)), name
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_modelopt_weight_preparation_rejects_compressed_tensors_source() -> None:
+def test_legacy_modelopt_source_format_is_not_accepted() -> None:
     torch.manual_seed(20260523)
     experts = 3
     w13, w13_blockscale, w2, w2_blockscale = _make_case(
@@ -169,8 +157,8 @@ def test_modelopt_weight_preparation_rejects_compressed_tensors_source() -> None
     w13_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(torch.float32)
     w2_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(torch.float32)
 
-    with pytest.raises(ValueError, match="source_format='modelopt'"):
-        prepare_w4a16_modelopt_weights(
+    with pytest.raises(ValueError, match="modelopt_nvfp4"):
+        prepare_w4a16_packed_weights(
             w13,
             w13_blockscale,
             w13_global_scale,
@@ -178,14 +166,14 @@ def test_modelopt_weight_preparation_rejects_compressed_tensors_source() -> None
             w2_blockscale,
             w2_global_scale,
             activation="relu2",
-            source_format="compressed_tensors",
+            source_format="modelopt",
         )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("activation", ["relu2", "silu"])
 @pytest.mark.parametrize("params_dtype", [torch.bfloat16, torch.float16])
-def test_packed_compressed_tensors_source_matches_reciprocal_modelopt_contract(
+def test_compressed_tensors_source_matches_reciprocal_modelopt_nvfp4_contract(
     activation: str,
     params_dtype: torch.dtype,
 ) -> None:
@@ -211,9 +199,8 @@ def test_packed_compressed_tensors_source_matches_reciprocal_modelopt_contract(
         (1.0 / w2_weight_global_scale).to(torch.float32),
         activation=activation,
         params_dtype=params_dtype,
-        source_format="modelopt",
     )
-    compressed_tensors = prepare_w4a16_weights(
+    compressed_tensors = prepare_w4a16_compressed_tensors_weights(
         w13,
         w13_blockscale,
         w13_weight_global_scale,
@@ -222,7 +209,6 @@ def test_packed_compressed_tensors_source_matches_reciprocal_modelopt_contract(
         w2_weight_global_scale,
         activation=activation,
         params_dtype=params_dtype,
-        source_format="compressed_tensors",
     )
 
     for name in (
@@ -234,6 +220,63 @@ def test_packed_compressed_tensors_source_matches_reciprocal_modelopt_contract(
         "w2_global_scale",
     ):
         assert torch.equal(getattr(modelopt, name), getattr(compressed_tensors, name)), name
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("activation", ["relu2", "silu"])
+@pytest.mark.parametrize("params_dtype", [torch.bfloat16, torch.float16])
+def test_mxfp4_native_scales_expand_to_w4a16_scale_grid(
+    activation: str,
+    params_dtype: torch.dtype,
+) -> None:
+    torch.manual_seed(20260524)
+    experts, hidden_size, intermediate_size = 3, 128, 128
+    w13_rows = intermediate_size * (2 if activation == "silu" else 1)
+    w13, _, w2, _ = _make_case(
+        experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+    )
+    w13_native_scale = _positive_fp8((experts, w13_rows, hidden_size // 32))
+    w2_native_scale = _positive_fp8((experts, hidden_size, intermediate_size // 32))
+    w13_blockscale = swizzle_block_scale(w13_native_scale.repeat_interleave(2, dim=2))
+    w2_blockscale = swizzle_block_scale(w2_native_scale.repeat_interleave(2, dim=2))
+    w13_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(torch.float32)
+    w2_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(torch.float32)
+
+    expected = prepare_w4a16_weights(
+        w13,
+        w13_blockscale,
+        w13_global_scale,
+        w2,
+        w2_blockscale,
+        w2_global_scale,
+        activation=activation,
+        params_dtype=params_dtype,
+    )
+    actual = prepare_w4a16_mxfp4_native_weights(
+        w13,
+        w13_native_scale,
+        w13_global_scale,
+        w2,
+        w2_native_scale,
+        w2_global_scale,
+        activation=activation,
+        params_dtype=params_dtype,
+    )
+
+    assert actual.source_format == "mxfp4_native"
+    assert actual.weight_layout == "packed"
+    for name in (
+        "w13",
+        "w13_scale",
+        "w13_global_scale",
+        "w2",
+        "w2_scale",
+        "w2_global_scale",
+    ):
+        assert torch.equal(getattr(actual, name), getattr(expected, name)), name
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -342,7 +385,7 @@ def test_integration_packed_preparation_uses_default_a16_alpha_contract(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("activation", ["relu2", "silu"])
-def test_integration_modelopt_preparation_converts_fused_nvfp4_alphas(
+def test_integration_modelopt_nvfp4_preparation_converts_fused_nvfp4_alphas(
     activation: str,
 ) -> None:
     torch.manual_seed(20260523)
@@ -362,7 +405,7 @@ def test_integration_modelopt_preparation_converts_fused_nvfp4_alphas(
     a1_gscale = (torch.rand(experts, device="cuda") * 0.5 + 0.75).to(torch.float32)
     a2_gscale = (torch.rand(experts, device="cuda") * 0.5 + 0.75).to(torch.float32)
 
-    expected = prepare_w4a16_modelopt_weights(
+    expected = prepare_w4a16_weights(
         w13,
         w13_blockscale,
         fused_w13_alphas * a1_gscale,
@@ -371,7 +414,7 @@ def test_integration_modelopt_preparation_converts_fused_nvfp4_alphas(
         fused_w2_alphas * a2_gscale,
         activation=activation,
     )
-    actual = prepare_b12x_w4a16_modelopt_weights(
+    actual = prepare_b12x_w4a16_modelopt_nvfp4_weights(
         w13,
         w13_blockscale,
         fused_w13_alphas,
@@ -384,12 +427,13 @@ def test_integration_modelopt_preparation_converts_fused_nvfp4_alphas(
         params_dtype=torch.bfloat16,
     )
 
-    assert actual.weight_layout == "modelopt"
-    assert actual.w13.data_ptr() == w13.data_ptr()
-    assert actual.w2.data_ptr() == w2.data_ptr()
+    assert actual.weight_layout == "packed"
+    assert actual.source_format == "modelopt_nvfp4"
     for name in (
+        "w13",
         "w13_scale",
         "w13_global_scale",
+        "w2",
         "w2_scale",
         "w2_global_scale",
     ):

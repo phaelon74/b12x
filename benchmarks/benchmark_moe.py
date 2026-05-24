@@ -424,7 +424,7 @@ class ExpertWeights:
     g2_alphas: torch.Tensor
     g1_alphas_per_expert: torch.Tensor
     g2_alphas_per_expert: torch.Tensor
-    source_format: str = "modelopt"
+    source_format: str = "modelopt_nvfp4"
     w4a16_w13_global_scale: torch.Tensor | None = None
     w4a16_w2_global_scale: torch.Tensor | None = None
 
@@ -596,7 +596,7 @@ def load_expert_weights(
     E = spec.num_experts
     K = spec.hidden_size
     I_tp = spec.I_tp
-    source_format = "modelopt"
+    source_format = "modelopt_nvfp4"
     w4a16_w13_global_scale = None
     w4a16_w2_global_scale = None
     if checkpoint_family in {"nano35_w4a16_shape", "dsv4f_shape"}:

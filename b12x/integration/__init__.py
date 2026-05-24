@@ -94,7 +94,7 @@ from .tp_moe import (
     b12x_route_experts_fast,
     b12x_sparse_moe_fp4,
     plan_tp_moe_arena_layout,
-    prepare_b12x_w4a16_modelopt_weights,
+    prepare_b12x_w4a16_modelopt_nvfp4_weights,
     prepare_b12x_w4a16_packed_weights,
 )
 
@@ -182,6 +182,6 @@ __all__ = [
     "b12x_route_experts_fast",
     "b12x_sparse_moe_fp4",
     "plan_tp_moe_arena_layout",
-    "prepare_b12x_w4a16_modelopt_weights",
+    "prepare_b12x_w4a16_modelopt_nvfp4_weights",
     "prepare_b12x_w4a16_packed_weights",
 ]

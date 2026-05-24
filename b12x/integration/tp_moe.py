@@ -49,10 +49,9 @@ _LEVEL_TILE_N = 128
 _DYNAMIC_SLICE_CHUNK = 1
 _MOE_FORCE_A16_ENV = "B12X_MOE_FORCE_A16"
 _FP4_SOURCE_FORMATS = {
-    "modelopt": "modelopt",
+    "modelopt_nvfp4": "modelopt_nvfp4",
+    "mxfp4_native": "mxfp4_native",
     "compressed_tensors": "compressed_tensors",
-    "compressed-tensors": "compressed_tensors",
-    "ct": "compressed_tensors",
 }
 
 
@@ -216,7 +215,7 @@ class B12XFP4ExpertWeights:
     w2_fp4: torch.Tensor
     w2_blockscale: torch.Tensor
     w2_alphas: torch.Tensor
-    source_format: str = "modelopt"
+    source_format: str = "modelopt_nvfp4"
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -523,7 +522,8 @@ def _normalize_fp4_source_format(source_format: str) -> str:
         return _FP4_SOURCE_FORMATS[source_format.lower()]
     except KeyError as exc:
         raise ValueError(
-            "source_format must be one of 'modelopt' or 'compressed_tensors', "
+            "source_format must be one of 'modelopt_nvfp4', "
+            "'mxfp4_native', or 'compressed_tensors', "
             f"got {source_format!r}"
         ) from exc
 
@@ -531,11 +531,11 @@ def _normalize_fp4_source_format(source_format: str) -> str:
 def _validate_fp4_source_format_for_quant_mode(
     *, source_format: str, quant_mode: str
 ) -> None:
-    if source_format == "compressed_tensors" and quant_mode != "w4a16":
+    if source_format != "modelopt_nvfp4" and quant_mode != "w4a16":
         raise ValueError(
-            "source_format='compressed_tensors' is only supported with "
+            f"source_format={source_format!r} is only supported with "
             "quant_mode='w4a16'; the NVFP4 kernels currently support only "
-            "source_format='modelopt'"
+            "source_format='modelopt_nvfp4'"
         )
 
 
@@ -583,7 +583,6 @@ def _dynamic_tile_m(quant_mode: str = "nvfp4") -> int:
 
 _WEIGHT_CACHE: Dict[Tuple[int, int, int], _WeightViews] = {}
 _W4A16_PACKED_WEIGHT_CACHE: Dict[Tuple[object, ...], object] = {}
-_W4A16_MODEL_OPT_WEIGHT_CACHE: Dict[Tuple[object, ...], object] = {}
 _MICRO_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 _STATIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 _DYNAMIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
@@ -648,7 +647,6 @@ def clear_tp_moe_caches() -> None:
     global _DYNAMIC_DOWN_SCALE_CACHE
     _WEIGHT_CACHE.clear()
     _W4A16_PACKED_WEIGHT_CACHE.clear()
-    _W4A16_MODEL_OPT_WEIGHT_CACHE.clear()
     clear_w4a16_kernel_cache()
     _MICRO_KERNEL_CACHE.clear()
     _STATIC_KERNEL_CACHE.clear()
@@ -1690,10 +1688,14 @@ def _get_w4a16_packed_weights(
     *,
     activation: str,
     params_dtype: torch.dtype,
-    source_format: str = "modelopt",
+    source_format: str = "modelopt_nvfp4",
     reuse_input_storage: bool = False,
 ):
-    from b12x.moe.fused.w4a16.prepare import prepare_w4a16_packed_weights
+    from b12x.moe.fused.w4a16.prepare import (
+        prepare_w4a16_compressed_tensors_weights,
+        prepare_w4a16_modelopt_nvfp4_weights,
+        prepare_w4a16_mxfp4_native_weights,
+    )
 
     source_format = _normalize_fp4_source_format(source_format)
     key = (
@@ -1711,7 +1713,15 @@ def _get_w4a16_packed_weights(
     cached = _W4A16_PACKED_WEIGHT_CACHE.get(key)
     if cached is not None:
         return cached
-    prepared = prepare_w4a16_packed_weights(
+    if source_format == "modelopt_nvfp4":
+        prepare_weights = prepare_w4a16_modelopt_nvfp4_weights
+    elif source_format == "compressed_tensors":
+        prepare_weights = prepare_w4a16_compressed_tensors_weights
+    elif source_format == "mxfp4_native":
+        prepare_weights = prepare_w4a16_mxfp4_native_weights
+    else:
+        raise AssertionError(f"unhandled W4A16 source_format {source_format!r}")
+    prepared = prepare_weights(
         w1_fp4,
         w1_blockscale,
         w1_alphas,
@@ -1720,54 +1730,9 @@ def _get_w4a16_packed_weights(
         w2_alphas,
         activation=activation,
         params_dtype=params_dtype,
-        source_format=source_format,
         reuse_input_storage=reuse_input_storage,
     )
     _W4A16_PACKED_WEIGHT_CACHE[key] = prepared
-    return prepared
-
-
-def _get_w4a16_modelopt_weights(
-    w1_fp4: torch.Tensor,
-    w1_blockscale: torch.Tensor,
-    w1_alphas: torch.Tensor,
-    w2_fp4: torch.Tensor,
-    w2_blockscale: torch.Tensor,
-    w2_alphas: torch.Tensor,
-    *,
-    activation: str,
-    params_dtype: torch.dtype,
-    source_format: str = "modelopt",
-):
-    from b12x.moe.fused.w4a16.prepare import prepare_w4a16_modelopt_weights
-
-    source_format = _normalize_fp4_source_format(source_format)
-    key = (
-        w1_fp4.data_ptr(),
-        w1_blockscale.data_ptr(),
-        w1_alphas.data_ptr(),
-        w2_fp4.data_ptr(),
-        w2_blockscale.data_ptr(),
-        w2_alphas.data_ptr(),
-        activation,
-        params_dtype,
-        source_format,
-    )
-    cached = _W4A16_MODEL_OPT_WEIGHT_CACHE.get(key)
-    if cached is not None:
-        return cached
-    prepared = prepare_w4a16_modelopt_weights(
-        w1_fp4,
-        w1_blockscale,
-        w1_alphas,
-        w2_fp4,
-        w2_blockscale,
-        w2_alphas,
-        activation=activation,
-        params_dtype=params_dtype,
-        source_format=source_format,
-    )
-    _W4A16_MODEL_OPT_WEIGHT_CACHE[key] = prepared
     return prepared
 
 
@@ -1784,7 +1749,7 @@ def prepare_b12x_w4a16_packed_weights(
     activation: str,
     params_dtype: torch.dtype,
     quant_mode: str | None = "w4a16",
-    source_format: str = "modelopt",
+    source_format: str = "modelopt_nvfp4",
     reuse_input_storage: bool = False,
 ) -> object:
     """Prepare W4A16 packed weights using the same contract as b12x_moe_fp4."""
@@ -1817,7 +1782,7 @@ def prepare_b12x_w4a16_packed_weights(
     )
 
 
-def prepare_b12x_w4a16_modelopt_weights(
+def prepare_b12x_w4a16_modelopt_nvfp4_weights(
     w1_fp4: torch.Tensor,
     w1_blockscale: torch.Tensor,
     w1_alphas: torch.Tensor,
@@ -1830,31 +1795,33 @@ def prepare_b12x_w4a16_modelopt_weights(
     activation: str,
     params_dtype: torch.dtype,
     quant_mode: str | None = "w4a16",
-    source_format: str = "modelopt",
+    source_format: str = "modelopt_nvfp4",
 ) -> object:
-    """Prepare modelopt W4A16 weights from the normal NVFP4 scale contract.
+    """Prepare ModelOpt NVFP4 W4A16 weights from the normal NVFP4 scale contract.
 
-    The modelopt/vLLM tensors use the same fused ``w*_alphas`` consumed by
+    The ModelOpt/vLLM tensors use the same fused ``w*_alphas`` consumed by
     W4A4: activation input scale multiplied by weight global scale. W4A16 uses
     BF16 activations directly, so recover the weight global scale by applying
     the reciprocal input scales before the W4A16 weight preparation step.
     """
     quant_mode = _normalize_quant_mode(quant_mode)
     if quant_mode != "w4a16":
-        raise ValueError("W4A16 modelopt weights require quant_mode='w4a16'")
+        raise ValueError("W4A16 ModelOpt NVFP4 weights require quant_mode='w4a16'")
     source_format = _normalize_fp4_source_format(source_format)
     _validate_fp4_source_format_for_quant_mode(
         source_format=source_format,
         quant_mode=quant_mode,
     )
-    if source_format != "modelopt":
-        raise ValueError("W4A16 modelopt weights require source_format='modelopt'")
+    if source_format != "modelopt_nvfp4":
+        raise ValueError(
+            "W4A16 ModelOpt NVFP4 weights require source_format='modelopt_nvfp4'"
+        )
 
     weight_E = int(w1_fp4.shape[0])
     w1_alphas = _w4a16_default_alpha(w1_alphas, a1_gscale, weight_E)
     w2_alphas = _w4a16_default_alpha(w2_alphas, a2_gscale, weight_E)
 
-    return _get_w4a16_modelopt_weights(
+    return _get_w4a16_packed_weights(
         w1_fp4,
         w1_blockscale,
         w1_alphas,
@@ -2734,24 +2701,24 @@ def _prewarm_w4a16_planned_launches(
                 workspace.weight_E,
             )
             max_m_blocks = (route_slots + block_size_m - 1) // block_size_m
-            for weight_layout in ("modelopt", "packed"):
-                fused_launches[(weight_layout, token_count)] = compile_w4a16_fused_moe(
-                    size_m=token_count,
-                    hidden_size=workspace.k,
-                    intermediate_size=workspace.n,
-                    num_experts=workspace.weight_E,
-                    top_k=workspace.num_topk,
-                    activation=workspace.activation,
-                    apply_router_weight_on_input=bool(apply_router_weight_on_input),
-                    zero_fc2_output=False,
-                    moe_block_size=block_size_m,
-                    max_m_blocks=max_m_blocks,
-                    element_dtype=element_dtype,
-                    sms=sms,
-                    max_shared_mem=max_shared_mem,
-                    swiglu_limit=swiglu_limit,
-                    weight_layout=weight_layout,
-                )
+            weight_layout = "packed"
+            fused_launches[(weight_layout, token_count)] = compile_w4a16_fused_moe(
+                size_m=token_count,
+                hidden_size=workspace.k,
+                intermediate_size=workspace.n,
+                num_experts=workspace.weight_E,
+                top_k=workspace.num_topk,
+                activation=workspace.activation,
+                apply_router_weight_on_input=bool(apply_router_weight_on_input),
+                zero_fc2_output=False,
+                moe_block_size=block_size_m,
+                max_m_blocks=max_m_blocks,
+                element_dtype=element_dtype,
+                sms=sms,
+                max_shared_mem=max_shared_mem,
+                swiglu_limit=swiglu_limit,
+                weight_layout=weight_layout,
+            )
             topk_sum_launches[token_count] = compile_w4a16_topk_sum(
                 m=token_count,
                 topk=workspace.num_topk,
@@ -4111,7 +4078,7 @@ def _can_use_w4a16_micro_direct(
     weight_E: int,
     activation: str,
 ) -> bool:
-    if source_format != "modelopt":
+    if source_format != "modelopt_nvfp4":
         return False
     if apply_router_weight_on_input or swiglu_limit is not None:
         return False
@@ -4613,7 +4580,7 @@ def b12x_moe_fp4(
     activation: str = "silu",
     quant_mode: str | None = None,
     unit_scale_contract: bool = False,
-    source_format: str = "modelopt",
+    source_format: str = "modelopt_nvfp4",
     prepared_w4a16: object | None = None,
     swiglu_limit: float | None = None,
 ) -> torch.Tensor:
@@ -4671,7 +4638,7 @@ def b12x_moe_fp4(
         prepared_w4a16 is None
         and quant_mode_arg is None
         and quant_mode == "w4a16"
-        and source_format != "modelopt"
+        and source_format != "modelopt_nvfp4"
     ):
         w1_alphas = _w4a16_default_alpha(
             w1_alphas,
@@ -4689,34 +4656,35 @@ def b12x_moe_fp4(
         a1_gscale.numel() == 1 and a2_gscale.numel() == 1
     )
     if quant_mode == "w4a16":
-        micro_output = _try_launch_w4a16_micro_direct(
-            workspace=workspace,
-            a=a,
-            a1_gscale=a1_gscale,
-            w1_fp4=w1_fp4,
-            w1_blockscale=w1_blockscale,
-            w1_alphas=w1_alphas,
-            a2_gscale=a2_gscale,
-            w2_fp4=w2_fp4,
-            w2_blockscale=w2_blockscale,
-            w2_alphas=w2_alphas,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            output=output,
-            input_scales_static=effective_input_scales_static,
-            fast_math=fast_math,
-            activation=activation,
-            source_format=source_format,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            swiglu_limit=swiglu_limit,
-            weight_E=weight_E,
-            k=k,
-            n=n,
-            num_topk=num_topk,
-            device=device,
-        )
-        if micro_output is not None:
-            return micro_output
+        if prepared_w4a16 is None:
+            micro_output = _try_launch_w4a16_micro_direct(
+                workspace=workspace,
+                a=a,
+                a1_gscale=a1_gscale,
+                w1_fp4=w1_fp4,
+                w1_blockscale=w1_blockscale,
+                w1_alphas=w1_alphas,
+                a2_gscale=a2_gscale,
+                w2_fp4=w2_fp4,
+                w2_blockscale=w2_blockscale,
+                w2_alphas=w2_alphas,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                output=output,
+                input_scales_static=effective_input_scales_static,
+                fast_math=fast_math,
+                activation=activation,
+                source_format=source_format,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                swiglu_limit=swiglu_limit,
+                weight_E=weight_E,
+                k=k,
+                n=n,
+                num_topk=num_topk,
+                device=device,
+            )
+            if micro_output is not None:
+                return micro_output
 
         from b12x.moe.fused.w4a16.kernel import run_w4a16_moe
 
@@ -4745,7 +4713,7 @@ def b12x_moe_fp4(
 
         prepared = prepared_w4a16
         if prepared is None:
-            if source_format == "modelopt":
+            if source_format == "modelopt_nvfp4":
                 w1_prepare_alphas = _w4a16_default_alpha(
                     w1_alphas,
                     a1_gscale,
@@ -4756,29 +4724,20 @@ def b12x_moe_fp4(
                     a2_gscale,
                     weight_E,
                 )
-                prepared = _get_w4a16_modelopt_weights(
-                    w1_fp4,
-                    w1_blockscale,
-                    w1_prepare_alphas,
-                    w2_fp4,
-                    w2_blockscale,
-                    w2_prepare_alphas,
-                    activation=activation,
-                    params_dtype=a.dtype,
-                    source_format=source_format,
-                )
             else:
-                prepared = _get_w4a16_packed_weights(
-                    w1_fp4,
-                    w1_blockscale,
-                    w1_alphas,
-                    w2_fp4,
-                    w2_blockscale,
-                    w2_alphas,
-                    activation=activation,
-                    params_dtype=a.dtype,
-                    source_format=source_format,
-                )
+                w1_prepare_alphas = w1_alphas
+                w2_prepare_alphas = w2_alphas
+            prepared = _get_w4a16_packed_weights(
+                w1_fp4,
+                w1_blockscale,
+                w1_prepare_alphas,
+                w2_fp4,
+                w2_blockscale,
+                w2_prepare_alphas,
+                activation=activation,
+                params_dtype=a.dtype,
+                source_format=source_format,
+            )
         weight_layout = getattr(prepared, "weight_layout", "packed")
         plan = _make_workspace_plan(
             num_tokens=m,

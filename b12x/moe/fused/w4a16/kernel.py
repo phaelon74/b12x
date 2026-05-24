@@ -9,7 +9,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass.cutlass_dsl import Int32, Int64, Uint32
+from cutlass.cutlass_dsl import Int32, Uint32
 
 from b12x.cute.fp4 import (
     atomic_add_global_i32,
@@ -75,7 +75,7 @@ _PACK_FACTOR = 8
 _STAGES = 4
 _DEVICE_MAX_REG_BYTES = 255 * 1024
 _DEFAULT_MAX_SHARED_MEM = 101_376
-_WEIGHT_LAYOUTS = {"packed", "modelopt"}
+_WEIGHT_LAYOUTS = {"packed"}
 
 
 # The W4A16 launch model chooses blocks/SM from static resource usage
@@ -367,7 +367,6 @@ class W4A16GemmKernel:
         element_dtype: str = "bf16",
         epilogue_activation: str | None = None,
         weight_layout: str = "packed",
-        source_n_rotation: int = 0,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
@@ -406,7 +405,6 @@ class W4A16GemmKernel:
         self.is_fp16 = element_dtype == "fp16"
         self.epilogue_relu2 = epilogue_activation == "relu2"
         self.weight_layout = weight_layout
-        self.source_n_rotation = int(source_n_rotation)
         self.cta_m_blocks = int(_covering_count(moe_block_size, 16))
         self.uses_m_block_8 = moe_block_size == 8
         self.max_m_blocks = int(max_m_blocks)
@@ -1869,22 +1867,14 @@ class W4A16GemmKernel:
         pipe: Int32,
         kk: Int32,
     ):
-        if cutlass.const_expr(self.weight_layout == "modelopt"):
-            q0, q1, q2, q3 = self._load_b_registers_modelopt_shared(
-                smem_base,
-                b_sh_rd,
-                pipe,
-                kk,
-            )
-        else:
-            b_addr = self._int4_addr(
-                smem_base,
-                Int32(self.sh_b_off)
-                + pipe * Int32(self.b_sh_stage)
-                + Int32(self.b_sh_stride) * kk
-                + b_sh_rd,
-            )
-            q0, q1, q2, q3 = ld_shared_v4_u32(b_addr)
+        b_addr = self._int4_addr(
+            smem_base,
+            Int32(self.sh_b_off)
+            + pipe * Int32(self.b_sh_stage)
+            + Int32(self.b_sh_stride) * kk
+            + b_sh_rd,
+        )
+        q0, q1, q2, q3 = ld_shared_v4_u32(b_addr)
 
         warp_id = tid // Int32(32)
         warp_row = warp_id // Int32(self.tb_n_warps)
@@ -2088,146 +2078,6 @@ class W4A16GemmKernel:
         acc[mb, jj, 1, 3] = d3
 
     @cute.jit
-    def _source_n_from_logical(self, logical_n: Int32) -> Int32:
-        source_n = logical_n
-        if cutlass.const_expr(self.source_n_rotation != 0):
-            source_n += Int32(self.source_n_rotation)
-            if source_n >= Int32(self.size_n):
-                source_n -= Int32(self.size_n)
-        return source_n
-
-    @cute.jit
-    def _stage_b_tile_modelopt_native(
-        self,
-        b_u8_flat: cute.Tensor,
-        smem_addr: Int32,
-        expert_idx: Int32,
-        output_n_tile: Int32,
-        tile_idx: Int32,
-        local_int4: Int32,
-    ):
-        chunks_per_row = Int32(self.tile_k // 32)
-        local_n = local_int4 // chunks_per_row
-        local_k_vec = local_int4 - local_n * chunks_per_row
-        logical_n = output_n_tile * Int32(self.tile_n) + local_n
-        source_n = self._source_n_from_logical(logical_n)
-        packed_cols = Int32(self.size_k // 2)
-        byte_offset = (
-            Int64(expert_idx) * Int64(self.size_n * (self.size_k // 2))
-            + Int64(source_n) * Int64(packed_cols)
-            + Int64(tile_idx * Int32(self.tile_k // 2))
-            + Int64(local_k_vec * Int32(16))
-        )
-        cp_async4_shared_global(
-            smem_addr,
-            get_ptr_as_int64(b_u8_flat, byte_offset),
-        )
-
-    @cute.jit
-    def _load_modelopt_shared_byte(
-        self,
-        smem_base: Int32,
-        pipe: Int32,
-        n_tile: Int32,
-        k_tile: Int32,
-        warp_id: Int32,
-        tc_col: Int32,
-        tc_row: Int32,
-        n_delta: cutlass.Constexpr[int],
-        k_delta: cutlass.Constexpr[int],
-    ) -> Uint32:
-        local_n = (
-            n_tile * Int32(64)
-            + warp_id * Int32(16)
-            + tc_col
-            + Int32(n_delta)
-        )
-        local_k = k_tile * Int32(16) + tc_row + Int32(k_delta)
-        byte_offset = local_n * Int32(self.tile_k // 2) + local_k // Int32(2)
-        word_byte_offset = byte_offset - (byte_offset & Int32(3))
-        word = ld_shared_u32(
-            smem_base
-            + Int32(self.sh_b_off * 16)
-            + pipe * Int32(self.b_sh_stage * 16)
-            + word_byte_offset
-        )
-        shift = Uint32((byte_offset - word_byte_offset) * Int32(8))
-        return (word >> shift) & Uint32(0xFF)
-
-    @cute.jit
-    def _pack_modelopt_byte_pair(
-        self,
-        word: Uint32,
-        q: Uint32,
-        low_shift: cutlass.Constexpr[int],
-        high_shift: cutlass.Constexpr[int],
-    ) -> Uint32:
-        low = q & Uint32(0xF)
-        high = (q >> Uint32(4)) & Uint32(0xF)
-        return word | (low << Uint32(low_shift)) | (high << Uint32(high_shift))
-
-    @cute.jit
-    def _load_modelopt_shared_packed_word_for_lane(
-        self,
-        smem_base: Int32,
-        pipe: Int32,
-        n_tile: Int32,
-        k_tile: Int32,
-        warp_id: Int32,
-        tc_col: Int32,
-        tc_row: Int32,
-    ) -> Uint32:
-        q0 = self._load_modelopt_shared_byte(
-            smem_base, pipe, n_tile, k_tile, warp_id, tc_col, tc_row, 0, 0
-        )
-        q1 = self._load_modelopt_shared_byte(
-            smem_base, pipe, n_tile, k_tile, warp_id, tc_col, tc_row, 0, 8
-        )
-        q2 = self._load_modelopt_shared_byte(
-            smem_base, pipe, n_tile, k_tile, warp_id, tc_col, tc_row, 8, 0
-        )
-        q3 = self._load_modelopt_shared_byte(
-            smem_base, pipe, n_tile, k_tile, warp_id, tc_col, tc_row, 8, 8
-        )
-        word = Uint32(0)
-        word = self._pack_modelopt_byte_pair(word, q0, 0, 16)
-        word = self._pack_modelopt_byte_pair(word, q1, 4, 20)
-        word = self._pack_modelopt_byte_pair(word, q2, 8, 24)
-        word = self._pack_modelopt_byte_pair(word, q3, 12, 28)
-        return word
-
-    @cute.jit
-    def _load_b_registers_modelopt_shared(
-        self,
-        smem_base: Int32,
-        b_sh_rd: Int32,
-        pipe: Int32,
-        kk: Int32,
-    ):
-        packed_word_index = (Int32(self.b_sh_stride) * kk + b_sh_rd) * Int32(4)
-        words_per_k_tile = Int32((self.tile_n // 64) * 128)
-        k_tile = packed_word_index // words_per_k_tile
-        pos_in_k_tile = packed_word_index - k_tile * words_per_k_tile
-        n_tile = pos_in_k_tile // Int32(128)
-        pos = pos_in_k_tile - n_tile * Int32(128)
-        th_id = pos // Int32(4)
-        tc_col = th_id // Int32(4)
-        tc_row = (th_id - tc_col * Int32(4)) * Int32(2)
-        q0 = self._load_modelopt_shared_packed_word_for_lane(
-            smem_base, pipe, n_tile, k_tile, Int32(0), tc_col, tc_row
-        )
-        q1 = self._load_modelopt_shared_packed_word_for_lane(
-            smem_base, pipe, n_tile, k_tile, Int32(1), tc_col, tc_row
-        )
-        q2 = self._load_modelopt_shared_packed_word_for_lane(
-            smem_base, pipe, n_tile, k_tile, Int32(2), tc_col, tc_row
-        )
-        q3 = self._load_modelopt_shared_packed_word_for_lane(
-            smem_base, pipe, n_tile, k_tile, Int32(3), tc_col, tc_row
-        )
-        return q0, q1, q2, q3
-
-    @cute.jit
     def _stage_k_tile_async(
         self,
         a_bf16_flat: cute.Tensor,
@@ -2289,20 +2139,10 @@ class W4A16GemmKernel:
                 + Int32(i * self.cta_threads)
                 + tid,
             )
-            if cutlass.const_expr(self.weight_layout == "packed"):
-                cp_async4_shared_global(
-                    b_dst,
-                    get_ptr_as_int64(b_i32_flat, b_src_int4 * Int32(4)),
-                )
-            else:
-                self._stage_b_tile_modelopt_native(
-                    b_i32_flat,
-                    b_dst,
-                    expert_idx,
-                    output_n_tile,
-                    tile_idx,
-                    Int32(i * self.cta_threads) + tid,
-                )
+            cp_async4_shared_global(
+                b_dst,
+                get_ptr_as_int64(b_i32_flat, b_src_int4 * Int32(4)),
+            )
 
         if tid < Int32(self.s_sh_stage):
             s_src_int4 = (
@@ -2900,9 +2740,6 @@ class W4A16FusedMoeKernel:
         self.zero_fc2_output = bool(zero_fc2_output)
         self.element_dtype = element_dtype
         self.is_fp16 = element_dtype == "fp16"
-        fc1_source_n_rotation = (
-            int(intermediate_size) if weight_layout == "modelopt" and is_gated else 0
-        )
         self.fc1 = W4A16GemmKernel(
             size_m=size_m,
             size_n=fc1_cols,
@@ -2917,7 +2754,6 @@ class W4A16FusedMoeKernel:
             element_dtype=element_dtype,
             epilogue_activation=None if is_gated else "relu2",
             weight_layout=weight_layout,
-            source_n_rotation=fc1_source_n_rotation,
         )
         self.fc2 = W4A16GemmKernel(
             size_m=routed_rows,
@@ -3654,28 +3490,16 @@ def compile_w4a16_fused_moe(
         return cached
 
     a_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    if weight_layout == "modelopt":
-        w13_fake = cute.runtime.make_fake_compact_tensor(
-            cutlass.Uint8,
-            (num_experts * fc1_cols * (hidden_size // 2),),
-            assumed_align=16,
-        )
-        w2_fake = cute.runtime.make_fake_compact_tensor(
-            cutlass.Uint8,
-            (num_experts * hidden_size * (intermediate_size // 2),),
-            assumed_align=16,
-        )
-    else:
-        w13_fake = cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32,
-            (num_experts * (hidden_size // 16) * (fc1_cols // 16 * 32),),
-            assumed_align=16,
-        )
-        w2_fake = cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32,
-            (num_experts * (intermediate_size // 16) * (hidden_size // 16 * 32),),
-            assumed_align=16,
-        )
+    w13_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32,
+        (num_experts * (hidden_size // 16) * (fc1_cols // 16 * 32),),
+        assumed_align=16,
+    )
+    w2_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32,
+        (num_experts * (intermediate_size // 16) * (hidden_size // 16 * 32),),
+        assumed_align=16,
+    )
     fc1_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
         (routed_rows * fc1_cols,),
@@ -4331,12 +4155,8 @@ def run_w4a16_moe(
         device=a_input.device,
         scratch=fc2_c_tmp,
     )
-    if weight_layout == "modelopt":
-        w13_arg = prepared.w13.view(torch.uint8).view(-1)
-        w2_arg = prepared.w2.view(torch.uint8).view(-1)
-    else:
-        w13_arg = prepared.w13.view(torch.int32).view(-1)
-        w2_arg = prepared.w2.view(torch.int32).view(-1)
+    w13_arg = prepared.w13.view(torch.int32).view(-1)
+    w2_arg = prepared.w2.view(torch.int32).view(-1)
     fused.compiled(
         make_ptr(
             _cutlass_element_dtype(element_dtype),
