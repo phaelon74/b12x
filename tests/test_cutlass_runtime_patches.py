@@ -90,6 +90,38 @@ def test_compile_disk_cache_key_ignores_pointer_address_and_stream_value() -> No
     assert key_a == key_b
 
 
+def test_compile_miss_log_includes_target_attrs_and_arg_shapes(capsys) -> None:
+    class FakeKernel:
+        def __init__(self) -> None:
+            self.m = 16
+            self.n = 4096
+            self.tile = (64, 128)
+            self._private = "hidden"
+
+        def __call__(self) -> None:
+            pass
+
+    fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (4, 8), assumed_align=4)
+
+    runtime_patches._log_cute_compile_miss(
+        FakeKernel(),
+        (fake, 7),
+        {},
+        cache_key="abcdef0123456789",
+        cache_status="disk-cache-miss",
+    )
+
+    out = capsys.readouterr().out
+    assert "[b12x cute.compile] miss" in out
+    assert "FakeKernel" in out
+    assert "'m': 16" in out
+    assert "'n': 4096" in out
+    assert "_private" not in out
+    assert "'shape': '(4, 8)'" in out
+    assert "'align': 4" in out
+    assert "abcdef0123456789" in out
+
+
 def test_compile_disk_cache_key_changes_with_compile_env(monkeypatch) -> None:
     fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (4, 8), assumed_align=4)
     compile_callable = cute.compile

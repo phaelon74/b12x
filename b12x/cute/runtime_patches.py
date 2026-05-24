@@ -35,6 +35,160 @@ def _cute_compile_cache_dir() -> Path:
     return Path.home() / ".cache" / "b12x" / "cute_compile"
 
 
+def _cute_compile_log_enabled() -> bool:
+    raw = os.environ.get("B12X_LOG_CUTE_COMPILES", "")
+    return raw.lower() not in {"", "0", "false", "no", "off"}
+
+
+def _short_repr(value: Any, *, max_len: int = 160) -> str:
+    try:
+        if isinstance(value, type):
+            text = f"{value.__module__}.{value.__qualname__}"
+        else:
+            text = repr(value)
+    except Exception:
+        text = f"<{type(value).__module__}.{type(value).__qualname__}>"
+    if len(text) > max_len:
+        return text[: max_len - 3] + "..."
+    return text
+
+
+def _compile_target_name(func: Any) -> str:
+    unwrapped = inspect.unwrap(func)
+    if inspect.ismethod(unwrapped):
+        module = getattr(unwrapped.__func__, "__module__", "")
+        qualname = getattr(
+            unwrapped.__func__,
+            "__qualname__",
+            getattr(unwrapped.__func__, "__name__", ""),
+        )
+        return f"{module}.{qualname}" if module else qualname
+    if inspect.isfunction(unwrapped):
+        module = getattr(unwrapped, "__module__", "")
+        qualname = getattr(unwrapped, "__qualname__", getattr(unwrapped, "__name__", ""))
+        return f"{module}.{qualname}" if module else qualname
+    target_type = type(func)
+    module = getattr(target_type, "__module__", "")
+    qualname = getattr(target_type, "__qualname__", target_type.__name__)
+    return f"{module}.{qualname}" if module else qualname
+
+
+def _simple_log_value(value: Any) -> Any | None:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, type):
+        return f"{value.__module__}.{value.__qualname__}"
+    if isinstance(value, (tuple, list)) and len(value) <= 8:
+        items = []
+        for item in value:
+            simple = _simple_log_value(item)
+            if simple is None:
+                return None
+            items.append(simple)
+        return tuple(items) if isinstance(value, tuple) else items
+    return None
+
+
+def _compile_target_attrs(func: Any) -> dict[str, Any]:
+    if not hasattr(func, "__dict__"):
+        return {}
+    attrs = {}
+    for name, value in sorted(vars(func).items()):
+        if name.startswith("_"):
+            continue
+        simple = _simple_log_value(value)
+        if simple is None:
+            continue
+        attrs[name] = simple
+        if len(attrs) >= 48:
+            attrs["..."] = "truncated"
+            break
+    return attrs
+
+
+def _compile_arg_shape_summary(value: Any) -> dict[str, Any] | None:
+    shape = _first_present_attr(value, "_shape", "shape")
+    if shape is None:
+        return None
+    try:
+        shape_value = tuple(shape)
+    except TypeError:
+        shape_value = shape
+    summary: dict[str, Any] = {
+        "type": f"{type(value).__module__}.{type(value).__qualname__}",
+        "shape": _short_repr(shape_value, max_len=96),
+    }
+    stride = _first_present_attr(value, "_stride", "stride")
+    if stride is not None:
+        try:
+            stride_value = tuple(stride)
+        except TypeError:
+            stride_value = stride
+        summary["stride"] = _short_repr(stride_value, max_len=96)
+    stride_order = _first_present_attr(value, "_stride_order", "stride_order")
+    if stride_order is not None:
+        try:
+            stride_order_value = tuple(stride_order)
+        except TypeError:
+            stride_order_value = stride_order
+        summary["stride_order"] = _short_repr(stride_order_value, max_len=96)
+    dtype = _first_present_attr(value, "_dtype", "dtype", "element_type")
+    if dtype is not None:
+        summary["dtype"] = _short_repr(dtype, max_len=80)
+    memspace = _first_present_attr(value, "_memspace", "memspace")
+    if memspace is not None:
+        summary["memspace"] = _short_repr(memspace, max_len=80)
+    assumed_align = _first_present_attr(value, "_assumed_align", "assumed_align")
+    if assumed_align is not None:
+        summary["align"] = assumed_align
+    return summary
+
+
+def _compile_args_shape_summary(
+    args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for idx, value in enumerate(args):
+        shaped = _compile_arg_shape_summary(value)
+        if shaped is not None:
+            summary[f"arg{idx}"] = shaped
+        elif value is None or isinstance(value, (bool, int, float, str)):
+            summary[f"arg{idx}"] = value
+        if len(summary) >= 24:
+            summary["..."] = "truncated"
+            return summary
+    for name, value in sorted(kwargs.items()):
+        shaped = _compile_arg_shape_summary(value)
+        if shaped is not None:
+            summary[f"kw:{name}"] = shaped
+        elif value is None or isinstance(value, (bool, int, float, str)):
+            summary[f"kw:{name}"] = value
+        if len(summary) >= 24:
+            summary["..."] = "truncated"
+            return summary
+    return summary
+
+
+def _log_cute_compile_miss(
+    func: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    cache_key: str | None,
+    cache_status: str,
+) -> None:
+    cache_label = "<disabled>" if cache_key is None else cache_key[:16]
+    print(
+        "[b12x cute.compile] miss "
+        f"target={_compile_target_name(func)} "
+        f"cache={cache_label} "
+        f"status={cache_status} "
+        f"attrs={_short_repr(_compile_target_attrs(func), max_len=1200)} "
+        f"args={_short_repr(_compile_args_shape_summary(args, kwargs), max_len=1600)}",
+        flush=True,
+    )
+
+
 def _iter_fingerprint_files(root: Path) -> list[Path]:
     files = []
     for path in root.rglob("*"):
@@ -508,6 +662,15 @@ def apply_cutlass_runtime_patches() -> None:
     @wraps(original_compile)
     def patched_compile(self, func, *args, **kwargs):
         if not _cute_compile_disk_cache_enabled():
+            if _cute_compile_log_enabled():
+                with suppress(Exception):
+                    _log_cute_compile_miss(
+                        func,
+                        args,
+                        kwargs,
+                        cache_key=None,
+                        cache_status="disk-cache-disabled",
+                    )
             return original_compile(self, func, *args, **kwargs)
 
         cache_key = _build_compile_disk_cache_key(self, func, args, kwargs)
@@ -515,6 +678,15 @@ def apply_cutlass_runtime_patches() -> None:
         if compiled is not None:
             return compiled
 
+        if _cute_compile_log_enabled():
+            with suppress(Exception):
+                _log_cute_compile_miss(
+                    func,
+                    args,
+                    kwargs,
+                    cache_key=cache_key,
+                    cache_status="disk-cache-miss",
+                )
         compiled = original_compile(self, func, *args, **kwargs)
         with suppress(Exception):
             _store_cute_compile_to_disk(cache_key, compiled)
