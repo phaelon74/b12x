@@ -1679,6 +1679,7 @@ def prepare_b12x_w4a16_modelopt_nvfp4_weights(
     params_dtype: torch.dtype,
     quant_mode: str | None = "w4a16",
     source_format: str = "modelopt_nvfp4",
+    reuse_input_storage: bool = False,
 ) -> object:
     """Prepare ModelOpt NVFP4 W4A16 weights from the normal NVFP4 scale contract.
 
@@ -1714,6 +1715,7 @@ def prepare_b12x_w4a16_modelopt_nvfp4_weights(
         activation=activation,
         params_dtype=params_dtype,
         source_format=source_format,
+        reuse_input_storage=reuse_input_storage,
     )
 
 

@@ -5,6 +5,7 @@ import importlib.metadata
 import inspect
 import os
 import sys
+import traceback
 from contextlib import suppress
 from functools import lru_cache
 from functools import wraps
@@ -38,6 +39,24 @@ def _cute_compile_cache_dir() -> Path:
 def _cute_compile_log_enabled() -> bool:
     raw = os.environ.get("B12X_LOG_CUTE_COMPILES", "")
     return raw.lower() not in {"", "0", "false", "no", "off"}
+
+
+def _cute_compile_stack_log_enabled() -> bool:
+    raw = os.environ.get("B12X_LOG_CUTE_COMPILE_STACK", "")
+    if raw:
+        return raw.lower() not in {"0", "false", "no", "off"}
+    raw = os.environ.get("B12X_LOG_CUTE_COMPILES", "")
+    return raw.lower() in {"stack", "trace", "traceback", "full"}
+
+
+def _cute_compile_stack_log_depth() -> int:
+    raw = os.environ.get("B12X_LOG_CUTE_COMPILE_STACK_DEPTH", "")
+    if not raw:
+        return 48
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 48
 
 
 def _short_repr(value: Any, *, max_len: int = 160) -> str:
@@ -169,24 +188,311 @@ def _compile_args_shape_summary(
     return summary
 
 
+def _type_log_name(module: str, qualname: str) -> str:
+    return f"{module}.{qualname}" if module else qualname
+
+
+def _function_fingerprint_log_value(value: Any) -> Any:
+    if isinstance(value, tuple) and len(value) == 3:
+        module, qualname, _fingerprint = value
+        if isinstance(module, str) and isinstance(qualname, str):
+            return _type_log_name(module, qualname)
+    return _cache_key_log_value(value, max_depth=2, max_items=8)
+
+
+def _object_state_log_value(
+    value: Any, *, max_depth: int, max_items: int
+) -> dict[str, Any] | None:
+    if not (isinstance(value, tuple) and len(value) == 4 and value[0] == "object"):
+        return None
+    _tag, module, qualname, attrs = value
+    if not isinstance(attrs, tuple):
+        return None
+
+    state: dict[str, Any] = {}
+    for idx, item in enumerate(attrs):
+        if idx >= max_items:
+            state["..."] = f"{len(attrs) - idx} more"
+            break
+        if not (isinstance(item, tuple) and len(item) == 2):
+            continue
+        name, attr_value = item
+        state[str(name)] = _cache_key_log_value(
+            attr_value, max_depth=max_depth - 1, max_items=max_items
+        )
+    return {"type": _type_log_name(str(module), str(qualname)), "attrs": state}
+
+
+def _tensor_key_log_value(
+    names: tuple[str, ...], values: tuple[Any, ...], *, max_depth: int, max_items: int
+) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for name, value in zip(names, values, strict=False):
+        if value is None:
+            continue
+        out[name] = _cache_key_log_value(
+            value, max_depth=max_depth - 1, max_items=max_items
+        )
+    return out
+
+
+def _cache_key_log_value(
+    value: Any, *, max_depth: int = 5, max_items: int = 32
+) -> Any:
+    if max_depth <= 0:
+        return _short_repr(value, max_len=120)
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, type):
+        return _type_log_name(value.__module__, value.__qualname__)
+
+    object_state = _object_state_log_value(
+        value, max_depth=max_depth, max_items=max_items
+    )
+    if object_state is not None:
+        return object_state
+
+    if isinstance(value, tuple) and value and all(
+        isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str)
+        for item in value
+    ):
+        out: dict[str, Any] = {}
+        for idx, (key, item_value) in enumerate(value):
+            if idx >= max_items:
+                out["..."] = f"{len(value) - idx} more"
+                break
+            out[key] = _cache_key_log_value(
+                item_value, max_depth=max_depth - 1, max_items=max_items
+            )
+        return out
+
+    if isinstance(value, tuple) and value:
+        tag = value[0]
+        if tag == "type" and len(value) == 3:
+            return _type_log_name(str(value[1]), str(value[2]))
+        if tag == "function" and len(value) == 2:
+            return _function_fingerprint_log_value(value[1])
+        if tag == "method" and len(value) == 3:
+            return {
+                "kind": "method",
+                "function": _function_fingerprint_log_value(value[1]),
+                "self": _cache_key_log_value(
+                    value[2], max_depth=max_depth - 1, max_items=max_items
+                ),
+            }
+        if tag == "callable_instance" and len(value) == 5:
+            return {
+                "kind": "callable_instance",
+                "type": _type_log_name(str(value[1]), str(value[2])),
+                "call": _function_fingerprint_log_value(value[3]),
+                "state": _cache_key_log_value(
+                    value[4], max_depth=max_depth - 1, max_items=max_items
+                ),
+            }
+        if tag == "callable" and len(value) == 4:
+            return {
+                "kind": "callable",
+                "type": _type_log_name(str(value[1]), str(value[2])),
+                "repr": _short_repr(value[3], max_len=160),
+            }
+        if tag == "cache_key" and len(value) == 4:
+            return {
+                "type": _type_log_name(str(value[1]), str(value[2])),
+                "cache_key": _cache_key_log_value(
+                    value[3], max_depth=max_depth - 1, max_items=max_items
+                ),
+            }
+        if tag == "fake_tensor" and len(value) == 12:
+            return _tensor_key_log_value(
+                (
+                    "kind",
+                    "type",
+                    "dtype",
+                    "shape",
+                    "stride",
+                    "stride_order",
+                    "device",
+                    "layout",
+                    "memspace",
+                    "align",
+                    "use_32bit_stride",
+                ),
+                (
+                    "fake_tensor",
+                    _type_log_name(str(value[1]), str(value[2])),
+                    *value[3:],
+                ),
+                max_depth=max_depth,
+                max_items=max_items,
+            )
+        if tag == "runtime_tensor" and len(value) == 8:
+            return _tensor_key_log_value(
+                (
+                    "kind",
+                    "dtype",
+                    "shape",
+                    "stride",
+                    "memspace",
+                    "align",
+                    "is_dynamic",
+                    "use_32bit_stride",
+                ),
+                value,
+                max_depth=max_depth,
+                max_items=max_items,
+            )
+        if tag == "fake_compact_tensor" and len(value) == 7:
+            return _tensor_key_log_value(
+                (
+                    "kind",
+                    "dtype",
+                    "shape",
+                    "stride_order",
+                    "memspace",
+                    "align",
+                    "use_32bit_stride",
+                ),
+                value,
+                max_depth=max_depth,
+                max_items=max_items,
+            )
+        if tag == "cuda_stream":
+            return "cuda_stream"
+        if tag == "symbolic_dim" and len(value) == 4:
+            return value[3]
+        if tag == "bytes" and len(value) == 2 and isinstance(value[1], str):
+            return f"bytes[{len(value[1]) // 2}]"
+        if tag == "path" and len(value) == 2:
+            return value[1]
+        if tag == "repr" and len(value) == 4:
+            return {
+                "type": _type_log_name(str(value[1]), str(value[2])),
+                "repr": _short_repr(value[3], max_len=160),
+            }
+        if tag == "cycle" and len(value) == 3:
+            return {"cycle": _type_log_name(str(value[1]), str(value[2]))}
+
+    if isinstance(value, dict):
+        out = {}
+        for idx, (key, item_value) in enumerate(
+            sorted(value.items(), key=lambda kv: str(kv[0]))
+        ):
+            if idx >= max_items:
+                out["..."] = f"{len(value) - idx} more"
+                break
+            out[str(key)] = _cache_key_log_value(
+                item_value, max_depth=max_depth - 1, max_items=max_items
+            )
+        return out
+
+    if isinstance(value, (tuple, list)):
+        items = [
+            _cache_key_log_value(item, max_depth=max_depth - 1, max_items=max_items)
+            for item in value[:max_items]
+        ]
+        if len(value) > max_items:
+            items.append(f"... {len(value) - max_items} more")
+        return tuple(items) if isinstance(value, tuple) else items
+
+    return _short_repr(value, max_len=160)
+
+
+def _toolchain_log_value(toolchain: tuple[object, ...]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for entry in toolchain:
+        if not (isinstance(entry, tuple) and entry):
+            continue
+        name = entry[0]
+        if name == "python" and len(entry) >= 3:
+            summary[str(name)] = f"{entry[1]} {'.'.join(str(v) for v in entry[2])}"
+        elif len(entry) >= 2 and entry[1]:
+            summary[str(name)] = entry[1]
+    return summary
+
+
+def _environment_log_value(env: tuple[tuple[str, str], ...]) -> dict[str, str]:
+    return {name: value for name, value in env if value}
+
+
+def _compile_cache_payload_log_value(
+    payload: tuple[object, ...] | None
+) -> dict[str, Any]:
+    if payload is None or len(payload) != 8:
+        return {}
+    (
+        _version,
+        target_key,
+        _b12x_fingerprint,
+        toolchain_key,
+        args_key,
+        kwargs_key,
+        options_key,
+        env_key,
+    ) = payload
+
+    summary: dict[str, Any] = {
+        "target": _cache_key_log_value(target_key, max_depth=7, max_items=80),
+        "args": _cache_key_log_value(args_key, max_depth=5, max_items=32),
+    }
+    kwargs_summary = _cache_key_log_value(kwargs_key, max_depth=5, max_items=32)
+    if kwargs_summary:
+        summary["kwargs"] = kwargs_summary
+    if options_key:
+        summary["options"] = _cache_key_log_value(
+            options_key, max_depth=4, max_items=32
+        )
+    env_summary = _environment_log_value(env_key) if isinstance(env_key, tuple) else {}
+    if env_summary:
+        summary["env"] = env_summary
+    if isinstance(toolchain_key, tuple):
+        toolchain_summary = _toolchain_log_value(toolchain_key)
+        if toolchain_summary:
+            summary["toolchain"] = toolchain_summary
+    return summary
+
+
+def _format_cute_compile_stack() -> str:
+    depth = _cute_compile_stack_log_depth()
+    frames = traceback.extract_stack()[:-2]
+    runtime_patch_path = str(Path(__file__).resolve())
+    visible_frames = [
+        frame
+        for frame in frames
+        if str(Path(frame.filename).resolve()) != runtime_patch_path
+    ]
+    if depth:
+        visible_frames = visible_frames[-depth:]
+
+    lines = ["[b12x cute.compile] python_stack (most recent call last):"]
+    for frame in visible_frames:
+        lines.append(
+            f'  File "{frame.filename}", line {frame.lineno}, in {frame.name}'
+        )
+        if frame.line:
+            lines.append(f"    {frame.line.strip()}")
+    return "\n".join(lines)
+
+
 def _log_cute_compile_miss(
     func: Any,
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
     *,
-    cache_key: str | None,
     cache_status: str,
+    cache_payload: tuple[object, ...] | None = None,
 ) -> None:
-    cache_label = "<disabled>" if cache_key is None else cache_key[:16]
+    key_inputs = _compile_cache_payload_log_value(cache_payload)
     print(
         "[b12x cute.compile] miss "
         f"target={_compile_target_name(func)} "
-        f"cache={cache_label} "
         f"status={cache_status} "
         f"attrs={_short_repr(_compile_target_attrs(func), max_len=1200)} "
-        f"args={_short_repr(_compile_args_shape_summary(args, kwargs), max_len=1600)}",
+        f"args={_short_repr(_compile_args_shape_summary(args, kwargs), max_len=1600)} "
+        f"key_inputs={_short_repr(key_inputs, max_len=4000)}",
         flush=True,
     )
+    if _cute_compile_stack_log_enabled():
+        print(_format_cute_compile_stack(), flush=True)
 
 
 def _iter_fingerprint_files(root: Path) -> list[Path]:
@@ -579,13 +885,13 @@ def _compile_options_cache_key(compile_callable: Any) -> tuple[str, ...]:
     return tuple(serialized)
 
 
-def _build_compile_disk_cache_key(
+def _compile_disk_cache_payload(
     compile_callable: Any,
     func: Any,
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
-) -> str:
-    payload = (
+) -> tuple[object, ...]:
+    return (
         "b12x_cute_compile_cache_v2",
         _normalize_compile_target(func, set()),
         _b12x_package_fingerprint(),
@@ -595,6 +901,15 @@ def _build_compile_disk_cache_key(
         _compile_options_cache_key(compile_callable),
         _compile_environment_key(),
     )
+
+
+def _build_compile_disk_cache_key(
+    compile_callable: Any,
+    func: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> str:
+    payload = _compile_disk_cache_payload(compile_callable, func, args, kwargs)
     return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
 
 
@@ -664,16 +979,18 @@ def apply_cutlass_runtime_patches() -> None:
         if not _cute_compile_disk_cache_enabled():
             if _cute_compile_log_enabled():
                 with suppress(Exception):
+                    payload = _compile_disk_cache_payload(self, func, args, kwargs)
                     _log_cute_compile_miss(
                         func,
                         args,
                         kwargs,
-                        cache_key=None,
                         cache_status="disk-cache-disabled",
+                        cache_payload=payload,
                     )
             return original_compile(self, func, *args, **kwargs)
 
-        cache_key = _build_compile_disk_cache_key(self, func, args, kwargs)
+        payload = _compile_disk_cache_payload(self, func, args, kwargs)
+        cache_key = hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
         compiled = _load_cute_compile_from_disk(cache_key)
         if compiled is not None:
             return compiled
@@ -684,8 +1001,8 @@ def apply_cutlass_runtime_patches() -> None:
                     func,
                     args,
                     kwargs,
-                    cache_key=cache_key,
                     cache_status="disk-cache-miss",
+                    cache_payload=payload,
                 )
         compiled = original_compile(self, func, *args, **kwargs)
         with suppress(Exception):

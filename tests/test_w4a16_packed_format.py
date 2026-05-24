@@ -438,3 +438,64 @@ def test_integration_modelopt_nvfp4_preparation_converts_fused_nvfp4_alphas(
         "w2_global_scale",
     ):
         assert torch.equal(getattr(actual, name), getattr(expected, name)), name
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("activation", ["relu2", "silu"])
+def test_integration_modelopt_nvfp4_preparation_can_reuse_input_storage(
+    activation: str,
+) -> None:
+    torch.manual_seed(20260524)
+    experts, hidden_size, intermediate_size = 3, 128, 128
+    w13, w13_blockscale, w2, w2_blockscale = _make_case(
+        experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+    )
+    fused_w13_alphas = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
+        torch.float32
+    )
+    fused_w2_alphas = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
+        torch.float32
+    )
+    a1_gscale = (torch.rand(experts, device="cuda") * 0.5 + 0.75).to(torch.float32)
+    a2_gscale = (torch.rand(experts, device="cuda") * 0.5 + 0.75).to(torch.float32)
+
+    expected = prepare_b12x_w4a16_modelopt_nvfp4_weights(
+        w13.clone(),
+        w13_blockscale,
+        fused_w13_alphas,
+        a1_gscale,
+        w2.clone(),
+        w2_blockscale,
+        fused_w2_alphas,
+        a2_gscale,
+        activation=activation,
+        params_dtype=torch.bfloat16,
+    )
+    actual = prepare_b12x_w4a16_modelopt_nvfp4_weights(
+        w13,
+        w13_blockscale,
+        fused_w13_alphas,
+        a1_gscale,
+        w2,
+        w2_blockscale,
+        fused_w2_alphas,
+        a2_gscale,
+        activation=activation,
+        params_dtype=torch.bfloat16,
+        reuse_input_storage=True,
+    )
+
+    assert actual.w13.data_ptr() == w13.data_ptr()
+    assert actual.w2.data_ptr() == w2.data_ptr()
+    for name in (
+        "w13",
+        "w13_scale",
+        "w13_global_scale",
+        "w2",
+        "w2_scale",
+        "w2_global_scale",
+    ):
+        assert torch.equal(getattr(actual, name), getattr(expected, name)), name

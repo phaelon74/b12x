@@ -240,7 +240,7 @@ def _repack_4bit_no_perm(
 
     k_tiles = size_k // _PACKED_TILE_SIZE
     n_tiles = size_n // _PACKED_TILE_N_SIZE
-    tiles = (qweight_i32.to(torch.int64) & 0xFFFFFFFF).view(
+    tiles = qweight_i32.view(
         k_tiles,
         2,
         n_tiles,
@@ -268,7 +268,7 @@ def _repack_4bit_no_perm(
     )[:, pack_idx]
     source_shift = torch.cat([pos, pos], dim=1)[:, pack_idx] * 4
 
-    result = torch.zeros((k_tiles, n_tiles, 128), device=device, dtype=torch.int64)
+    result = torch.zeros((k_tiles, n_tiles, 128), device=device, dtype=torch.int32)
     for slot in range(8):
         gathered = flat.gather(
             2,
@@ -277,7 +277,7 @@ def _repack_4bit_no_perm(
         nibble = (gathered >> source_shift[:, slot].view(1, 1, 128)) & 0xF
         result |= nibble << (slot * 4)
 
-    return result.to(torch.int32).reshape(k_tiles, n_tiles * 128).contiguous()
+    return result.reshape(k_tiles, n_tiles * 128).contiguous()
 
 
 def _repack_weight(
@@ -319,9 +319,9 @@ def _repack_weight(
             ).T.contiguous()
         else:
             qweight = expert_weight.T.contiguous()
-        packed[expert].copy_(
-            _repack_4bit_no_perm(qweight, size_k=size_k, size_n=size_n)
-        )
+        repacked = _repack_4bit_no_perm(qweight, size_k=size_k, size_n=size_n)
+        packed[expert].copy_(repacked)
+        del qweight, repacked
     return packed
 
 

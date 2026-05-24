@@ -15,6 +15,7 @@ from cutlass.cute.nvgpu.warp import mma
 import b12x.cute.runtime_patches as runtime_patches
 from b12x.cute.runtime_patches import (
     _build_compile_disk_cache_key,
+    _compile_disk_cache_payload,
     _structural_cache_key,
 )
 from b12x.cute.utils import make_ptr
@@ -90,7 +91,12 @@ def test_compile_disk_cache_key_ignores_pointer_address_and_stream_value() -> No
     assert key_a == key_b
 
 
-def test_compile_miss_log_includes_target_attrs_and_arg_shapes(capsys) -> None:
+def test_compile_miss_log_includes_target_attrs_and_arg_shapes(
+    capsys, monkeypatch
+) -> None:
+    monkeypatch.delenv("B12X_LOG_CUTE_COMPILE_STACK", raising=False)
+    monkeypatch.setenv("B12X_LOG_CUTE_COMPILES", "1")
+
     class FakeKernel:
         def __init__(self) -> None:
             self.m = 16
@@ -107,8 +113,10 @@ def test_compile_miss_log_includes_target_attrs_and_arg_shapes(capsys) -> None:
         FakeKernel(),
         (fake, 7),
         {},
-        cache_key="abcdef0123456789",
         cache_status="disk-cache-miss",
+        cache_payload=_compile_disk_cache_payload(
+            cute.compile, FakeKernel(), (fake, 7), {}
+        ),
     )
 
     out = capsys.readouterr().out
@@ -116,10 +124,38 @@ def test_compile_miss_log_includes_target_attrs_and_arg_shapes(capsys) -> None:
     assert "FakeKernel" in out
     assert "'m': 16" in out
     assert "'n': 4096" in out
-    assert "_private" not in out
     assert "'shape': '(4, 8)'" in out
     assert "'align': 4" in out
-    assert "abcdef0123456789" in out
+    assert "key_inputs=" in out
+    assert "'_private': 'hidden'" in out
+    assert " cache=" not in out
+    assert "python_stack" not in out
+
+
+def test_compile_miss_log_can_include_python_stack(capsys, monkeypatch) -> None:
+    monkeypatch.setenv("B12X_LOG_CUTE_COMPILE_STACK", "1")
+
+    class FakeKernel:
+        def __call__(self) -> None:
+            pass
+
+    def call_logger() -> None:
+        runtime_patches._log_cute_compile_miss(
+            FakeKernel(),
+            (),
+            {},
+            cache_status="disk-cache-miss",
+            cache_payload=_compile_disk_cache_payload(
+                cute.compile, FakeKernel(), (), {}
+            ),
+        )
+
+    call_logger()
+
+    out = capsys.readouterr().out
+    assert "[b12x cute.compile] python_stack" in out
+    assert "call_logger" in out
+    assert "test_cutlass_runtime_patches.py" in out
 
 
 def test_compile_disk_cache_key_changes_with_compile_env(monkeypatch) -> None:
