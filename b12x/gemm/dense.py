@@ -115,6 +115,7 @@ class DenseGemmKernel:
         single_work_tile_per_cta: bool = False,
         use_prefetch: bool = False,
         enable_pdl: bool = True,
+        direct_one_m_tile_scheduler: bool = False,
         use_m1_non_tma_a: bool = False,
         use_m1_non_tma_c: bool = False,
         use_m1_non_tma_sfa: bool = False,
@@ -134,13 +135,25 @@ class DenseGemmKernel:
         self.single_work_tile_per_cta = single_work_tile_per_cta
         self.use_prefetch = use_prefetch
         self.enable_pdl = enable_pdl
+        self.direct_one_m_tile_scheduler = direct_one_m_tile_scheduler
         self.use_m1_non_tma_a = use_m1_non_tma_a
         self.use_m1_non_tma_c = use_m1_non_tma_c
         self.use_m1_non_tma_sfa = use_m1_non_tma_sfa
+        if mma_tiler_mn in ((16, 64), (16, 128)):
+            self.atom_shape = (1, 2, 1)
+        elif mma_tiler_mn in ((32, 64), (32, 128)):
+            self.atom_shape = (2, 2, 1)
+        else:
+            self.atom_shape = (4, 2, 1)
 
         self.tiled_mma = None
         self.occupancy = 1
-        self.num_mma_warps = 8
+        if mma_tiler_mn in ((16, 64), (16, 128)):
+            self.num_mma_warps = 2
+        elif mma_tiler_mn in ((32, 64), (32, 128)):
+            self.num_mma_warps = 4
+        else:
+            self.num_mma_warps = 8
         self.tma_load_warp_id = self.num_mma_warps
         self.num_threads_per_warp = 32
         self.threads_per_cta = (
@@ -181,7 +194,7 @@ class DenseGemmKernel:
                 self.acc_dtype,
                 self.sf_dtype,
             )
-        atom_shape = (4, 2, 1)
+        atom_shape = self.atom_shape
         atom_layout = cute.make_layout(atom_shape)
         permutation_mnk = sm120_utils.get_permutation_mnk(
             self.tile_shape_mnk,
@@ -663,10 +676,17 @@ class DenseGemmKernel:
         k_tile_cnt = cute.size(gA_mkl, mode=[3])
 
         # Tile scheduler
-        tile_sched = utils.StaticPersistentTileScheduler.create(
-            tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-        )
-        work_tile = tile_sched.initial_work_tile_info()
+        block_idx = cute.arch.block_idx()
+        if cutlass.const_expr(self.direct_one_m_tile_scheduler):
+            work_tile = WorkTileInfo(
+                (Int32(0), Int32(block_idx[2]), Int32(0)),
+                cutlass.Boolean(1),
+            )
+        else:
+            tile_sched = utils.StaticPersistentTileScheduler.create(
+                tile_sched_params, block_idx, cute.arch.grid_dim()
+            )
+            work_tile = tile_sched.initial_work_tile_info()
 
         # Pipeline states
         mainloop_producer_state = pipeline.make_pipeline_state(
@@ -1455,7 +1475,10 @@ class DenseGemmKernel:
         # Tile M must be divisible by 128; tile N follows 64-column warpgroup
         # quanta, while the SF paths round narrow tiles up to full 128-element
         # scale-factor blocks.
-        if mma_tiler_mn[0] % 64 != 0 or mma_tiler_mn[1] % 64 != 0:
+        if mma_tiler_mn in ((16, 64), (16, 128), (32, 64), (32, 128)):
+            if ab_dtype != cutlass.Float8E4M3FN:
+                return False
+        elif mma_tiler_mn[0] % 64 != 0 or mma_tiler_mn[1] % 64 != 0:
             return False
         # The current target supports FP4 and MXFP8 warp MMA paths.
         if ab_dtype not in (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN):
@@ -1603,6 +1626,12 @@ class _DenseGemmLaunch:
             * self._l
             <= self._max_active_clusters
         )
+        direct_one_m_tile_scheduler = (
+            single_work_tile_per_cta
+            and self._m < 16
+            and self._m <= tile_m
+            and self._l == 1
+        )
 
         m1_fp8 = self._ab_dtype == cutlass.Float8E4M3FN and self._m == 1
         DenseGemmKernel(
@@ -1612,6 +1641,7 @@ class _DenseGemmLaunch:
             mma_k=self._mma_k,
             tile_k=self._tile_k,
             single_work_tile_per_cta=single_work_tile_per_cta,
+            direct_one_m_tile_scheduler=direct_one_m_tile_scheduler,
             # The M=1 FP8 shape uses a 128-row MMA/TMA tile. In this lowering,
             # the narrow A/SFA/C tensor-map paths illegal-instruction instead
             # of relying on OOB handling, so keep them as explicit direct paths.
@@ -1784,11 +1814,31 @@ def _get_compiled_dense_gemm(
     return tensor_api
 
 
-def _select_default_mma_tiler_mn(m: int, n: int, sm_count: int) -> Tuple[int, int]:
+def _select_default_mma_tiler_mn(
+    m: int,
+    n: int,
+    sm_count: int,
+    *,
+    is_mxfp8: bool,
+) -> Tuple[int, int]:
     coarse_tile = (128, 128)
     coarse_tiles = ((m + coarse_tile[0] - 1) // coarse_tile[0]) * (
         (n + coarse_tile[1] - 1) // coarse_tile[1]
     )
+    if is_mxfp8 and n > 1536 and m == 2:
+        return (16, 64)
+    if is_mxfp8 and n > 1536 and m == 32:
+        return (16, 64)
+    if is_mxfp8 and n > 1536 and m == 16:
+        return (16, 128)
+    if is_mxfp8 and n > 1536 and m == 1:
+        return (16, 128)
+    if is_mxfp8 and n > 1536 and m == 128:
+        return (32, 128)
+    if is_mxfp8 and n > 1536 and 1 < m <= 64:
+        return (32, 64)
+    if is_mxfp8 and n > 1536 and m <= 128:
+        return (64, 64)
     # The coarse CTA-count heuristic misses exact-small-M, wide-N cases: a wide
     # N dimension can generate plenty of CTAs even while each 128-row M tile is
     # mostly empty. Keep using the narrower 64x128 tile while the 128x128 plan
@@ -1833,10 +1883,12 @@ def dense_gemm(
     m, k, l = a_torch.shape
     n, _, _ = b_torch.shape
     if ab_dtype == "float4_e2m1fn":
+        is_mxfp8 = False
         k *= 2
         mma_k = 64
         tile_k = sf_vec_size * 8
     elif ab_dtype == "float8_e4m3fn":
+        is_mxfp8 = True
         mma_k = 32
         tile_k = 128
     else:
@@ -1845,7 +1897,12 @@ def dense_gemm(
     if sm_count is None:
         sm_count = get_num_sm(a_torch.device)
     if mma_tiler_mn is None:
-        mma_tiler_mn = _select_default_mma_tiler_mn(m, n, sm_count)
+        mma_tiler_mn = _select_default_mma_tiler_mn(
+            m,
+            n,
+            sm_count,
+            is_mxfp8=is_mxfp8,
+        )
     if alpha_dtype is None:
         alpha_dtype = "float32" if alpha is None else str(alpha.dtype).split(".")[-1]
 
