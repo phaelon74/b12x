@@ -16,8 +16,6 @@ class SeqlenInfoQK:
     seqlen_k: Int32
     has_cu_seqlens_q: cutlass.Constexpr[bool]
     has_cu_seqlens_k: cutlass.Constexpr[bool]
-    has_seqused_q: cutlass.Constexpr[bool]
-    has_seqused_k: cutlass.Constexpr[bool]
 
     @staticmethod
     def create(
@@ -26,8 +24,6 @@ class SeqlenInfoQK:
         seqlen_k_static: Int32,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         mCuSeqlensK: Optional[cute.Tensor] = None,
-        mSeqUsedQ: Optional[cute.Tensor] = None,
-        mSeqUsedK: Optional[cute.Tensor] = None,
         tile_m: cutlass.Constexpr[Int32] = 128,
         tile_n: cutlass.Constexpr[Int32] = 128,
     ):
@@ -44,22 +40,14 @@ class SeqlenInfoQK:
             else cute.assume((offset_k + batch_idx * tile_n) // tile_n * tile_n, divby=tile_n)
         )
         seqlen_q = (
-            mSeqUsedQ[batch_idx]
-            if const_expr(mSeqUsedQ is not None)
-            else (
-                seqlen_q_static
-                if const_expr(mCuSeqlensQ is None)
-                else mCuSeqlensQ[batch_idx + 1] - offset_q
-            )
+            seqlen_q_static
+            if const_expr(mCuSeqlensQ is None)
+            else mCuSeqlensQ[batch_idx + 1] - offset_q
         )
         seqlen_k = (
-            mSeqUsedK[batch_idx]
-            if const_expr(mSeqUsedK is not None)
-            else (
-                seqlen_k_static
-                if const_expr(mCuSeqlensK is None)
-                else mCuSeqlensK[batch_idx + 1] - offset_k
-            )
+            seqlen_k_static
+            if const_expr(mCuSeqlensK is None)
+            else mCuSeqlensK[batch_idx + 1] - offset_k
         )
         return SeqlenInfoQK(
             offset_q,
@@ -70,62 +58,6 @@ class SeqlenInfoQK:
             seqlen_k,
             has_cu_seqlens_q=mCuSeqlensQ is not None,
             has_cu_seqlens_k=mCuSeqlensK is not None,
-            has_seqused_q=mSeqUsedQ is not None,
-            has_seqused_k=mSeqUsedK is not None,
-        )
-
-    @staticmethod
-    def create_decode(
-        batch_idx: Int32,
-        seqlen_q_static: Int32,
-        seqlen_k_static: Int32,
-        mSeqUsedK: Optional[cute.Tensor] = None,
-        tile_m: cutlass.Constexpr[Int32] = 128,
-        tile_n: cutlass.Constexpr[Int32] = 128,
-    ):
-        del seqlen_q_static, tile_n
-        padded_offset_q = cute.assume(batch_idx * tile_m, divby=tile_m)
-        seqlen_k = seqlen_k_static if const_expr(mSeqUsedK is None) else mSeqUsedK[batch_idx]
-        return SeqlenInfoQK(
-            offset_q=batch_idx,
-            offset_k=Int32(0),
-            padded_offset_q=padded_offset_q,
-            padded_offset_k=Int32(0),
-            seqlen_q=Int32(1),
-            seqlen_k=seqlen_k,
-            has_cu_seqlens_q=True,
-            has_cu_seqlens_k=False,
-            has_seqused_q=False,
-            has_seqused_k=mSeqUsedK is not None,
-        )
-
-    @staticmethod
-    def create_uniform_q(
-        batch_idx: Int32,
-        seqlen_q_static: Int32,
-        seqlen_k_static: Int32,
-        mSeqUsedK: Optional[cute.Tensor] = None,
-        tile_m: cutlass.Constexpr[Int32] = 128,
-        tile_n: cutlass.Constexpr[Int32] = 128,
-    ):
-        del tile_n
-        offset_q = batch_idx * seqlen_q_static
-        padded_offset_q = cute.assume(
-            batch_idx * cute.ceil_div(seqlen_q_static, tile_m) * tile_m,
-            divby=tile_m,
-        )
-        seqlen_k = seqlen_k_static if const_expr(mSeqUsedK is None) else mSeqUsedK[batch_idx]
-        return SeqlenInfoQK(
-            offset_q=offset_q,
-            offset_k=Int32(0),
-            padded_offset_q=padded_offset_q,
-            padded_offset_k=Int32(0),
-            seqlen_q=seqlen_q_static,
-            seqlen_k=seqlen_k,
-            has_cu_seqlens_q=True,
-            has_cu_seqlens_k=False,
-            has_seqused_q=False,
-            has_seqused_k=mSeqUsedK is not None,
         )
 
     def offset_batch_Q(
