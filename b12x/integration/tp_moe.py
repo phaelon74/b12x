@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import weakref
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from typing import Dict, Tuple
@@ -472,7 +473,7 @@ _DYNAMIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 _MAC_CACHE: Dict[Tuple[int, str], int] = {}  # (device_idx, impl) → max_active_clusters
 _PLAIN_PARAM_CACHE: Dict[
     Tuple[int, Tuple[int, ...], Tuple[int, ...], torch.dtype, torch.dtype, int],
-    torch.Tensor,
+    tuple[weakref.ReferenceType[torch.Tensor], torch.Tensor],
 ] = {}
 _W4A16_ALPHA_CACHE: Dict[Tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 _MICRO_COMPACT_CUTOVER_PAIRS_DEFAULT = 20
@@ -706,11 +707,14 @@ def _get_plain_cuda_tensor(
         )
         cached = _PLAIN_PARAM_CACHE.get(key)
         if cached is not None:
-            return cached
+            cached_source, cached_plain = cached
+            if cached_source() is t:
+                return cached_plain
+            _PLAIN_PARAM_CACHE.pop(key, None)
         plain = torch.empty(tuple(t.shape), dtype=target_dtype, device=t.device)
         with record_function("tp_moe.get_plain_cuda_tensor.copy"):
             plain.copy_(t.to(target_dtype) if t.dtype != target_dtype else t)
-        _PLAIN_PARAM_CACHE[key] = plain
+        _PLAIN_PARAM_CACHE[key] = (weakref.ref(t), plain)
         return plain
 
 

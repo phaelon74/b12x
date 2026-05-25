@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import weakref
+
 import pytest
 import torch
 
 from b12x.cute.fp4 import swizzle_block_scale
+import b12x.integration.tp_moe as tp_moe
 from b12x.integration.tp_moe import (
     prepare_b12x_w4a16_modelopt_nvfp4_weights,
     prepare_b12x_w4a16_packed_weights,
@@ -50,6 +53,31 @@ def _make_case(
         _positive_fp8((experts, hidden_size, intermediate_size // 16))
     )
     return w13, w13_blockscale, w2, w2_blockscale
+
+
+def test_plain_param_cache_revalidates_tensor_identity() -> None:
+    tp_moe._PLAIN_PARAM_CACHE.clear()
+    stale_source = torch.tensor([1.0, 2.0], dtype=torch.float32)
+    requested = torch.tensor([3.0, 4.0], dtype=torch.float32)
+    stale_plain = torch.tensor([9.0, 8.0], dtype=torch.float32)
+    key = (
+        requested.data_ptr(),
+        tuple(requested.shape),
+        tuple(requested.stride()),
+        requested.dtype,
+        requested.dtype,
+        int(requested._version),
+    )
+    tp_moe._PLAIN_PARAM_CACHE[key] = (weakref.ref(stale_source), stale_plain)
+
+    actual = tp_moe._get_plain_cuda_tensor(requested)
+
+    assert actual is not stale_plain
+    assert torch.equal(actual, requested)
+    cached_source, cached_plain = tp_moe._PLAIN_PARAM_CACHE[key]
+    assert cached_source() is requested
+    assert cached_plain is actual
+    tp_moe._PLAIN_PARAM_CACHE.clear()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
