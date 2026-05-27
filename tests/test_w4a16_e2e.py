@@ -14,7 +14,11 @@ from b12x.integration.tp_moe import (
     b12x_moe_fp4,
     prepare_b12x_fp4_moe_weights,
 )
-from b12x.moe.fused.reference import moe_reference_nvfp4, moe_reference_w4a16_f32
+from b12x.moe.fused.reference import (
+    moe_reference_nvfp4,
+    moe_reference_w4a16_f32,
+    moe_reference_w4a16_fp4_e8m0_k32,
+)
 from b12x.moe.fused.w4a16.host import max_packed_route_slots, select_route_block_size_m
 from b12x.moe.fused.w4a16.kernel import (
     _DEFAULT_MAX_SHARED_MEM,
@@ -25,12 +29,31 @@ from b12x.moe.fused.w4a16.kernel import (
 from b12x.moe.fused.w4a16.prepare import (
     make_w4a16_packed_buffers as make_w4a16_buffers,
     prepare_w4a16_modelopt_nvfp4_weights as prepare_w4a16_weights,
+    prepare_w4a16_packed_weights,
 )
 from tests.w4a16_reference import compare_to_reference, moe_reference_w4a16
 
 
 def _positive_fp8(shape: tuple[int, ...]) -> torch.Tensor:
     return (torch.rand(shape, device="cuda") * 0.25 + 0.03125).to(torch.float8_e4m3fn)
+
+
+def _constant_e8m0(shape: tuple[int, ...], byte: int) -> torch.Tensor:
+    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+    if e8m0_dtype is None:
+        pytest.skip("requires torch.float8_e8m0fnu")
+    return torch.full(shape, byte, dtype=torch.uint8, device="cuda").view(e8m0_dtype)
+
+
+def _pattern_e8m0(shape: tuple[int, ...], *, offset: int = 0) -> torch.Tensor:
+    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+    if e8m0_dtype is None:
+        pytest.skip("requires torch.float8_e8m0fnu")
+    numel = 1
+    for dim in shape:
+        numel *= int(dim)
+    storage = ((torch.arange(numel, device="cuda", dtype=torch.int64) + offset) % 4 + 119)
+    return storage.to(torch.uint8).reshape(shape).view(e8m0_dtype)
 
 
 def _quantize_dense_moe_weight_storage(
@@ -206,6 +229,99 @@ def _assert_matches_oracle(
     metrics = compare_to_reference(actual, expected)
     min_cos = 0.9975 if activation == "silu" else 0.9900
     assert metrics.cos >= min_cos, metrics
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("activation", ["relu2", "silu"])
+def test_w4a16_fp4_e8m0_k32_kernel_matches_raw_e8m0_oracle(
+    activation: str,
+) -> None:
+    experts, hidden_size, intermediate_size = 4, 128, 128
+    rows = intermediate_size * (2 if activation == "silu" else 1)
+    m, topk = 8, 2
+    torch.manual_seed(20260526 + (1000 if activation == "silu" else 0))
+    w13 = torch.randint(
+        0,
+        256,
+        (experts, rows, hidden_size // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w2 = torch.randint(
+        0,
+        256,
+        (experts, hidden_size, intermediate_size // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w13_scale = _pattern_e8m0((experts, rows, hidden_size // 32))
+    w2_scale = _pattern_e8m0((experts, hidden_size, intermediate_size // 32), offset=1)
+    w13_global_scale = torch.ones(experts, dtype=torch.float32, device="cuda")
+    w2_global_scale = torch.ones(experts, dtype=torch.float32, device="cuda")
+    prepared = prepare_w4a16_packed_weights(
+        w13,
+        w13_scale,
+        w13_global_scale,
+        w2,
+        w2_scale,
+        w2_global_scale,
+        activation=activation,
+        params_dtype=torch.bfloat16,
+        source_format="fp4_e8m0_k32",
+    )
+    buffers = make_w4a16_buffers(
+        prepared,
+        m=m,
+        topk=topk,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    )
+    x = torch.randn(m, hidden_size, dtype=torch.bfloat16, device="cuda")
+    topk_ids = torch.tensor(
+        [[0, 1], [2, 3], [1, 0], [3, 2], [0, 2], [1, 3], [2, 0], [3, 1]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    topk_weights = torch.rand(m, topk, dtype=torch.float32, device="cuda")
+
+    actual = run_w4a16_moe(
+        x,
+        prepared,
+        topk_weights,
+        topk_ids,
+        activation=activation,
+        intermediate_cache13=buffers.intermediate_cache13,
+        intermediate_cache2=buffers.intermediate_cache2,
+        output=buffers.output,
+        fc1_c_tmp=buffers.fc1_c_tmp,
+        fc2_c_tmp=buffers.fc2_c_tmp,
+        packed_route_indices=buffers.packed_route_indices,
+        block_expert_ids=buffers.block_expert_ids,
+        packed_route_count=buffers.packed_route_count,
+        expert_offsets=buffers.expert_offsets,
+        swiglu_limit=10.0 if activation == "silu" else None,
+    )
+    expected = moe_reference_w4a16_fp4_e8m0_k32(
+        x,
+        w13,
+        w13_scale,
+        w13_global_scale,
+        w2,
+        w2_scale,
+        w2_global_scale,
+        topk_ids,
+        topk_weights,
+        experts,
+        hidden_size,
+        intermediate_size,
+        activation=activation,
+        swiglu_limit=10.0 if activation == "silu" else None,
+        w13_layout="w13",
+    )
+    torch.cuda.synchronize()
+
+    assert bool((actual != 0).any().item())
+    _assert_matches_oracle(actual, expected, activation=activation)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

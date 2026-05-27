@@ -21,14 +21,19 @@ from typing import Callable, Sequence
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
+import torch.nn.functional as F
 
 from benchmarks.checkpoint_loader import IndexedSafetensorLoader
 from b12x.moe.fused.reference import (
+    FlashInferTrtllmFP4E8M0K32Weights,
     OracleMetrics,
     compare_to_reference,
     moe_reference_f32,
     moe_reference_nvfp4,
+    moe_reference_w4a16_fp4_e8m0_k32,
+    moe_reference_w4a16_fp4_e8m0_k32_flashinfer_prepared,
     moe_reference_w4a16_f32,
+    prepare_flashinfer_trtllm_fp4_e8m0_k32_weights,
 )
 from b12x.cute.fp4 import as_grouped_scale_view, swizzle_block_scale
 from b12x.cute.utils import get_hardware_info
@@ -65,9 +70,8 @@ _FALLBACK_L2_FLUSH_BYTES = 32 << 20
 
 
 def require_sm120() -> None:
-    major, minor = torch.cuda.get_device_capability()
-    if major != 12 or minor not in (0, 1):
-        raise RuntimeError(f"Requires sm_120 or sm_121, got sm_{major}{minor}")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required")
 
 
 def resolve_l2_flush_bytes(bytes_hint: int) -> int:
@@ -260,6 +264,8 @@ class ModelProfile:
     default_activation: str = "silu"
     default_quant_mode: str | None = None
     default_validate: str = "oracle"
+    default_swiglu_limit: float | None = None
+    default_routing: str = "synthetic"
     shape: ShapeSpec | None = None
 
 
@@ -319,6 +325,18 @@ MODEL_PROFILES = {
             num_experts=256,
             top_k=8,
         ),
+    ),
+    "deepseek-v4-flash": ModelProfile(
+        label="DeepSeek V4 Flash",
+        checkpoint_family="deepseek_v4_flash",
+        default_layer_idx=3,
+        tp_size=4,
+        hf_repo_id="deepseek-ai/DeepSeek-V4-Flash",
+        default_activation="silu",
+        default_quant_mode="w4a16",
+        default_validate="oracle",
+        default_swiglu_limit=10.0,
+        default_routing="model",
     ),
     "glm51": ModelProfile(
         label="GLM-5.1",
@@ -428,11 +446,31 @@ class ExpertWeights:
     source_format: str = "modelopt_nvfp4"
     w4a16_w13_global_scale: torch.Tensor | None = None
     w4a16_w2_global_scale: torch.Tensor | None = None
+    gate_weight: torch.Tensor | None = None
+    gate_bias: torch.Tensor | None = None
+    gate_tid2eid: torch.Tensor | None = None
+    gate_score_func: str = "softmax"
+    gate_route_scale: float = 1.0
+    gate_norm_topk_prob: bool = True
+    oracle_w13_weight: torch.Tensor | None = None
+    oracle_w13_scale: torch.Tensor | None = None
+    oracle_w2_weight: torch.Tensor | None = None
+    oracle_w2_scale: torch.Tensor | None = None
+    oracle_flashinfer_weights: FlashInferTrtllmFP4E8M0K32Weights | None = None
+    w13_layout: str = "w31"
 
 
 def _load_config(model_path: pathlib.Path) -> dict:
     raw_cfg = json.loads((model_path / "config.json").read_text())
     return raw_cfg.get("text_config", raw_cfg)
+
+
+def _fp4_checkpoint_bytes(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.dtype == torch.uint8:
+        return tensor
+    if tensor.element_size() != 1:
+        raise TypeError(f"expected one-byte packed FP4 tensor, got {tensor.dtype}")
+    return tensor.view(torch.uint8)
 
 
 def build_model_spec(model_path: pathlib.Path, profile: ModelProfile, *, tp_size_override: int | None = None, tp_rank: int = 0) -> ModelSpec:
@@ -476,6 +514,15 @@ def build_model_spec(model_path: pathlib.Path, profile: ModelProfile, *, tp_size
             tp_rank=tp_rank,
         )
     if profile.checkpoint_family == "nano35_w4a16":
+        return ModelSpec(
+            hidden_size=cfg["hidden_size"],
+            intermediate_size=cfg["moe_intermediate_size"],
+            num_experts=cfg["n_routed_experts"],
+            top_k=cfg["num_experts_per_tok"],
+            tp_size=tp,
+            tp_rank=tp_rank,
+        )
+    if profile.checkpoint_family == "deepseek_v4_flash":
         return ModelSpec(
             hidden_size=cfg["hidden_size"],
             intermediate_size=cfg["moe_intermediate_size"],
@@ -589,6 +636,7 @@ def load_expert_weights(
     layer_idx: int = 0,
     activation: str = "silu",
     checkpoint_family: str = "qwen",
+    keep_flashinfer_oracle_copy: bool = False,
 ) -> ExpertWeights:
     if activation not in {"silu", "relu2"}:
         raise ValueError(f"unsupported activation {activation!r}")
@@ -600,6 +648,18 @@ def load_expert_weights(
     source_format = "modelopt_nvfp4"
     w4a16_w13_global_scale = None
     w4a16_w2_global_scale = None
+    gate_weight = None
+    gate_bias = None
+    gate_tid2eid = None
+    gate_score_func = "softmax"
+    gate_route_scale = 1.0
+    gate_norm_topk_prob = True
+    oracle_w13_weight = None
+    oracle_w13_scale = None
+    oracle_w2_weight = None
+    oracle_w2_scale = None
+    oracle_flashinfer_weights = None
+    w13_layout = "w31"
     if checkpoint_family in {"nano35_w4a16_shape", "dsv4f_shape"}:
         return make_shape_only_expert_weights(spec, layer_idx=layer_idx, activation=activation)
 
@@ -811,6 +871,114 @@ def load_expert_weights(
         g1_alphas = ones
         g2_alphas = ones
         g1_alphas_per_expert = ones
+    elif checkpoint_family == "deepseek_v4_flash":
+        if activation != "silu":
+            raise ValueError("DeepSeek V4 Flash FP4 benchmark expects silu experts")
+        if spec.hidden_size % 32 != 0 or spec.I_tp % 32 != 0:
+            raise ValueError(
+                f"DeepSeek V4 Flash W4A16 requires K and I_tp divisible by 32, "
+                f"got K={spec.hidden_size}, I_tp={spec.I_tp}"
+            )
+        assert cfg["n_routed_experts"] == spec.num_experts
+        assert cfg["moe_intermediate_size"] == spec.intermediate_size
+        assert cfg["hidden_size"] == spec.hidden_size
+
+        source_format = "fp4_e8m0_k32"
+        w13_layout = "w31"
+        prefix = f"layers.{layer_idx}.ffn.experts"
+        gate_proj = "w1"
+        up_proj = "w3"
+        down_proj = "w2"
+        e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+        if e8m0_dtype is None:
+            raise RuntimeError("DeepSeek V4 Flash FP4 scales require torch.float8_e8m0fnu")
+
+        gate_w = torch.empty(E, I_tp, K // 2, dtype=torch.uint8, device=device)
+        up_w = torch.empty(E, I_tp, K // 2, dtype=torch.uint8, device=device)
+        down_w = torch.empty(E, K, I_tp // 2, dtype=torch.uint8, device=device)
+
+        gate_sf = torch.empty(E, I_tp, K // 32, dtype=e8m0_dtype, device=device)
+        up_sf = torch.empty(E, I_tp, K // 32, dtype=e8m0_dtype, device=device)
+        down_sf = torch.empty(E, K, I_tp // 32, dtype=e8m0_dtype, device=device)
+
+        print(f"  Loading {E} DeepSeek V4 Flash FP4 experts...", end="", flush=True)
+        for eid in range(E):
+            ep = f"{prefix}.{eid}"
+            tp_off = spec.tp_rank * I_tp
+            tp_off_packed = spec.tp_rank * (I_tp // 2)
+            tp_sf_cols = I_tp // 32
+            tp_sf_off = spec.tp_rank * tp_sf_cols
+
+            gate_w[eid] = _fp4_checkpoint_bytes(
+                loader.get_tensor(f"{ep}.{gate_proj}.weight")
+            ).narrow(0, tp_off, I_tp).to(device)
+            gate_sf[eid] = loader.get_tensor(f"{ep}.{gate_proj}.scale").narrow(0, tp_off, I_tp).to(device)
+
+            up_w[eid] = _fp4_checkpoint_bytes(
+                loader.get_tensor(f"{ep}.{up_proj}.weight")
+            ).narrow(0, tp_off, I_tp).to(device)
+            up_sf[eid] = loader.get_tensor(f"{ep}.{up_proj}.scale").narrow(0, tp_off, I_tp).to(device)
+
+            down_w[eid] = _fp4_checkpoint_bytes(
+                loader.get_tensor(f"{ep}.{down_proj}.weight")
+            ).narrow(1, tp_off_packed, I_tp // 2).to(device)
+            down_sf[eid] = loader.get_tensor(f"{ep}.{down_proj}.scale").narrow(1, tp_sf_off, tp_sf_cols).to(device)
+        print(" done.")
+
+        # Match vLLM FusedMoE loading for the B12X backend: native DeepSeek V4
+        # FP4 W13 source is contiguous [w1/gate, w3/up], and B12X receives it
+        # without an additional row swap.
+        w13_weight = torch.cat([gate_w, up_w], dim=1).contiguous()
+        w13_sf = torch.cat([gate_sf, up_sf], dim=1).contiguous()
+        if keep_flashinfer_oracle_copy:
+            # Build the oracle copy in the exact FlashInfer/TRT-LLM structure
+            # vLLM prepares from its independently loaded [w1, w3] source.
+            oracle_w13_weight = w13_weight.clone()
+            oracle_w13_scale = w13_sf.clone()
+            oracle_w2_weight = down_w.contiguous().clone()
+            oracle_w2_scale = down_sf.contiguous().clone()
+            oracle_flashinfer_weights = prepare_flashinfer_trtllm_fp4_e8m0_k32_weights(
+                oracle_w13_weight,
+                oracle_w13_scale,
+                oracle_w2_weight,
+                oracle_w2_scale,
+                K,
+                I_tp,
+                activation=activation,
+                scale_byte_clamp=None,
+            )
+        w13_sf.view(torch.uint8).clamp_(max=247)
+        down_sf.view(torch.uint8).clamp_(max=247)
+        w13_blockscale_swizzled = w13_sf
+        w2_weight = down_w.contiguous()
+        w2_blockscale_swizzled = down_sf.contiguous()
+
+        w13_permuted = w13_weight.permute(1, 2, 0)
+        w13_scale = w13_sf
+        down_permuted = w2_weight.permute(1, 2, 0)
+        down_scale = down_sf
+
+        ones = torch.ones(E, dtype=torch.float32, device=device)
+        w13_input_scale = torch.ones((), dtype=torch.float32, device=device)
+        w2_input_scale = torch.ones((), dtype=torch.float32, device=device)
+        w13_input_scale_per_expert = ones
+        down_is = ones
+        down_gs = ones
+        g1_alphas = ones
+        g2_alphas = ones
+        g1_alphas_per_expert = ones
+
+        gate_prefix = f"layers.{layer_idx}.ffn.gate"
+        gate_weight = loader.get_tensor(f"{gate_prefix}.weight").to(device=device).contiguous()
+        bias_key = f"{gate_prefix}.bias"
+        if bias_key in loader.weight_map:
+            gate_bias = loader.get_tensor(bias_key).to(device=device).contiguous()
+        tid2eid_key = f"{gate_prefix}.tid2eid"
+        if tid2eid_key in loader.weight_map:
+            gate_tid2eid = loader.get_tensor(tid2eid_key).to(device=device).contiguous()
+        gate_score_func = str(cfg.get("scoring_func", "softmax")).lower()
+        gate_route_scale = float(cfg.get("routed_scaling_factor", 1.0))
+        gate_norm_topk_prob = bool(cfg.get("norm_topk_prob", True))
     else:
         raise ValueError(f"unsupported checkpoint family {checkpoint_family!r}")
 
@@ -846,6 +1014,18 @@ def load_expert_weights(
         source_format=source_format,
         w4a16_w13_global_scale=w4a16_w13_global_scale,
         w4a16_w2_global_scale=w4a16_w2_global_scale,
+        gate_weight=gate_weight,
+        gate_bias=gate_bias,
+        gate_tid2eid=gate_tid2eid,
+        gate_score_func=gate_score_func,
+        gate_route_scale=gate_route_scale,
+        gate_norm_topk_prob=gate_norm_topk_prob,
+        oracle_w13_weight=oracle_w13_weight,
+        oracle_w13_scale=oracle_w13_scale,
+        oracle_w2_weight=oracle_w2_weight,
+        oracle_w2_scale=oracle_w2_scale,
+        oracle_flashinfer_weights=oracle_flashinfer_weights,
+        w13_layout=w13_layout,
     )
 
 
@@ -857,6 +1037,7 @@ def load_expert_weight_stack(
     num_layers: int,
     activation: str = "silu",
     checkpoint_family: str = "qwen",
+    keep_flashinfer_oracle_copy: bool = False,
 ) -> list[ExpertWeights]:
     return [
         load_expert_weights(
@@ -865,6 +1046,7 @@ def load_expert_weight_stack(
             layer_idx=layer_start + layer_offset,
             activation=activation,
             checkpoint_family=checkpoint_family,
+            keep_flashinfer_oracle_copy=keep_flashinfer_oracle_copy,
         )
         for layer_offset in range(num_layers)
     ]
@@ -921,6 +1103,67 @@ def make_routed_inputs(
     ).to(device=device)
     topk_logits, topk_ids = torch.topk(routing_logits, spec.top_k, dim=-1)
     topk_weights = torch.softmax(topk_logits, dim=-1)
+    return x, topk_ids, topk_weights
+
+
+def compute_model_gate_routing(
+    weights: ExpertWeights,
+    x: torch.Tensor,
+    *,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if weights.gate_weight is None:
+        raise ValueError("model gate routing requires gate_weight")
+    scores = F.linear(x.float(), weights.gate_weight.float())
+    score_func = weights.gate_score_func
+    if score_func == "softmax":
+        original_scores = torch.softmax(scores, dim=-1)
+    elif score_func == "sigmoid":
+        original_scores = torch.sigmoid(scores)
+    elif score_func == "sqrtsoftplus":
+        original_scores = F.softplus(scores).sqrt()
+    else:
+        raise ValueError(f"unsupported model gate score function {score_func!r}")
+
+    if weights.gate_tid2eid is not None:
+        routing_generator = torch.Generator(device="cpu")
+        routing_generator.manual_seed(seed + 17)
+        input_ids = torch.randint(
+            0,
+            weights.gate_tid2eid.shape[0],
+            (x.shape[0],),
+            generator=routing_generator,
+            dtype=torch.int64,
+        ).to(device=x.device)
+        topk_ids = weights.gate_tid2eid[input_ids].to(device=x.device)
+    else:
+        selection_scores = original_scores
+        if weights.gate_bias is not None:
+            selection_scores = selection_scores + weights.gate_bias.to(device=x.device)
+        _topk_scores, topk_ids = torch.topk(selection_scores, weights.spec.top_k, dim=-1)
+
+    topk_weights = original_scores.gather(1, topk_ids)
+    if score_func != "softmax" and weights.gate_norm_topk_prob:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+    topk_weights = topk_weights * weights.gate_route_scale
+    return topk_ids, topk_weights
+
+
+def make_profile_routed_inputs(
+    profile: ModelProfile,
+    weights: ExpertWeights,
+    spec: ModelSpec,
+    m: int,
+    seed: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    x = make_input_activations(spec, m, seed, device)
+    if profile.default_routing == "model":
+        topk_ids, topk_weights = compute_model_gate_routing(weights, x, seed=seed + 1)
+        return x, topk_ids, topk_weights
+    if profile.default_routing != "synthetic":
+        raise ValueError(f"unsupported routing source {profile.default_routing!r}")
+    _x, topk_ids, topk_weights = make_routed_inputs(spec, m, seed, device)
     return x, topk_ids, topk_weights
 
 
@@ -1121,6 +1364,7 @@ def make_oracle_reference(
     topk_weights: torch.Tensor,
     *,
     activation: str,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     spec = weights.spec
     quant_mode = quant_mode.lower()
@@ -1128,6 +1372,42 @@ def make_oracle_reference(
         if oracle_mode == "nvfp4":
             raise ValueError("--oracle-mode nvfp4 is not valid with --quant-mode w4a16")
         params = get_w4a16_oracle_params(weights, params)
+        if weights.source_format == "fp4_e8m0_k32":
+            if oracle_mode not in {"f32", "w4a16", "flashinfer"}:
+                raise ValueError(f"unsupported W4A16 oracle mode {oracle_mode!r}")
+            if oracle_mode == "flashinfer":
+                if weights.oracle_flashinfer_weights is None:
+                    raise ValueError("FlashInfer fp4_e8m0_k32 oracle requires FI-structured oracle tensors")
+                return moe_reference_w4a16_fp4_e8m0_k32_flashinfer_prepared(
+                    x,
+                    weights.oracle_flashinfer_weights,
+                    params.g1_alphas,
+                    params.g2_alphas,
+                    topk_ids,
+                    topk_weights,
+                    spec.num_experts,
+                    spec.hidden_size,
+                    spec.I_tp,
+                    activation=activation,
+                    swiglu_limit=swiglu_limit,
+                )
+            return moe_reference_w4a16_fp4_e8m0_k32(
+                x,
+                weights.w13_weight,
+                weights.w13_blockscale_swizzled,
+                params.g1_alphas,
+                weights.w2_weight,
+                weights.w2_blockscale_swizzled,
+                params.g2_alphas,
+                topk_ids,
+                topk_weights,
+                spec.num_experts,
+                spec.hidden_size,
+                spec.I_tp,
+                activation=activation,
+                swiglu_limit=swiglu_limit,
+                w13_layout=weights.w13_layout,
+            )
         if oracle_mode == "f32":
             return moe_reference_w4a16_f32(
                 x,
@@ -1143,6 +1423,7 @@ def make_oracle_reference(
                 spec.hidden_size,
                 spec.I_tp,
                 activation=activation,
+                swiglu_limit=swiglu_limit,
             )
         if oracle_mode != "w4a16":
             raise ValueError(f"unsupported W4A16 oracle mode {oracle_mode!r}")
@@ -1161,6 +1442,8 @@ def make_oracle_reference(
             spec.I_tp,
             activation=activation,
         )
+    if oracle_mode == "flashinfer":
+        raise ValueError("--oracle-mode flashinfer requires --quant-mode w4a16 and source_format='fp4_e8m0_k32'")
     if oracle_mode == "w4a16":
         raise ValueError("--oracle-mode w4a16 requires --quant-mode w4a16")
     oracle_fn = moe_reference_nvfp4 if oracle_mode == "nvfp4" else moe_reference_f32
@@ -1238,7 +1521,7 @@ def check_oracle_metrics(
     oracle_mode: str = "nvfp4",
 ) -> list[str]:
     failures = []
-    if oracle_mode == "w4a16":
+    if oracle_mode in {"w4a16", "flashinfer"}:
         tol = W4A16_ORACLE_TOLERANCES[activation]
     else:
         tol = ORACLE_TOLERANCES[activation]
@@ -1403,6 +1686,8 @@ def run_moe_layer_chain(
             input_scales_static=True,
             activation=activation,
             quant_mode=quant_mode,
+            source_format=weights.source_format,
+            w13_layout=weights.w13_layout,
         )
         layer_outputs.append(current)
     return layer_outputs
@@ -1480,7 +1765,10 @@ def bench_multilayer_graph_mode(
         )
 
     if args.reference != "none" or args.validate != "none":
-        print("Note: multi-layer graph mode skips flashinfer/oracle checks and validates graph replay against an eager layer chain.")
+        print(
+            "Note: multi-layer graph mode skips flashinfer/oracle checks and validates graph replay "
+            "against an eager layer chain."
+        )
     print("Multi-layer graph mode")
     print("Backend: b12x")
     print(f"Quant mode: {args.quant_mode}")
@@ -1496,6 +1784,7 @@ def bench_multilayer_graph_mode(
         num_layers=graph_num_layers,
         activation=args.activation,
         checkpoint_family=profile.checkpoint_family,
+        keep_flashinfer_oracle_copy=args.validate == "oracle" and args.oracle_mode == "flashinfer",
     )
     params_stack = [
         get_quant_mode_params(weights, args.scale_contract, args.quant_mode)
@@ -1689,6 +1978,12 @@ def bench_e2e() -> None:
     parser.add_argument("--layer-idx", type=int, default=None)
     parser.add_argument("--activation", choices=["silu", "relu2"], default=None)
     parser.add_argument(
+        "--swiglu-limit",
+        type=float,
+        default=None,
+        help="Clamp gated W4A16 SwiGLU inputs before silu/up multiply; defaults to the model profile value.",
+    )
+    parser.add_argument(
         "--quant-mode",
         choices=["nvfp4", "w4a16"],
         default=None,
@@ -1708,7 +2003,7 @@ def bench_e2e() -> None:
     )
     parser.add_argument("--scale-contract", choices=["shared", "per-expert"], default="shared")
     parser.add_argument("--validate", choices=["none", "oracle"], default=None)
-    parser.add_argument("--oracle-mode", choices=["nvfp4", "w4a16", "f32"], default=None)
+    parser.add_argument("--oracle-mode", choices=["nvfp4", "w4a16", "f32", "flashinfer"], default=None)
     parser.add_argument("--include-routing", action="store_true")
     parser.set_defaults(cuda_graph=True)
     parser.add_argument(
@@ -1757,12 +2052,14 @@ def bench_e2e() -> None:
     if args.quant_mode is None:
         args.quant_mode = model_profile.default_quant_mode or quant_mode_default
     use_w4a16 = args.quant_mode == "w4a16"
+    swiglu_limit = args.swiglu_limit if args.swiglu_limit is not None else model_profile.default_swiglu_limit
     if args.validate is None:
         args.validate = model_profile.default_validate
     if args.reference is None:
         args.reference = "none" if use_w4a16 else "flashinfer"
     if args.oracle_mode is None:
         args.oracle_mode = args.quant_mode
+    keep_flashinfer_oracle_copy = args.validate == "oracle" and args.oracle_mode == "flashinfer"
     batch_sizes = (
         args.batch_sizes
         if args.batch_sizes is not None
@@ -1777,6 +2074,8 @@ def bench_e2e() -> None:
         raise ValueError("--reference flashinfer is only valid with --quant-mode nvfp4")
     if args.reference == "flashinfer" and args.activation != "silu":
         raise ValueError("--reference flashinfer is only valid with --activation silu")
+    if model_profile.checkpoint_family == "deepseek_v4_flash" and not use_w4a16:
+        raise ValueError("DeepSeek V4 Flash FP4 checkpoint profile requires --quant-mode w4a16")
     if use_w4a16 and args.graph_mode != "single-op":
         raise ValueError("--quant-mode w4a16 currently supports --graph-mode single-op")
     if use_w4a16 and args.tp_parallel:
@@ -1805,6 +2104,7 @@ def bench_e2e() -> None:
     print(f"Layer: {layer_idx}")
     print(f"Activation: {args.activation}")
     print(f"Quant mode: {args.quant_mode}")
+    print(f"Routing source: {model_profile.default_routing}")
     print(f"Batch-size profile: {args.batch_size_profile} -> {batch_sizes}")
     backend_label = "b12x"
     print(f"Backend: {backend_label}")
@@ -1814,6 +2114,8 @@ def bench_e2e() -> None:
     print(f"Fast math: {'on' if args.fast_math else 'off'}")
     if use_w4a16:
         print("W4A16 kernel: fused W4A16 FC1+FC2")
+    if swiglu_limit is not None:
+        print(f"SwiGLU limit: {swiglu_limit:g}")
     if args.flush_l2:
         print(f"L2 flush: on ({l2_flush_bytes / (1 << 20):.1f} MiB per launch)")
     else:
@@ -1823,7 +2125,13 @@ def bench_e2e() -> None:
     print(f"Timing passes per batch size: {args.repeats} x {args.iters} iterations")
     print(
         "Timed region: "
-        + ("top-k + softmax routing + backend launch" if args.include_routing else "backend launch only")
+        + (
+            "model gate routing + backend launch"
+            if args.include_routing and model_profile.default_routing == "model"
+            else "top-k + softmax routing + backend launch"
+            if args.include_routing
+            else "backend launch only"
+        )
     )
     if args.validate == "oracle":
         print(f"Oracle mode: {args.oracle_mode}")
@@ -1839,7 +2147,9 @@ def bench_e2e() -> None:
         layer_idx=layer_idx,
         activation=args.activation,
         checkpoint_family=model_profile.checkpoint_family,
+        keep_flashinfer_oracle_copy=keep_flashinfer_oracle_copy,
     )
+    print(f"Source format: {weights.source_format}")
     params = get_quant_mode_params(weights, args.scale_contract, args.quant_mode)
     backend_w4a16_prepared = None
     make_backend_w4a16_buffers = None
@@ -1863,7 +2173,9 @@ def bench_e2e() -> None:
             activation=args.activation,
             params_dtype=torch.bfloat16,
             source_format=source_format,
+            w13_layout=weights.w13_layout,
         )
+        print(f"W4A16 scale format: {backend_w4a16_prepared.scale_format}")
         make_backend_w4a16_buffers = make_w4a16_buffers
 
     unit_scale_contract = uses_unit_scale_contract(
@@ -1886,11 +2198,14 @@ def bench_e2e() -> None:
     _clear_b12x_caches()
 
     print("  Warming up b12x (compilation)...", end="", flush=True)
-    torch.manual_seed(42)
-    x_warm = torch.randn(1, spec.hidden_size, dtype=torch.bfloat16, device=device)
-    routing_warm = torch.randn(1, spec.num_experts, dtype=torch.float32, device=device)
-    topk_logits_w, topk_ids_w = torch.topk(routing_warm, spec.top_k, dim=-1)
-    topk_weights_w = torch.softmax(topk_logits_w, dim=-1)
+    x_warm, topk_ids_w, topk_weights_w = make_profile_routed_inputs(
+        model_profile,
+        weights,
+        spec,
+        1,
+        42,
+        device,
+    )
     if use_w4a16:
         assert w4a16_moe is not None
         assert backend_w4a16_prepared is not None
@@ -1909,6 +2224,7 @@ def bench_e2e() -> None:
             topk_ids_w,
             activation=args.activation,
             fast_math=args.fast_math,
+            swiglu_limit=swiglu_limit,
             intermediate_cache13=warmup_buffers.intermediate_cache13,
             intermediate_cache2=warmup_buffers.intermediate_cache2,
             output=warmup_buffers.output,
@@ -1938,6 +2254,8 @@ def bench_e2e() -> None:
             activation=args.activation,
             quant_mode=args.quant_mode,
             unit_scale_contract=unit_scale_contract,
+            source_format=weights.source_format,
+            w13_layout=weights.w13_layout,
         )
     torch.cuda.synchronize()
     print(" done.")
@@ -1968,6 +2286,8 @@ def bench_e2e() -> None:
                 workspace=ws_r, fast_math=args.fast_math, activation=args.activation,
                 quant_mode=args.quant_mode,
                 unit_scale_contract=unit_scale_contract,
+                source_format=rw.source_format,
+                w13_layout=rw.w13_layout,
             )
         torch.cuda.synchronize()
         print(f" {spec.tp_size} ranks done.")
@@ -1981,10 +2301,23 @@ def bench_e2e() -> None:
         print(f"{'=' * 70}")
 
         torch.manual_seed(42 + batch_size)
-        x = torch.randn(batch_size, spec.hidden_size, dtype=torch.bfloat16, device=device)
-        routing_logits = torch.randn(batch_size, spec.num_experts, dtype=torch.float32, device=device)
-        topk_logits, topk_ids = torch.topk(routing_logits, spec.top_k, dim=-1)
-        topk_weights = torch.softmax(topk_logits, dim=-1)
+        x = make_input_activations(spec, batch_size, 42 + batch_size, device)
+        routing_logits = None
+        if model_profile.default_routing == "model":
+            topk_ids, topk_weights = compute_model_gate_routing(weights, x, seed=43 + batch_size)
+        else:
+            routing_logits = torch.randn(batch_size, spec.num_experts, dtype=torch.float32, device=device)
+            topk_logits, topk_ids = torch.topk(routing_logits, spec.top_k, dim=-1)
+            topk_weights = torch.softmax(topk_logits, dim=-1)
+
+        def compute_timed_routing() -> tuple[torch.Tensor, torch.Tensor]:
+            if model_profile.default_routing == "model":
+                return compute_model_gate_routing(weights, x, seed=43 + batch_size)
+            assert routing_logits is not None
+            timed_topk_logits, timed_topk_ids = torch.topk(routing_logits, spec.top_k, dim=-1)
+            timed_topk_weights = torch.softmax(timed_topk_logits, dim=-1)
+            return timed_topk_ids, timed_topk_weights
+
         backend_output = torch.empty_like(x)
         backend_workspace = (
             None
@@ -2017,6 +2350,7 @@ def bench_e2e() -> None:
                         topk_ids_local,
                         activation=args.activation,
                         fast_math=args.fast_math,
+                        swiglu_limit=swiglu_limit,
                         intermediate_cache13=backend_w4a16_buffers.intermediate_cache13,
                         intermediate_cache2=backend_w4a16_buffers.intermediate_cache2,
                         output=backend_output,
@@ -2045,12 +2379,13 @@ def bench_e2e() -> None:
                     activation=args.activation,
                     quant_mode=args.quant_mode,
                     unit_scale_contract=unit_scale_contract,
+                    source_format=weights.source_format,
+                    w13_layout=weights.w13_layout,
                 )
 
             def impl_e2e() -> torch.Tensor:
                 if args.include_routing:
-                    timed_topk_logits, timed_topk_ids = torch.topk(routing_logits, spec.top_k, dim=-1)
-                    timed_topk_weights = torch.softmax(timed_topk_logits, dim=-1)
+                    timed_topk_ids, timed_topk_weights = compute_timed_routing()
                     return impl_launch(timed_topk_ids, timed_topk_weights)
                 return impl_launch(topk_ids, topk_weights)
 
@@ -2077,8 +2412,7 @@ def bench_e2e() -> None:
 
             if args.include_routing:
                 def ref_launch() -> None:
-                    timed_topk_logits, timed_topk_ids = torch.topk(routing_logits, spec.top_k, dim=-1)
-                    timed_topk_weights = torch.softmax(timed_topk_logits, dim=-1)
+                    timed_topk_ids, timed_topk_weights = compute_timed_routing()
                     flashinfer_cutlass_fused_moe(
                         output=ref_result_tensor,
                         input=x,
@@ -2109,6 +2443,7 @@ def bench_e2e() -> None:
                 topk_ids,
                 topk_weights,
                 activation=args.activation,
+                swiglu_limit=swiglu_limit,
             )
             print(
                 "  oracle:".ljust(28),
@@ -2316,6 +2651,9 @@ def bench_e2e() -> None:
                         workspace=tp_workspaces[r], output=tp_outputs[r],
                         fast_math=args.fast_math, activation=args.activation,
                         quant_mode=args.quant_mode,
+                        unit_scale_contract=unit_scale_contract,
+                        source_format=rw.source_format,
+                        w13_layout=rw.w13_layout,
                     )
 
                 # Warm eager launches

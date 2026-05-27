@@ -40,6 +40,8 @@ from b12x.cute.fp4 import (
     packed_dequant_e2m1x4_to_half2x2,
     packed_dequant_e4m3x4_to_bfloat2x2,
     packed_dequant_e4m3x4_to_half2x2,
+    packed_dequant_e8m0x4_to_bfloat2x2,
+    packed_dequant_e8m0x4_to_half2x2,
     pack_f32x2_to_bfloat2,
     pack_f32x2_to_f16x2,
     red_add_global_release_i32,
@@ -52,7 +54,6 @@ from b12x.cute.fp4 import (
     st_shared_i32,
     st_shared_u32,
     st_shared_v4_f32,
-    st_shared_v4_u32,
     threadfence,
 )
 from b12x.cute.utils import current_cuda_stream, make_ptr
@@ -76,6 +77,12 @@ _STAGES = 4
 _DEVICE_MAX_REG_BYTES = 255 * 1024
 _DEFAULT_MAX_SHARED_MEM = 101_376
 _WEIGHT_LAYOUTS = {"packed"}
+_SCALE_FORMATS = {
+    "e4m3_k16": "e4m3_k16",
+    "e8m0_k32": "e8m0_k32",
+}
+_E8M0_K32_FP16_GLOBAL_COMPENSATION = float(2.0**7)
+_E8M0_K32_BF16_GLOBAL_COMPENSATION = float(2.0**119)
 _MAX_DIRECT_TOPK_ROUTE_M = 6
 
 
@@ -152,6 +159,7 @@ def _shared_memory_footprint(
     cta_m_blocks: int,
     tile_n: int,
     tile_k: int,
+    scale_format: str = "e4m3_k16",
 ) -> int:
     cta_m = int(cta_m_blocks) * 16
     cta_n = int(tile_n)
@@ -163,7 +171,9 @@ def _shared_memory_footprint(
     sh_bias_size = cta_n * 2
     tmp_size = min(sh_b_size, sh_red_size) + sh_bias_size
     tmp_size = max(max(sh_b_size, sh_red_size), tmp_size)
-    sh_s_size = _covering_count(cta_k, 16) * cta_n * 2 * _STAGES
+    sh_s_size = (
+        _covering_count(cta_k, _scale_group_size(scale_format)) * cta_n * 2 * _STAGES
+    )
     return tmp_size + sh_a_size + sh_s_size + sh_block_meta_size
 
 
@@ -179,6 +189,7 @@ def _determine_blocks_per_sm(
     uses_m_block_8: bool,
     sms: int,
     max_shared_mem: int,
+    scale_format: str = "e4m3_k16",
 ) -> int:
     num_regs = _w4a16_num_regs(
         cta_threads=cta_threads,
@@ -192,6 +203,7 @@ def _determine_blocks_per_sm(
         cta_m_blocks=cta_m_blocks,
         tile_n=tile_n,
         tile_k=tile_k,
+        scale_format=scale_format,
     )
     blocks_per_sm_limit = min(
         _DEVICE_MAX_REG_BYTES // register_bytes,
@@ -217,10 +229,14 @@ def _candidate_tile_fits(
     tile_k: int,
     cta_threads: int,
     max_shared_mem: int,
+    scale_format: str = "e4m3_k16",
 ) -> bool:
     if int(tile_k) == -1 or int(tile_n) == -1 or int(cta_threads) == -1:
         return False
     if int(problem_k) % int(tile_k) != 0 or int(problem_n) % int(tile_n) != 0:
+        return False
+    scale_group_size = _scale_group_size(scale_format)
+    if int(problem_k) % scale_group_size != 0 or int(tile_k) % scale_group_size != 0:
         return False
     if int(tile_n) < 64 or int(tile_k) < 64 or int(cta_threads) < 128:
         return False
@@ -228,6 +244,7 @@ def _candidate_tile_fits(
         cta_m_blocks=cta_m_blocks,
         tile_n=tile_n,
         tile_k=tile_k,
+        scale_format=scale_format,
     )
     return smem_bytes <= int(max_shared_mem)
 
@@ -242,6 +259,7 @@ def _select_tile_config(
     sms: int,
     max_shared_mem: int,
     required_cta_threads: int | None = None,
+    scale_format: str = "e4m3_k16",
 ) -> tuple[int, int, int, int]:
     cta_m_blocks = _covering_count(moe_block_size, 16)
     uses_m_block_8 = moe_block_size == 8
@@ -263,6 +281,7 @@ def _select_tile_config(
             tile_k=tile_k,
             cta_threads=cta_threads,
             max_shared_mem=int(max_shared_mem) - 512,
+            scale_format=scale_format,
         ):
             continue
         blocks_per_sm_limit = _determine_blocks_per_sm(
@@ -276,6 +295,7 @@ def _select_tile_config(
             uses_m_block_8=uses_m_block_8,
             sms=sms,
             max_shared_mem=max_shared_mem,
+            scale_format=scale_format,
         )
         if blocks_per_sm_limit > best_blocks_per_sm:
             best_blocks_per_sm = blocks_per_sm_limit
@@ -303,6 +323,7 @@ class W4A16GemmCompileResult:
     max_m_blocks: int
     blocks_per_sm: int
     weight_layout: str = "packed"
+    scale_format: str = "e4m3_k16"
 
 
 @dataclass(frozen=True)
@@ -345,6 +366,7 @@ class W4A16FusedMoeCompileResult:
     blocks_per_sm: int
     weight_layout: str = "packed"
     direct_topk_routes: bool = False
+    scale_format: str = "e4m3_k16"
 
 
 @dataclass(frozen=True)
@@ -370,6 +392,7 @@ class W4A16GemmKernel:
         element_dtype: str = "bf16",
         epilogue_activation: str | None = None,
         weight_layout: str = "packed",
+        scale_format: str = "e4m3_k16",
         single_token_route_fast_path: bool = False,
         direct_topk_routes: bool = False,
     ):
@@ -377,6 +400,7 @@ class W4A16GemmKernel:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
         if weight_layout not in _WEIGHT_LAYOUTS:
             raise ValueError(f"unsupported W4A16 weight_layout {weight_layout!r}")
+        scale_format = _normalize_scale_format(scale_format)
         if epilogue_activation not in (None, "relu2"):
             raise ValueError(
                 "W4A16 GEMM epilogue activation currently supports only relu2"
@@ -387,6 +411,8 @@ class W4A16GemmKernel:
             raise ValueError("size_k must be divisible by tile_k")
         if tile_n % 16 != 0 or tile_k % 16 != 0:
             raise ValueError("tile_n/tile_k must be multiples of 16")
+        if scale_format == "e8m0_k32" and (size_k % 32 != 0 or tile_k % 32 != 0):
+            raise ValueError("E8M0 K/32 W4A16 scales require size_k/tile_k multiples of 32")
         if moe_block_size not in _ALLOWED_ROUTED_SIZES:
             raise ValueError(f"unsupported moe_block_size {moe_block_size}")
         if moe_block_size != 8 and moe_block_size % 16 != 0:
@@ -410,6 +436,8 @@ class W4A16GemmKernel:
         self.is_fp16 = element_dtype == "fp16"
         self.epilogue_relu2 = epilogue_activation == "relu2"
         self.weight_layout = weight_layout
+        self.scale_format = scale_format
+        self.scale_format_e8m0_k32 = scale_format == "e8m0_k32"
         self.single_token_route_fast_path = bool(single_token_route_fast_path)
         self.direct_topk_routes = bool(direct_topk_routes)
         self.cta_m_blocks = int(_covering_count(moe_block_size, 16))
@@ -435,6 +463,7 @@ class W4A16GemmKernel:
             uses_m_block_8=self.uses_m_block_8,
             sms=self.sms,
             max_shared_mem=max_shared_mem,
+            scale_format=scale_format,
         )
 
         # W4A16 shared-memory geometry, in int4 units unless noted.
@@ -454,7 +483,9 @@ class W4A16GemmKernel:
         self.b_sh_wr_iters = self.b_sh_stage // self.cta_threads
 
         self.s_sh_stride = 16 * self.cta_n_blocks // 16
-        self.s_tb_groups = self.cta_k_blocks
+        self.s_tb_groups = (
+            self.cta_k_blocks // 2 if scale_format == "e8m0_k32" else self.cta_k_blocks
+        )
         self.s_sh_stage = self.s_tb_groups * self.s_sh_stride
         self.tb_n_warps = self.cta_n_blocks // 4
 
@@ -500,6 +531,16 @@ class W4A16GemmKernel:
 
     @cute.jit
     def _dequant_e4m3x4_to_elem2x2(self, packed: Uint32):
+        if cutlass.const_expr(self.is_fp16):
+            return packed_dequant_e4m3x4_to_half2x2(packed)
+        return packed_dequant_e4m3x4_to_bfloat2x2(packed)
+
+    @cute.jit
+    def _dequant_scale_x4_to_elem2x2(self, packed: Uint32):
+        if cutlass.const_expr(self.scale_format_e8m0_k32):
+            if cutlass.const_expr(self.is_fp16):
+                return packed_dequant_e8m0x4_to_half2x2(packed)
+            return packed_dequant_e8m0x4_to_bfloat2x2(packed)
         if cutlass.const_expr(self.is_fp16):
             return packed_dequant_e4m3x4_to_half2x2(packed)
         return packed_dequant_e4m3x4_to_bfloat2x2(packed)
@@ -1039,6 +1080,11 @@ class W4A16GemmKernel:
         active_size_m: Int32,
     ):
         global_scale_f32 = global_scale[expert_idx].to(cutlass.Float32)
+        if cutlass.const_expr(self.scale_format_e8m0_k32):
+            if cutlass.const_expr(self.is_fp16):
+                global_scale_f32 *= cutlass.Float32(_E8M0_K32_FP16_GLOBAL_COMPENSATION)
+            else:
+                global_scale_f32 *= cutlass.Float32(_E8M0_K32_BF16_GLOBAL_COMPENSATION)
         block_valid_rows = self._read_moe_block_data(
             packed_route_indices,
             topk_weights_flat,
@@ -1082,7 +1128,10 @@ class W4A16GemmKernel:
         a_gl_stride = Int32(self.size_k // 8)
         b_gl_stride = Int32(16 * self.size_n // (_PACK_FACTOR * 4))
         s_gl_stride = Int32(self.size_n // 16)
-        scales_expert_stride = Int32((self.size_n * self.size_k) // (16 * 16))
+        if cutlass.const_expr(self.scale_format_e8m0_k32):
+            scales_expert_stride = Int32((self.size_n * self.size_k) // (32 * 16))
+        else:
+            scales_expert_stride = Int32((self.size_n * self.size_k) // (16 * 16))
         b_expert_off = (
             Int32((self.size_n * self.size_k) // (_PACK_FACTOR * 4)) * expert_idx
         )
@@ -1929,15 +1978,19 @@ class W4A16GemmKernel:
         warp_id = tid // Int32(32)
         warp_row = warp_id // Int32(self.tb_n_warps)
         cur_group_id = Int32(self.b_sh_wr_iters) * warp_row + kk
+        if cutlass.const_expr(self.scale_format_e8m0_k32):
+            scale_group_id = cur_group_id // Int32(2)
+        else:
+            scale_group_id = cur_group_id
         s_addr = (
             smem_base
             + Int32(self.sh_s_off * 16)
             + pipe * Int32(self.s_sh_stage * 16)
-            + (s_sh_rd + cur_group_id * Int32(2 * self.s_sh_stride)) * Int32(8)
+            + (s_sh_rd + scale_group_id * Int32(2 * self.s_sh_stride)) * Int32(8)
         )
         s_pack0, s_pack1 = ld_shared_v2_u32(s_addr)
-        s0, s1 = self._dequant_e4m3x4_to_elem2x2(s_pack0)
-        s2, s3 = self._dequant_e4m3x4_to_elem2x2(s_pack1)
+        s0, s1 = self._dequant_scale_x4_to_elem2x2(s_pack0)
+        s2, s3 = self._dequant_scale_x4_to_elem2x2(s_pack1)
         return q0, q1, q2, q3, s0, s1, s2, s3
 
     @cute.jit
@@ -2198,7 +2251,7 @@ class W4A16GemmKernel:
             s_src_int4 = (
                 scales_expert_off
                 + s_gl_stride
-                * (tile_idx * Int32(self.cta_k_blocks) + tid // Int32(self.s_sh_stride))
+                * (tile_idx * Int32(self.s_tb_groups) + tid // Int32(self.s_sh_stride))
                 + Int32(self.s_sh_stride) * output_n_tile
                 + (tid % Int32(self.s_sh_stride))
             )
@@ -2767,6 +2820,7 @@ class W4A16FusedMoeKernel:
         fast_math: bool = True,
         swiglu_limit: float | None = None,
         weight_layout: str = "packed",
+        scale_format: str = "e4m3_k16",
         direct_topk_routes: bool = False,
     ):
         is_gated = validate_activation(activation)
@@ -2775,6 +2829,7 @@ class W4A16FusedMoeKernel:
             raise ValueError("swiglu_limit requires a gated W4A16 activation")
         if weight_layout not in _WEIGHT_LAYOUTS:
             raise ValueError(f"unsupported W4A16 weight_layout {weight_layout!r}")
+        scale_format = _normalize_scale_format(scale_format)
         fc1_cols = int(intermediate_size) * (2 if is_gated else 1)
         routed_rows = int(size_m) * int(top_k)
         self.size_m = int(size_m)
@@ -2788,6 +2843,7 @@ class W4A16FusedMoeKernel:
         self.has_swiglu_limit = swiglu_limit is not None
         self.swiglu_limit = 0.0 if swiglu_limit is None else swiglu_limit
         self.weight_layout = weight_layout
+        self.scale_format = scale_format
         self.apply_router_weight_on_input = bool(apply_router_weight_on_input)
         self.zero_fc2_output = bool(zero_fc2_output)
         self.element_dtype = element_dtype
@@ -2808,6 +2864,7 @@ class W4A16FusedMoeKernel:
             element_dtype=element_dtype,
             epilogue_activation=None if is_gated else "relu2",
             weight_layout=weight_layout,
+            scale_format=scale_format,
             single_token_route_fast_path=size_m == 1
             and not self.direct_topk_routes,
             direct_topk_routes=self.direct_topk_routes,
@@ -2825,6 +2882,7 @@ class W4A16FusedMoeKernel:
             max_m_blocks=max_m_blocks,
             element_dtype=element_dtype,
             weight_layout=weight_layout,
+            scale_format=scale_format,
             single_token_route_fast_path=size_m == 1
             and not self.direct_topk_routes,
             direct_topk_routes=self.direct_topk_routes,
@@ -3294,6 +3352,36 @@ def _normalize_element_dtype(dtype: torch.dtype) -> str:
     raise TypeError(f"unsupported W4A16 activation dtype {dtype}")
 
 
+def _normalize_scale_format(scale_format: str) -> str:
+    try:
+        return _SCALE_FORMATS[scale_format.lower()]
+    except KeyError as exc:
+        raise ValueError(
+            "scale_format must be one of 'e4m3_k16' or 'e8m0_k32', "
+            f"got {scale_format!r}"
+        ) from exc
+
+
+def _scale_group_size(scale_format: str) -> int:
+    return 32 if _normalize_scale_format(scale_format) == "e8m0_k32" else 16
+
+
+def _scale_fake_int32_elements(
+    *,
+    num_experts: int,
+    size_k: int,
+    size_n: int,
+    scale_format: str,
+) -> int:
+    group_size = _scale_group_size(scale_format)
+    if int(size_k) % group_size != 0:
+        raise ValueError(
+            f"W4A16 {scale_format} scales require size_k divisible by {group_size}, "
+            f"got {size_k}"
+        )
+    return int(num_experts) * (int(size_k) // group_size) * (int(size_n) // 4)
+
+
 def _cutlass_element_dtype(element_dtype: str):
     if element_dtype == "bf16":
         return cutlass.BFloat16
@@ -3315,7 +3403,9 @@ def compile_w4a16_gemm(
     moe_block_size: int,
     max_m_blocks: int,
     element_dtype: str = "bf16",
+    scale_format: str = "e4m3_k16",
 ) -> W4A16GemmCompileResult:
+    scale_format = _normalize_scale_format(scale_format)
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
     if torch.cuda.is_available():
         device = int(torch.cuda.current_device())
@@ -3344,6 +3434,7 @@ def compile_w4a16_gemm(
         tile_k,
         moe_block_size,
         max_m_blocks,
+        scale_format,
     )
     cached = _CACHE.get(cache_key)
     if cached is not None:
@@ -3366,7 +3457,14 @@ def compile_w4a16_gemm(
     )
     scales_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (num_experts * (size_k // 16) * (size_n // 4),),
+        (
+            _scale_fake_int32_elements(
+                num_experts=num_experts,
+                size_k=size_k,
+                size_n=size_n,
+                scale_format=scale_format,
+            ),
+        ),
         assumed_align=16,
     )
     global_scale_fake = cute.runtime.make_fake_compact_tensor(
@@ -3422,6 +3520,7 @@ def compile_w4a16_gemm(
         moe_block_size=moe_block_size,
         max_m_blocks=max_m_blocks,
         element_dtype=element_dtype,
+        scale_format=scale_format,
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
@@ -3448,6 +3547,7 @@ def compile_w4a16_gemm(
         moe_block_size=moe_block_size,
         max_m_blocks=max_m_blocks,
         blocks_per_sm=kernel.blocks_per_sm,
+        scale_format=scale_format,
     )
     _CACHE[cache_key] = result
     return result
@@ -3471,8 +3571,10 @@ def compile_w4a16_fused_moe(
     max_shared_mem: int,
     swiglu_limit: float | None = None,
     weight_layout: str = "packed",
+    scale_format: str = "e4m3_k16",
     direct_topk_routes: bool = False,
 ) -> W4A16FusedMoeCompileResult:
+    scale_format = _normalize_scale_format(scale_format)
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
     device = int(torch.cuda.current_device()) if torch.cuda.is_available() else None
     is_gated = validate_activation(activation)
@@ -3500,6 +3602,7 @@ def compile_w4a16_fused_moe(
         moe_block_size=moe_block_size,
         sms=sms,
         max_shared_mem=max_shared_mem,
+        scale_format=scale_format,
     )
     fc2_tile_k, fc2_tile_n, fc2_cta_threads, _ = _select_tile_config(
         problem_m=routed_rows,
@@ -3509,6 +3612,7 @@ def compile_w4a16_fused_moe(
         moe_block_size=moe_block_size,
         sms=sms,
         max_shared_mem=max_shared_mem,
+        scale_format=scale_format,
     )
     if fc1_cta_threads != fc2_cta_threads:
         common_cta_threads = min(fc1_cta_threads, fc2_cta_threads)
@@ -3521,6 +3625,7 @@ def compile_w4a16_fused_moe(
             sms=sms,
             max_shared_mem=max_shared_mem,
             required_cta_threads=common_cta_threads,
+            scale_format=scale_format,
         )
         fc2_tile_k, fc2_tile_n, fc2_cta_threads, _ = _select_tile_config(
             problem_m=routed_rows,
@@ -3531,6 +3636,7 @@ def compile_w4a16_fused_moe(
             sms=sms,
             max_shared_mem=max_shared_mem,
             required_cta_threads=common_cta_threads,
+            scale_format=scale_format,
         )
         if fc1_cta_threads != fc2_cta_threads:
             raise ValueError(
@@ -3560,6 +3666,7 @@ def compile_w4a16_fused_moe(
         fc2_tile_k,
         moe_block_size,
         max_m_blocks,
+        scale_format,
         direct_topk_routes,
     )
     cached = _FUSED_CACHE.get(cache_key)
@@ -3599,12 +3706,26 @@ def compile_w4a16_fused_moe(
     )
     w13_scales_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (num_experts * (hidden_size // 16) * (fc1_cols // 4),),
+        (
+            _scale_fake_int32_elements(
+                num_experts=num_experts,
+                size_k=hidden_size,
+                size_n=fc1_cols,
+                scale_format=scale_format,
+            ),
+        ),
         assumed_align=16,
     )
     w2_scales_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (num_experts * (intermediate_size // 16) * (hidden_size // 4),),
+        (
+            _scale_fake_int32_elements(
+                num_experts=num_experts,
+                size_k=intermediate_size,
+                size_n=hidden_size,
+                scale_format=scale_format,
+            ),
+        ),
         assumed_align=16,
     )
     w13_global_fake = cute.runtime.make_fake_compact_tensor(
@@ -3678,6 +3799,7 @@ def compile_w4a16_fused_moe(
         fast_math=fast_math,
         swiglu_limit=swiglu_limit,
         weight_layout=weight_layout,
+        scale_format=scale_format,
         direct_topk_routes=direct_topk_routes,
     )
     raise_if_kernel_resolution_frozen(
@@ -3727,6 +3849,7 @@ def compile_w4a16_fused_moe(
         blocks_per_sm=kernel.blocks_per_sm,
         weight_layout=weight_layout,
         direct_topk_routes=kernel.direct_topk_routes,
+        scale_format=scale_format,
     )
     _FUSED_CACHE[cache_key] = result
     return result
@@ -3926,6 +4049,7 @@ def _compile_w4a16_gemm_launch(
     max_shared_mem: int,
     device: torch.device,
     c_tmp: torch.Tensor | None = None,
+    scale_format: str = "e4m3_k16",
 ) -> _W4A16GemmLaunch:
     tile_k, tile_n, _, _ = _select_tile_config(
         problem_m=size_m,
@@ -3935,6 +4059,7 @@ def _compile_w4a16_gemm_launch(
         moe_block_size=moe_block_size,
         sms=sms,
         max_shared_mem=max_shared_mem,
+        scale_format=scale_format,
     )
     kernel = compile_w4a16_gemm(
         size_m=size_m,
@@ -3948,6 +4073,7 @@ def _compile_w4a16_gemm_launch(
         moe_block_size=moe_block_size,
         max_m_blocks=max_m_blocks,
         element_dtype=element_dtype,
+        scale_format=scale_format,
     )
     c_tmp = _get_c_tmp(
         packed_gemm_scratch_elements(
@@ -4033,6 +4159,7 @@ def run_w4a16_moe(
     weight_layout = getattr(prepared, "weight_layout", "packed")
     if weight_layout not in _WEIGHT_LAYOUTS:
         raise ValueError(f"unsupported W4A16 weight_layout {weight_layout!r}")
+    scale_format = _normalize_scale_format(getattr(prepared, "scale_format", "e4m3_k16"))
     if topk_weights.dtype != torch.float32:
         raise TypeError("topk_weights must be torch.float32")
     _validate_topk_ids(topk_ids, require_cuda=False, require_contiguous=False)
@@ -4148,7 +4275,6 @@ def run_w4a16_moe(
         route_num_experts=route_num_experts,
         sms=sms,
     )
-    routed_rows = buffer_plan.routed_rows
     intermediate_size = int(prepared.intermediate_size)
     fc1_cols = buffer_plan.fc1_cols
 
@@ -4197,6 +4323,7 @@ def run_w4a16_moe(
             max_shared_mem=max_shared_mem,
             swiglu_limit=swiglu_limit,
             weight_layout=weight_layout,
+            scale_format=scale_format,
             direct_topk_routes=use_direct_topk_routes,
         )
     else:
@@ -4217,6 +4344,7 @@ def run_w4a16_moe(
             bool(fast_math),
             swiglu_limit,
             weight_layout,
+            scale_format,
             bool(use_direct_topk_routes),
             block_size_m,
         )
@@ -4232,6 +4360,7 @@ def run_w4a16_moe(
             bool(fused_launch.fast_math),
             fused_launch.swiglu_limit,
             getattr(fused_launch, "weight_layout", "packed"),
+            getattr(fused_launch, "scale_format", "e4m3_k16"),
             bool(getattr(fused_launch, "direct_topk_routes", False)),
             int(fused_launch.moe_block_size),
         )

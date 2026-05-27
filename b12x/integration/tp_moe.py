@@ -49,8 +49,12 @@ _DYNAMIC_SLICE_CHUNK = 1
 _MOE_FORCE_A16_ENV = "B12X_MOE_FORCE_A16"
 _FP4_SOURCE_FORMATS = {
     "modelopt_nvfp4": "modelopt_nvfp4",
-    "mxfp4_native": "mxfp4_native",
+    "fp4_e8m0_k32": "fp4_e8m0_k32",
     "compressed_tensors": "compressed_tensors",
+}
+_W4A16_SCALE_FORMATS = {
+    "e4m3_k16": "e4m3_k16",
+    "e8m0_k32": "e8m0_k32",
 }
 _W13_LAYOUTS = {
     "w13": "w13",
@@ -148,6 +152,7 @@ class TPW4A16Workspace:
     planned_token_counts: frozenset[int] = field(default_factory=frozenset)
     planned_apply_router_weight_on_input: bool = False
     planned_swiglu_limit: float | None = None
+    planned_scale_format: str = "e4m3_k16"
     planned_fused_moe_launches: dict[object, object] = field(default_factory=dict)
     planned_topk_sum_launches: dict[int, object] = field(default_factory=dict)
     route_workspace: "_TPRouteWorkspace | None" = None
@@ -429,14 +434,35 @@ def _normalize_quant_mode(quant_mode: str | None) -> str:
 
 
 def _normalize_fp4_source_format(source_format: str) -> str:
+    if source_format.lower() == "mxfp4_native":
+        raise ValueError(
+            "source_format='mxfp4_native' has been removed; use "
+            "source_format='fp4_e8m0_k32' for byte-preserved E8M0 K/32 "
+            "scales, or add a real MXFP4 source contract"
+        )
     try:
         return _FP4_SOURCE_FORMATS[source_format.lower()]
     except KeyError as exc:
         raise ValueError(
             "source_format must be one of 'modelopt_nvfp4', "
-            "'mxfp4_native', or 'compressed_tensors', "
+            "'fp4_e8m0_k32', or 'compressed_tensors', "
             f"got {source_format!r}"
         ) from exc
+
+
+def _normalize_w4a16_scale_format(scale_format: str) -> str:
+    try:
+        return _W4A16_SCALE_FORMATS[scale_format.lower()]
+    except KeyError as exc:
+        raise ValueError(
+            "scale_format must be one of 'e4m3_k16' or 'e8m0_k32', "
+            f"got {scale_format!r}"
+        ) from exc
+
+
+def _w4a16_scale_format_for_source(source_format: str) -> str:
+    source_format = _normalize_fp4_source_format(source_format)
+    return "e8m0_k32" if source_format == "fp4_e8m0_k32" else "e4m3_k16"
 
 
 def _normalize_w13_layout(w13_layout: str) -> str:
@@ -2035,7 +2061,9 @@ def _validate_frozen_w4a16_launch(
     apply_router_weight_on_input: bool,
     swiglu_limit: float | None,
     weight_layout: str,
+    scale_format: str,
 ) -> None:
+    scale_format = _normalize_w4a16_scale_format(scale_format)
     token_count = int(plan.max_tokens_per_launch)
     planned_capacity = min(
         (planned for planned in workspace.planned_token_counts if planned >= token_count),
@@ -2060,15 +2088,38 @@ def _validate_frozen_w4a16_launch(
             "frozen W4A16 MoE workspace swiglu_limit mismatch: "
             f"requested={requested_limit}, planned={workspace.planned_swiglu_limit}"
         )
-    fused = workspace.planned_fused_moe_launches.get((weight_layout, planned_capacity))
+    planned_scale_format = _normalize_w4a16_scale_format(
+        getattr(workspace, "planned_scale_format", "e4m3_k16")
+    )
+    if scale_format != planned_scale_format:
+        raise RuntimeError(
+            "frozen W4A16 MoE workspace scale_format mismatch: "
+            f"requested={scale_format!r}, planned={planned_scale_format!r}"
+        )
+    fused = workspace.planned_fused_moe_launches.get(
+        (weight_layout, scale_format, planned_capacity)
+    )
+    if fused is None:
+        legacy_fused = workspace.planned_fused_moe_launches.get(
+            (weight_layout, planned_capacity)
+        )
+        if (
+            scale_format == "e4m3_k16"
+            and getattr(legacy_fused, "weight_layout", "packed") == weight_layout
+        ):
+            fused = legacy_fused
     if fused is None:
         legacy_fused = workspace.planned_fused_moe_launches.get(planned_capacity)
-        if getattr(legacy_fused, "weight_layout", "packed") == weight_layout:
+        if (
+            scale_format == "e4m3_k16"
+            and getattr(legacy_fused, "weight_layout", "packed") == weight_layout
+        ):
             fused = legacy_fused
     if fused is None:
         raise RuntimeError(
             "frozen W4A16 MoE workspace is missing its preplanned fused launch "
-            f"for capacity={planned_capacity}, weight_layout={weight_layout!r}"
+            f"for capacity={planned_capacity}, weight_layout={weight_layout!r}, "
+            f"scale_format={scale_format!r}"
         )
     if planned_capacity not in workspace.planned_topk_sum_launches:
         raise RuntimeError(
@@ -2082,8 +2133,10 @@ def _w4a16_preplanned_launches(
     *,
     token_count: int,
     weight_layout: str,
+    scale_format: str = "e4m3_k16",
 ) -> tuple[object | None, object | None]:
     token_count = int(token_count)
+    scale_format = _normalize_w4a16_scale_format(scale_format)
     if not workspace.planned_token_counts:
         return None, None
     planned_capacity = min(
@@ -2095,16 +2148,31 @@ def _w4a16_preplanned_launches(
             "W4A16 MoE workspace was asked to launch an unplanned token count: "
             f"tokens={token_count}, planned={sorted(workspace.planned_token_counts)}"
         )
-    fused = workspace.planned_fused_moe_launches.get((weight_layout, planned_capacity))
+    fused = workspace.planned_fused_moe_launches.get(
+        (weight_layout, scale_format, planned_capacity)
+    )
+    if fused is None:
+        legacy_fused = workspace.planned_fused_moe_launches.get(
+            (weight_layout, planned_capacity)
+        )
+        if (
+            scale_format == "e4m3_k16"
+            and getattr(legacy_fused, "weight_layout", "packed") == weight_layout
+        ):
+            fused = legacy_fused
     if fused is None:
         legacy_fused = workspace.planned_fused_moe_launches.get(planned_capacity)
-        if getattr(legacy_fused, "weight_layout", "packed") == weight_layout:
+        if (
+            scale_format == "e4m3_k16"
+            and getattr(legacy_fused, "weight_layout", "packed") == weight_layout
+        ):
             fused = legacy_fused
     topk_sum = workspace.planned_topk_sum_launches.get(planned_capacity)
     if fused is None or topk_sum is None:
         raise RuntimeError(
             "W4A16 MoE workspace is missing preplanned launches for "
-            f"capacity={planned_capacity}, weight_layout={weight_layout!r}"
+            f"capacity={planned_capacity}, weight_layout={weight_layout!r}, "
+            f"scale_format={scale_format!r}"
         )
     return fused, topk_sum
 
@@ -2119,7 +2187,9 @@ def _resolve_workspace(
     apply_router_weight_on_input: bool = False,
     swiglu_limit: float | None = None,
     weight_layout: str = "packed",
+    scale_format: str = "e4m3_k16",
 ) -> object:
+    scale_format = _normalize_w4a16_scale_format(scale_format)
     if isinstance(workspace, (TPMoEWorkspace, TPW4A16Workspace)):
         _validate_workspace(workspace, plan=plan)
         if isinstance(workspace, TPDynamicWorkspace):
@@ -2266,6 +2336,7 @@ def _resolve_workspace(
             apply_router_weight_on_input=apply_router_weight_on_input,
             swiglu_limit=swiglu_limit,
             weight_layout=weight_layout,
+            scale_format=scale_format,
         )
 
     if isinstance(resolved, TPDynamicWorkspace):
@@ -2489,10 +2560,12 @@ def _prewarm_w4a16_planned_launches(
     token_counts: tuple[int, ...],
     apply_router_weight_on_input: bool,
     swiglu_limit: float | None,
+    scale_format: str = "e4m3_k16",
 ) -> None:
     """Resolve every W4A16 kernel shape owned by a frozen arena."""
     if workspace.device.type != "cuda":
         raise RuntimeError("W4A16 MoE launch planning requires a CUDA device")
+    scale_format = _normalize_w4a16_scale_format(scale_format)
 
     from b12x.moe.fused.w4a16.host import (
         max_packed_route_slots,
@@ -2532,7 +2605,9 @@ def _prewarm_w4a16_planned_launches(
             )
             max_m_blocks = (route_slots + block_size_m - 1) // block_size_m
             weight_layout = "packed"
-            fused_launches[(weight_layout, token_count)] = compile_w4a16_fused_moe(
+            fused_launches[
+                (weight_layout, scale_format, token_count)
+            ] = compile_w4a16_fused_moe(
                 size_m=token_count,
                 hidden_size=workspace.k,
                 intermediate_size=workspace.n,
@@ -2548,6 +2623,7 @@ def _prewarm_w4a16_planned_launches(
                 max_shared_mem=max_shared_mem,
                 swiglu_limit=swiglu_limit,
                 weight_layout=weight_layout,
+                scale_format=scale_format,
             )
             topk_sum_launches[token_count] = compile_w4a16_topk_sum(
                 m=token_count,
@@ -2574,6 +2650,7 @@ def _prewarm_w4a16_planned_launches(
             )
         workspace.planned_fused_moe_launches = fused_launches
         workspace.planned_topk_sum_launches = topk_sum_launches
+        workspace.planned_scale_format = scale_format
 
 
 def materialize_tp_moe_arena_workspaces(
@@ -2591,9 +2668,16 @@ def materialize_tp_moe_arena_workspaces(
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
     swiglu_limit: float | None = None,
+    source_format: str = "modelopt_nvfp4",
 ) -> None:
     """Materialize graph-capture-sensitive workspaces from arena sizing caps."""
     quant_mode = _normalize_quant_mode(quant_mode)
+    source_format = _normalize_fp4_source_format(source_format)
+    _validate_fp4_source_format_for_quant_mode(
+        source_format=source_format,
+        quant_mode=quant_mode,
+    )
+    w4a16_scale_format = _w4a16_scale_format_for_source(source_format)
 
     device = torch.device(device)
     max_tokens = max(int(max_tokens), 1)
@@ -2665,6 +2749,10 @@ def materialize_tp_moe_arena_workspaces(
                     != bool(apply_router_weight_on_input)
                     or existing.planned_swiglu_limit
                     != _normalize_w4a16_swiglu_limit(swiglu_limit)
+                    or _normalize_w4a16_scale_format(
+                        getattr(existing, "planned_scale_format", "e4m3_k16")
+                    )
+                    != w4a16_scale_format
                 ):
                     pass
                 else:
@@ -2723,6 +2811,7 @@ def materialize_tp_moe_arena_workspaces(
                 token_counts=core_token_counts,
                 apply_router_weight_on_input=bool(apply_router_weight_on_input),
                 swiglu_limit=materialized.planned_swiglu_limit,
+                scale_format=w4a16_scale_format,
             )
         pool.workspaces[key] = materialized
 
@@ -4241,6 +4330,13 @@ def b12x_moe_fp4(
                 w13_layout=w13_layout,
             )
         weight_layout = getattr(prepared, "weight_layout", "packed")
+        scale_format = _normalize_w4a16_scale_format(
+            getattr(
+                prepared,
+                "scale_format",
+                _w4a16_scale_format_for_source(source_format),
+            )
+        )
         plan = _make_workspace_plan(
             num_tokens=m,
             weight_E=weight_E,
@@ -4261,6 +4357,7 @@ def b12x_moe_fp4(
             apply_router_weight_on_input=apply_router_weight_on_input,
             swiglu_limit=swiglu_limit,
             weight_layout=weight_layout,
+            scale_format=scale_format,
         )
         if not isinstance(w4a16_workspace, TPW4A16Workspace):
             raise TypeError("expected a TPW4A16Workspace for the W4A16 backend")
@@ -4280,6 +4377,7 @@ def b12x_moe_fp4(
             w4a16_workspace,
             token_count=m,
             weight_layout=weight_layout,
+            scale_format=scale_format,
         )
         return run_w4a16_moe(
             a,
