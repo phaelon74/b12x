@@ -25,7 +25,7 @@ from .extend_kernel import (
     run_extend_logits_kernel,
     supports_extend_logits_kernel,
 )
-from .reference import extend_logits_reference, paged_decode_logits_reference
+from .reference import extend_logits_reference
 from .schedule_metadata import (
     build_paged_mqa_schedule_metadata_torch,
     build_paged_mqa_schedule_metadata_triton,
@@ -447,7 +447,6 @@ def paged_decode_logits(
                     "for the scheduled decode path"
                 )
             schedule_metadata = build_paged_mqa_schedule_metadata(seqlens_valid, page_size)
-
     logits_valid = run_paged_logits_kernel(
         q_fp8=q_fp8[:valid_q_rows],
         weights=weights_f[:valid_q_rows],

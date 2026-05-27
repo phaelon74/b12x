@@ -583,7 +583,7 @@ def compressed_index_decode_logits_fp8(
         allow_partial_rows=allow_partial_rows,
     )
     weights = _weights_as_2d(weights)
-    return paged_decode_logits(
+    logits = paged_decode_logits(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
@@ -594,6 +594,7 @@ def compressed_index_decode_logits_fp8(
         preinitialize_invalid_logits=preinitialize_invalid_logits,
         active_width_override=active_width_override,
     )
+    return logits
 
 
 def _resolve_supertile_k(supertile_k: int | None, *, page_size: int) -> int:

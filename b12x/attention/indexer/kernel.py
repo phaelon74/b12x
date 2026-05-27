@@ -8,13 +8,11 @@ from functools import lru_cache
 import os
 import warnings
 
-import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cuda.bindings.driver as cuda
 import torch
-from cutlass._mlir.dialects import llvm
 from cutlass import Float32, Int32, Uint32
-from cutlass.cutlass_dsl import Int64, dsl_user_op
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 
@@ -55,11 +53,7 @@ _EAGER_HOST_LAUNCHER_CACHE_SIZE = int(
     os.getenv("B12X_EAGER_HOST_LAUNCHER_CACHE_SIZE", "512")
 )
 _PAGED_Q_HEAD_TILE = 16
-_PAGED_K_TMA_DESC_CACHE_SIZE = 32
-_BLACKWELL_TMA_DESC_WORDS = 16
-_BLACKWELL_TMA_DESC_MIN_BACKING_BYTES = 128 * 1024
-_BLACKWELL_TMA_DESC_PATCH_WORD = 1
-_BLACKWELL_TMA_DESC_PATCH_CLEAR_MASK = 0xFFFFFFFFFFDFFFFF
+_BLACKWELL_TINY_STRIDED_TMA_MAX_BACKING_BYTES = 128 * 1024
 
 
 def _raise_binding_extras(api_name: str, extras: list[str]) -> None:
@@ -430,87 +424,19 @@ def _is_dense_non_overlapping(tensor: torch.Tensor) -> bool:
     return True
 
 
-def _needs_paged_index_k_tma_descriptor_workaround(
+def _needs_paged_index_k_scalar_load(
     index_k_cache: torch.Tensor,
     k_quant_bytes: torch.Tensor,
 ) -> bool:
+    # Real serving caches are large enough for the normal TMA path. Tiny
+    # strided caches appear in fake/warmup runs and should still be valid, so
+    # load those pages cooperatively instead of depending on tiny strided TMA
+    # descriptor behavior.
     if get_sm_version(index_k_cache.device) // 10 != 12:
         return False
-    if _tensor_storage_nbytes(index_k_cache) >= _BLACKWELL_TMA_DESC_MIN_BACKING_BYTES:
+    if _tensor_storage_nbytes(index_k_cache) >= _BLACKWELL_TINY_STRIDED_TMA_MAX_BACKING_BYTES:
         return False
     return not _is_dense_non_overlapping(k_quant_bytes)
-
-
-def _encode_paged_index_k_tma_descriptor(
-    k_quant_bytes: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if k_quant_bytes.ndim != 3 or k_quant_bytes.shape[1:] != (_PAGE_SIZE, _INDEX_HEAD_DIM):
-        raise ValueError(
-            "k_quant_bytes must have shape "
-            f"(num_pages, {_PAGE_SIZE}, {_INDEX_HEAD_DIM}), got {tuple(k_quant_bytes.shape)}"
-        )
-    if k_quant_bytes.dtype != torch.uint8:
-        raise TypeError(f"k_quant_bytes must have dtype torch.uint8, got {k_quant_bytes.dtype}")
-
-    num_pages = int(k_quant_bytes.shape[0])
-    row_stride_bytes = int(k_quant_bytes.stride(1)) * k_quant_bytes.element_size()
-    page_stride_bytes = int(k_quant_bytes.stride(0)) * k_quant_bytes.element_size()
-    base_ptr = int(k_quant_bytes.data_ptr())
-    U64 = cuda.cuuint64_t
-    U32 = cuda.cuuint32_t
-
-    result, tensor_map = cuda.cuTensorMapEncodeTiled(
-        cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_UINT8,
-        3,
-        base_ptr,
-        [U64(_INDEX_HEAD_DIM), U64(_PAGE_SIZE), U64(num_pages)],
-        [U64(row_stride_bytes), U64(page_stride_bytes)],
-        [U32(_INDEX_HEAD_DIM), U32(_PAGE_SIZE), U32(1)],
-        [U32(1), U32(1), U32(1)],
-        cuda.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE,
-        cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_NONE,
-        cuda.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_NONE,
-        cuda.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
-    )
-    if result != cuda.CUresult.CUDA_SUCCESS:
-        raise RuntimeError(f"cuTensorMapEncodeTiled failed: {result}")
-
-    host_desc_words = [int(word) for word in tensor_map.opaque]
-    if len(host_desc_words) != _BLACKWELL_TMA_DESC_WORDS:
-        raise RuntimeError(
-            f"unexpected TMA descriptor size: expected {_BLACKWELL_TMA_DESC_WORDS} words, "
-            f"got {len(host_desc_words)}"
-        )
-    host_desc = torch.tensor(host_desc_words, dtype=torch.uint64)
-    host_desc[_BLACKWELL_TMA_DESC_PATCH_WORD] &= _BLACKWELL_TMA_DESC_PATCH_CLEAR_MASK
-    desc = host_desc.to(device=k_quant_bytes.device, non_blocking=False)
-    desc_ptrs = torch.tensor([int(desc.data_ptr())], dtype=torch.int64, device=k_quant_bytes.device)
-    return desc, desc_ptrs
-
-
-def _get_cached_paged_index_k_tma_descriptor(
-    k_quant_bytes: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    key = (
-        int(k_quant_bytes.data_ptr()),
-        tuple(k_quant_bytes.shape),
-        tuple(k_quant_bytes.stride()),
-        str(k_quant_bytes.dtype),
-        (k_quant_bytes.device.type, k_quant_bytes.device.index),
-    )
-    cache = getattr(_get_cached_paged_index_k_tma_descriptor, "_cache", None)
-    if cache is None:
-        cache = OrderedDict()
-        setattr(_get_cached_paged_index_k_tma_descriptor, "_cache", cache)
-    cached = cache.get(key)
-    if cached is not None:
-        cache.move_to_end(key)
-        return cached
-    desc = _encode_paged_index_k_tma_descriptor(k_quant_bytes)
-    cache[key] = desc
-    if len(cache) > _PAGED_K_TMA_DESC_CACHE_SIZE:
-        cache.popitem(last=False)
-    return desc
 
 
 @lru_cache(maxsize=16)
@@ -521,37 +447,6 @@ def _dummy_paged_index_k_tma_desc_ptrs(device_index: int) -> torch.Tensor:
 @lru_cache(maxsize=32)
 def _cached_int32_scalar(value: int, device_index: int) -> torch.Tensor:
     return torch.tensor([value], dtype=torch.int32, device=torch.device("cuda", device_index))
-
-
-@dsl_user_op
-def _cp_async_bulk_tensor_3d(
-    dst_smem_addr: Int32,
-    tensor_map_ptr: Int64,
-    coord0: Int32,
-    coord1: Int32,
-    coord2: Int32,
-    mbar_smem_addr: Int32,
-    *,
-    loc=None,
-    ip=None,
-):
-    llvm.inline_asm(
-        None,
-        [
-            Int32(dst_smem_addr).ir_value(loc=loc, ip=ip),
-            Int64(tensor_map_ptr).ir_value(loc=loc, ip=ip),
-            Int32(coord0).ir_value(loc=loc, ip=ip),
-            Int32(coord1).ir_value(loc=loc, ip=ip),
-            Int32(coord2).ir_value(loc=loc, ip=ip),
-            Int32(mbar_smem_addr).ir_value(loc=loc, ip=ip),
-        ],
-        "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes "
-        "[$0], [$1, {$2, $3, $4}], [$5];",
-        "r,l,r,r,r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
 
 
 @cute.jit
@@ -607,6 +502,22 @@ def _repack_k_page_to_permuted(
         )
         v0, v1, v2, v3 = ld_shared_v4_u32(src_addr)
         st_shared_v4_u32(dst_addr, v0, v1, v2, v3)
+        linear += Int32(_PAGED_THREADS_PER_CTA)
+
+
+@cute.jit
+def _load_index_k_page_scalar(
+    k_quant_bytes: cute.Tensor,
+    page_id: Int32,
+    s_k_page_stage: cute.Tensor,
+    lane_linear: Int32,
+):
+    linear = lane_linear
+    total = Int32(_PAGE_SIZE * _INDEX_HEAD_DIM)
+    while linear < total:
+        row = linear // Int32(_INDEX_HEAD_DIM)
+        col = linear - row * Int32(_INDEX_HEAD_DIM)
+        s_k_page_stage[row, col, Int32(0)] = k_quant_bytes[page_id, row, col]
         linear += Int32(_PAGED_THREADS_PER_CTA)
 
 
@@ -716,24 +627,11 @@ def _issue_index_k_tma_copy(
     mbar_ptr,
     expected_bytes,
     page_id,
-    dst_smem_addr,
-    tma_desc_ptr=None,
-    use_external_tma_desc=Int32(0),
 ):
     full_mbar_ptr = mbar_ptr + producer_state.index
     with cute.arch.elect_one():
         cute.arch.mbarrier_arrive_and_expect_tx(full_mbar_ptr, expected_bytes)
-    if use_external_tma_desc != Int32(0):
-        _cp_async_bulk_tensor_3d(
-            Int32(dst_smem_addr),
-            Int64(tma_desc_ptr),
-            Int32(0),
-            Int32(0),
-            page_id,
-            Int32(shared_ptr_to_u32(full_mbar_ptr)),
-        )
-    else:
-        load_tma(src_idx=page_id, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
+    load_tma(src_idx=page_id, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
 
 
 class SparseNSAPagedLogitsKernel:
@@ -782,7 +680,7 @@ class SparseNSAPagedLogitsKernel:
         weights: cute.Tensor,
         k_quant_bytes: cute.Tensor,
         k_tma_desc_ptrs: cute.Tensor,
-        use_patched_k_tma_desc: cute.Tensor,
+        use_scalar_k_load: cute.Tensor,
         k_scales: cute.Tensor,
         real_page_table: cute.Tensor,
         seqlens_per_query: cute.Tensor,
@@ -802,9 +700,10 @@ class SparseNSAPagedLogitsKernel:
         self.kernel(
             q_bytes,
             weights,
+            k_quant_bytes,
             tma_tensor_k,
             k_tma_desc_ptrs,
-            use_patched_k_tma_desc,
+            use_scalar_k_load,
             k_scales,
             real_page_table,
             seqlens_per_query,
@@ -829,9 +728,10 @@ class SparseNSAPagedLogitsKernel:
         self,
         q_bytes: cute.Tensor,
         weights: cute.Tensor,
+        k_quant_bytes: cute.Tensor,
         k_tma_tensor: cute.Tensor,
         k_tma_desc_ptrs: cute.Tensor,
-        use_patched_k_tma_desc: cute.Tensor,
+        use_scalar_k_load: cute.Tensor,
         k_scales: cute.Tensor,
         real_page_table: cute.Tensor,
         seqlens_per_query: cute.Tensor,
@@ -909,12 +809,11 @@ class SparseNSAPagedLogitsKernel:
             cute.local_tile(k_tma_tensor, (_PAGE_SIZE, _INDEX_HEAD_DIM), (0, 0, None)),
             s_k_page_stage,
         )
-        use_external_k_tma_desc = Int32(use_patched_k_tma_desc[Int32(0)])
-        k_tma_desc_ptr = Int64(k_tma_desc_ptrs[Int32(0)])
+        use_scalar_k_load_flag = Int32(use_scalar_k_load[Int32(0)])
         if cta_idx < total_work:
             if tx == 0:
                 cute.arch.mbarrier_init(mbar_ptr_k, Int32(1))
-            if warp_idx == Int32(0) and use_external_k_tma_desc == Int32(0):
+            if (warp_idx == Int32(0)) & (use_scalar_k_load_flag == Int32(0)):
                 cpasync.prefetch_descriptor(tma_atom_k)
 
             num_heads = Int32(self.num_heads_static)
@@ -947,28 +846,34 @@ class SparseNSAPagedLogitsKernel:
                 page_col = work_idx
                 source_page_col = source_offset_pages + page_col
                 page_base = page_col * Int32(_PAGE_SIZE)
-                if page_base < seq_len and source_page_col < Int32(real_page_table.shape[1]):
+                if (page_base < seq_len) & (source_page_col < Int32(real_page_table.shape[1])):
                     page_id = Int32(real_page_table[q_idx, source_page_col])
                     if page_id >= Int32(0):
-                        if warp_idx == Int32(0):
-                            _issue_index_k_tma_copy(
-                                load_k_tma,
-                                producer_state,
-                                mbar_ptr_k,
-                                Int32(_PAGE_SIZE * _INDEX_HEAD_DIM),
+                        if use_scalar_k_load_flag != Int32(0):
+                            _load_index_k_page_scalar(
+                                k_quant_bytes,
                                 page_id,
-                                k_page_base_addr,
-                                tma_desc_ptr=k_tma_desc_ptr,
-                                use_external_tma_desc=use_external_k_tma_desc,
+                                s_k_page_stage,
+                                tx,
                             )
+                        else:
+                            if warp_idx == Int32(0):
+                                _issue_index_k_tma_copy(
+                                    load_k_tma,
+                                    producer_state,
+                                    mbar_ptr_k,
+                                    Int32(_PAGE_SIZE * _INDEX_HEAD_DIM),
+                                    page_id,
+                                )
                         scale_idx = tx
                         while scale_idx < Int32(_PAGE_SIZE):
                             s_scale[scale_idx] = Float32(k_scales[page_id, scale_idx])
                             scale_idx += Int32(_PAGED_THREADS_PER_CTA)
-                        cute.arch.mbarrier_wait(
-                            mbar_ptr_k + consumer_state.index,
-                            phase=consumer_state.phase,
-                        )
+                        if use_scalar_k_load_flag == Int32(0):
+                            cute.arch.mbarrier_wait(
+                                mbar_ptr_k + consumer_state.index,
+                                phase=consumer_state.phase,
+                            )
                         cute.arch.sync_threads()
                         _repack_k_page_to_permuted(k_page_base_addr, k_page_perm_base_addr, tx)
                         cute.arch.sync_threads()
@@ -1004,7 +909,7 @@ class SparseNSAPagedLogitsKernel:
                                     head_tile_slot,
                                 )
                             cute.arch.sync_threads()
-                            if head_tile_slot == Int32(0) and lane < Int32(_PAGED_TOKENS_PER_GROUP):
+                            if (head_tile_slot == Int32(0)) & (lane < Int32(_PAGED_TOKENS_PER_GROUP)):
                                 slot_idx = token_base + lane
                                 if slot_idx < valid_slots:
                                     logit = Float32(0.0)
@@ -1060,7 +965,7 @@ class SparseNSAPagedWindowedTiledLogitsKernel(SparseNSAPagedLogitsKernel):
         weights: cute.Tensor,
         k_quant_bytes: cute.Tensor,
         k_tma_desc_ptrs: cute.Tensor,
-        use_patched_k_tma_desc: cute.Tensor,
+        use_scalar_k_load: cute.Tensor,
         k_scales: cute.Tensor,
         real_page_table: cute.Tensor,
         seqlens_per_query: cute.Tensor,
@@ -1082,9 +987,10 @@ class SparseNSAPagedWindowedTiledLogitsKernel(SparseNSAPagedLogitsKernel):
         self.kernel(
             q_bytes,
             weights,
+            k_quant_bytes,
             tma_tensor_k,
             k_tma_desc_ptrs,
-            use_patched_k_tma_desc,
+            use_scalar_k_load,
             k_scales,
             real_page_table,
             seqlens_per_query,
@@ -1166,7 +1072,7 @@ class SparseNSAScheduledSingleRowLogitsKernel:
         weights: cute.Tensor,
         k_quant_bytes: cute.Tensor,
         k_tma_desc_ptrs: cute.Tensor,
-        use_patched_k_tma_desc: cute.Tensor,
+        use_scalar_k_load: cute.Tensor,
         k_scales: cute.Tensor,
         real_page_table: cute.Tensor,
         seqlens_per_query: cute.Tensor,
@@ -1187,9 +1093,10 @@ class SparseNSAScheduledSingleRowLogitsKernel:
         self.kernel(
             q_bytes,
             weights,
+            k_quant_bytes,
             tma_tensor_k,
             k_tma_desc_ptrs,
-            use_patched_k_tma_desc,
+            use_scalar_k_load,
             k_scales,
             real_page_table,
             seqlens_per_query,
@@ -1213,9 +1120,10 @@ class SparseNSAScheduledSingleRowLogitsKernel:
         self,
         q_bytes: cute.Tensor,
         weights: cute.Tensor,
+        k_quant_bytes: cute.Tensor,
         k_tma_tensor: cute.Tensor,
         k_tma_desc_ptrs: cute.Tensor,
-        use_patched_k_tma_desc: cute.Tensor,
+        use_scalar_k_load: cute.Tensor,
         k_scales: cute.Tensor,
         real_page_table: cute.Tensor,
         seqlens_per_query: cute.Tensor,
@@ -1281,17 +1189,16 @@ class SparseNSAScheduledSingleRowLogitsKernel:
             cute.local_tile(k_tma_tensor, (_PAGE_SIZE, _INDEX_HEAD_DIM), (0, 0, None)),
             s_k_page_stage,
         )
-        use_external_k_tma_desc = Int32(use_patched_k_tma_desc[Int32(0)])
-        k_tma_desc_ptr = Int64(k_tma_desc_ptrs[Int32(0)])
+        use_scalar_k_load_flag = Int32(use_scalar_k_load[Int32(0)])
 
         if (
-            start_q_idx == Int32(0)
-            and interval_page_start < interval_page_end
-            and cta_lane_idx < Int32(self.parallel_ctas)
+            (start_q_idx == Int32(0))
+            & (interval_page_start < interval_page_end)
+            & (cta_lane_idx < Int32(self.parallel_ctas))
         ):
             if tx == 0:
                 cute.arch.mbarrier_init(mbar_ptr_k, Int32(1))
-            if warp_idx == Int32(0) and use_external_k_tma_desc == Int32(0):
+            if (warp_idx == Int32(0)) & (use_scalar_k_load_flag == Int32(0)):
                 cpasync.prefetch_descriptor(tma_atom_k)
 
             num_heads = Int32(self.num_heads_static)
@@ -1325,25 +1232,31 @@ class SparseNSAScheduledSingleRowLogitsKernel:
                 if page_base < seq_len:
                     page_id = Int32(real_page_table[Int32(0), page_col])
                     if page_id >= Int32(0):
-                        if warp_idx == Int32(0):
-                            _issue_index_k_tma_copy(
-                                load_k_tma,
-                                producer_state,
-                                mbar_ptr_k,
-                                Int32(_PAGE_SIZE * _INDEX_HEAD_DIM),
+                        if use_scalar_k_load_flag != Int32(0):
+                            _load_index_k_page_scalar(
+                                k_quant_bytes,
                                 page_id,
-                                k_page_base_addr,
-                                tma_desc_ptr=k_tma_desc_ptr,
-                                use_external_tma_desc=use_external_k_tma_desc,
+                                s_k_page_stage,
+                                tx,
                             )
+                        else:
+                            if warp_idx == Int32(0):
+                                _issue_index_k_tma_copy(
+                                    load_k_tma,
+                                    producer_state,
+                                    mbar_ptr_k,
+                                    Int32(_PAGE_SIZE * _INDEX_HEAD_DIM),
+                                    page_id,
+                                )
                         scale_idx = tx
                         while scale_idx < Int32(_PAGE_SIZE):
                             s_scale[scale_idx] = Float32(k_scales[page_id, scale_idx])
                             scale_idx += Int32(_PAGED_THREADS_PER_CTA)
-                        cute.arch.mbarrier_wait(
-                            mbar_ptr_k + consumer_state.index,
-                            phase=consumer_state.phase,
-                        )
+                        if use_scalar_k_load_flag == Int32(0):
+                            cute.arch.mbarrier_wait(
+                                mbar_ptr_k + consumer_state.index,
+                                phase=consumer_state.phase,
+                            )
                         cute.arch.sync_threads()
                         _repack_k_page_to_permuted(k_page_base_addr, k_page_perm_base_addr, tx)
                         cute.arch.sync_threads()
@@ -1379,7 +1292,7 @@ class SparseNSAScheduledSingleRowLogitsKernel:
                                     head_tile_slot,
                                 )
                             cute.arch.sync_threads()
-                            if head_tile_slot == Int32(0) and lane < Int32(_PAGED_TOKENS_PER_GROUP):
+                            if (head_tile_slot == Int32(0)) & (lane < Int32(_PAGED_TOKENS_PER_GROUP)):
                                 slot_idx = token_base + lane
                                 if slot_idx < valid_slots:
                                     logit = Float32(0.0)
@@ -1433,7 +1346,7 @@ class SparseNSAScheduledMultiRowLogitsKernel:
         weights: cute.Tensor,
         k_quant_bytes: cute.Tensor,
         k_tma_desc_ptrs: cute.Tensor,
-        use_patched_k_tma_desc: cute.Tensor,
+        use_scalar_k_load: cute.Tensor,
         k_scales: cute.Tensor,
         real_page_table: cute.Tensor,
         seqlens_per_query: cute.Tensor,
@@ -1454,9 +1367,10 @@ class SparseNSAScheduledMultiRowLogitsKernel:
         self.kernel(
             q_bytes,
             weights,
+            k_quant_bytes,
             tma_tensor_k,
             k_tma_desc_ptrs,
-            use_patched_k_tma_desc,
+            use_scalar_k_load,
             k_scales,
             real_page_table,
             seqlens_per_query,
@@ -1480,9 +1394,10 @@ class SparseNSAScheduledMultiRowLogitsKernel:
         self,
         q_bytes: cute.Tensor,
         weights: cute.Tensor,
+        k_quant_bytes: cute.Tensor,
         k_tma_tensor: cute.Tensor,
         k_tma_desc_ptrs: cute.Tensor,
-        use_patched_k_tma_desc: cute.Tensor,
+        use_scalar_k_load: cute.Tensor,
         k_scales: cute.Tensor,
         real_page_table: cute.Tensor,
         seqlens_per_query: cute.Tensor,
@@ -1538,13 +1453,14 @@ class SparseNSAScheduledMultiRowLogitsKernel:
             cute.local_tile(k_tma_tensor, (_PAGE_SIZE, _INDEX_HEAD_DIM), (0, 0, None)),
             s_k_page_stage,
         )
-        use_external_k_tma_desc = Int32(use_patched_k_tma_desc[Int32(0)])
-        k_tma_desc_ptr = Int64(k_tma_desc_ptrs[Int32(0)])
+        use_scalar_k_load_flag = Int32(use_scalar_k_load[Int32(0)])
 
-        if interval_idx < total_schedule_intervals and cta_lane_idx < Int32(self.parallel_ctas):
+        if (interval_idx < total_schedule_intervals) & (
+            cta_lane_idx < Int32(self.parallel_ctas)
+        ):
             if tx == 0:
                 cute.arch.mbarrier_init(mbar_ptr_k, Int32(1))
-            if warp_idx == Int32(0) and use_external_k_tma_desc == Int32(0):
+            if (warp_idx == Int32(0)) & (use_scalar_k_load_flag == Int32(0)):
                 cpasync.prefetch_descriptor(tma_atom_k)
 
             num_heads = Int32(self.num_heads_static)
@@ -1555,9 +1471,9 @@ class SparseNSAScheduledMultiRowLogitsKernel:
             current_q_idx = start_q_idx
             current_split_idx = start_split_idx
 
-            while current_q_idx < q_rows and (
-                current_q_idx < end_q_idx
-                or (current_q_idx == end_q_idx and end_split_idx > Int32(0))
+            while (current_q_idx < q_rows) & (
+                (current_q_idx < end_q_idx)
+                | ((current_q_idx == end_q_idx) & (end_split_idx > Int32(0)))
             ):
                 seq_len = Int32(seqlens_per_query[current_q_idx])
                 if seq_len > live_width:
@@ -1605,25 +1521,31 @@ class SparseNSAScheduledMultiRowLogitsKernel:
                         if page_base < seq_len:
                             page_id = Int32(real_page_table[current_q_idx, page_col])
                             if page_id >= Int32(0):
-                                if warp_idx == Int32(0):
-                                    _issue_index_k_tma_copy(
-                                        load_k_tma,
-                                        producer_state,
-                                        mbar_ptr_k,
-                                        Int32(_PAGE_SIZE * _INDEX_HEAD_DIM),
+                                if use_scalar_k_load_flag != Int32(0):
+                                    _load_index_k_page_scalar(
+                                        k_quant_bytes,
                                         page_id,
-                                        k_page_base_addr,
-                                        tma_desc_ptr=k_tma_desc_ptr,
-                                        use_external_tma_desc=use_external_k_tma_desc,
+                                        s_k_page_stage,
+                                        tx,
                                     )
+                                else:
+                                    if warp_idx == Int32(0):
+                                        _issue_index_k_tma_copy(
+                                            load_k_tma,
+                                            producer_state,
+                                            mbar_ptr_k,
+                                            Int32(_PAGE_SIZE * _INDEX_HEAD_DIM),
+                                            page_id,
+                                        )
                                 scale_idx = tx
                                 while scale_idx < Int32(_PAGE_SIZE):
                                     s_scale[scale_idx] = Float32(k_scales[page_id, scale_idx])
                                     scale_idx += Int32(_PAGED_THREADS_PER_CTA)
-                                cute.arch.mbarrier_wait(
-                                    mbar_ptr_k + consumer_state.index,
-                                    phase=consumer_state.phase,
-                                )
+                                if use_scalar_k_load_flag == Int32(0):
+                                    cute.arch.mbarrier_wait(
+                                        mbar_ptr_k + consumer_state.index,
+                                        phase=consumer_state.phase,
+                                    )
                                 cute.arch.sync_threads()
                                 _repack_k_page_to_permuted(k_page_base_addr, k_page_perm_base_addr, tx)
                                 cute.arch.sync_threads()
@@ -1773,9 +1695,6 @@ def clear_indexer_kernel_cache() -> None:
     _build_sparse_nsa_paged_tiled_kernel.cache_clear()
     _build_sparse_nsa_schedule_single_row_kernel.cache_clear()
     _build_sparse_nsa_schedule_multi_row_kernel.cache_clear()
-    cache = getattr(_get_cached_paged_index_k_tma_descriptor, "_cache", None)
-    if cache is not None:
-        cache.clear()
 
 
 def supports_paged_logits_kernel(
@@ -1926,17 +1845,14 @@ def run_paged_logits_kernel(
         )
 
     k_quant_bytes, k_scales = _split_index_k_cache_runtime_views(index_k_cache)
-    use_patched_k_tma_desc = _needs_paged_index_k_tma_descriptor_workaround(
+    use_scalar_k_load = _needs_paged_index_k_scalar_load(
         index_k_cache,
         k_quant_bytes,
     )
     device_index = q_fp8.device.index or 0
-    if use_patched_k_tma_desc:
-        _, k_tma_desc_ptrs = _get_cached_paged_index_k_tma_descriptor(k_quant_bytes)
-    else:
-        k_tma_desc_ptrs = _dummy_paged_index_k_tma_desc_ptrs(device_index)
-    use_patched_k_tma_desc_tensor = _cached_int32_scalar(
-        int(use_patched_k_tma_desc),
+    k_tma_desc_ptrs = _dummy_paged_index_k_tma_desc_ptrs(device_index)
+    use_scalar_k_load_tensor = _cached_int32_scalar(
+        int(use_scalar_k_load),
         device_index,
     )
     if workspace is not None:
@@ -1983,7 +1899,7 @@ def run_paged_logits_kernel(
         _to_kernel_tensor(weights_kernel, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(k_quant_bytes, cutlass.Uint8),
         _to_kernel_tensor(k_tma_desc_ptrs, cutlass.Int64, assumed_align=8),
-        _to_kernel_tensor(use_patched_k_tma_desc_tensor, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(use_scalar_k_load_tensor, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(k_scales, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(real_page_table_kernel, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(seqlens_per_query_kernel, cutlass.Int32, assumed_align=4),
@@ -1994,7 +1910,7 @@ def run_paged_logits_kernel(
         _tensor_meta_key(_contract_key_tensor(_cp, "weights", weights_kernel)),
         _tensor_meta_key(k_quant_bytes),
         _tensor_meta_key(k_tma_desc_ptrs),
-        _tensor_meta_key(use_patched_k_tma_desc_tensor),
+        _tensor_meta_key(use_scalar_k_load_tensor),
         _tensor_meta_key(k_scales),
         _tensor_meta_key(
             _contract_key_tensor(_cp, "real_page_table", real_page_table_kernel)
@@ -2405,17 +2321,14 @@ def _run_paged_tiled_logits_kernel_common(
         )
 
     k_quant_bytes, k_scales = _split_index_k_cache_runtime_views(index_k_cache)
-    use_patched_k_tma_desc = _needs_paged_index_k_tma_descriptor_workaround(
+    use_scalar_k_load = _needs_paged_index_k_scalar_load(
         index_k_cache,
         k_quant_bytes,
     )
     device_index = q_fp8.device.index or 0
-    if use_patched_k_tma_desc:
-        _, k_tma_desc_ptrs = _get_cached_paged_index_k_tma_descriptor(k_quant_bytes)
-    else:
-        k_tma_desc_ptrs = _dummy_paged_index_k_tma_desc_ptrs(device_index)
-    use_patched_k_tma_desc_tensor = _cached_int32_scalar(
-        int(use_patched_k_tma_desc),
+    k_tma_desc_ptrs = _dummy_paged_index_k_tma_desc_ptrs(device_index)
+    use_scalar_k_load_tensor = _cached_int32_scalar(
+        int(use_scalar_k_load),
         device_index,
     )
     if workspace is not None and stage_runtime_metadata:
@@ -2469,7 +2382,7 @@ def _run_paged_tiled_logits_kernel_common(
         _to_kernel_tensor(weights_kernel, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(k_quant_bytes, cutlass.Uint8),
         _to_kernel_tensor(k_tma_desc_ptrs, cutlass.Int64, assumed_align=8),
-        _to_kernel_tensor(use_patched_k_tma_desc_tensor, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(use_scalar_k_load_tensor, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(k_scales, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(real_page_table_kernel, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(seqlens_per_query_kernel, cutlass.Int32, assumed_align=4),
@@ -2480,7 +2393,7 @@ def _run_paged_tiled_logits_kernel_common(
         _tensor_meta_key(_contract_key_tensor(_cp, "weights", weights_kernel)),
         _tensor_meta_key(k_quant_bytes),
         _tensor_meta_key(k_tma_desc_ptrs),
-        _tensor_meta_key(use_patched_k_tma_desc_tensor),
+        _tensor_meta_key(use_scalar_k_load_tensor),
         _tensor_meta_key(k_scales),
         _tensor_meta_key(
             _contract_key_tensor(_cp, "real_page_table", real_page_table_kernel)
