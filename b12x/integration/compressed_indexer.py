@@ -398,11 +398,11 @@ def _resolve_binding_metadata(
             raise TypeError("compressed indexer launch requires metadata or binding")
         return metadata, workspace, active_width_override
 
-    binding_workspace = getattr(binding, "workspace", None)
-    if binding_workspace is None:
-        raise TypeError("compressed indexer binding is missing a workspace")
-    if workspace is not None and workspace is not binding_workspace:
-        raise ValueError("workspace argument does not match compressed indexer binding workspace")
+    binding_scratch = getattr(binding, "scratch", None)
+    if binding_scratch is None:
+        raise TypeError("compressed indexer binding is missing scratch")
+    if workspace is not None and workspace is not binding_scratch:
+        raise ValueError("workspace argument does not match compressed indexer binding scratch")
     if metadata is not None:
         raise ValueError("pass either metadata or binding, not both")
     metadata = CompressedIndexerMetadata(
@@ -414,7 +414,7 @@ def _resolve_binding_metadata(
     )
     if active_width_override is None:
         active_width_override = getattr(binding, "active_width", None)
-    return metadata, binding_workspace, active_width_override
+    return metadata, binding_scratch, active_width_override
 
 
 def _prepare_shared_compressed_supertile(

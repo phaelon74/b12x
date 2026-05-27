@@ -137,7 +137,7 @@ class B12XPersistentTopK2048ScratchCaps:
 class B12XPersistentTopK2048Binding:
     logits: torch.Tensor
     lengths: torch.Tensor
-    workspace: torch.Tensor
+    scratch: torch.Tensor
     page_table_1: torch.Tensor | None = None
     output_indices: torch.Tensor | None = None
     max_seq_len: int | None = None
@@ -244,7 +244,7 @@ def build_persistent_topk2048_binding(
     return B12XPersistentTopK2048Binding(
         logits=logits,
         lengths=lengths,
-        workspace=workspace,
+        scratch=workspace,
         page_table_1=page_table_1,
         output_indices=output_indices,
         max_seq_len=max_seq_len,
@@ -783,14 +783,14 @@ def run_persistent_topk2048(
         ]
         if extras:
             raise ValueError(
-                "persistent top-k binding owns runtime tensors, workspace, and options; "
+                "persistent top-k binding owns runtime tensors, scratch, and options; "
                 f"do not also pass {', '.join(extras)}"
             )
         logits = binding.logits
         lengths = binding.lengths
         page_table_1 = binding.page_table_1
         output_indices = binding.output_indices
-        workspace = binding.workspace
+        workspace = binding.scratch
         max_seq_len = binding.max_seq_len
     if logits is None or lengths is None:
         raise TypeError("run_persistent_topk2048 requires logits/lengths or binding")

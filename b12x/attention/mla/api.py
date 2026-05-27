@@ -298,7 +298,7 @@ def _resolve_sparse_mla_binding(
     ]
     if extras:
         raise ValueError(
-            "sparse MLA binding owns runtime tensors and workspace; "
+            "sparse MLA binding owns runtime tensors and scratch; "
             f"do not also pass {', '.join(extras)}"
         )
     return (
@@ -306,7 +306,7 @@ def _resolve_sparse_mla_binding(
         binding.selected_indices,
         binding.cache_seqlens_int32,
         binding.nsa_cache_seqlens_int32,
-        binding.workspace,
+        binding.scratch,
     )
 
 

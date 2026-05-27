@@ -243,7 +243,8 @@ def test_workspace_bind_sparse_mla_returns_common_binding_type() -> None:
     )
 
     assert isinstance(binding, B12XSparseMLABinding)
-    assert binding.workspace is workspace
+    assert not hasattr(binding, "workspace")
+    assert binding.scratch is workspace
     assert binding.q.data_ptr() == q.data_ptr()
     assert binding.selected_indices is selected_indices
     assert binding.cache_seqlens_int32 is cache_seqlens
@@ -266,7 +267,8 @@ def test_workspace_bind_compressed_indexer_returns_common_binding_type() -> None
     )
 
     assert isinstance(binding, B12XCompressedIndexerBinding)
-    assert binding.workspace is workspace
+    assert not hasattr(binding, "workspace")
+    assert binding.scratch is workspace
     assert binding.real_page_table is real_page_table
     assert binding.active_width is active_width
     assert binding.expected_num_q_heads == 3
@@ -288,7 +290,8 @@ def test_workspace_bind_indexer_paged_decode_returns_common_binding_type() -> No
     )
 
     assert isinstance(binding, B12XIndexerPagedBinding)
-    assert binding.workspace is workspace
+    assert not hasattr(binding, "workspace")
+    assert binding.scratch is workspace
     assert binding.metadata.real_page_table is real_page_table
     assert binding.metadata.paged_mqa_schedule_metadata is schedule
     assert binding.active_width is active_width
@@ -309,7 +312,8 @@ def test_workspace_bind_indexer_extend_returns_common_binding_type() -> None:
     binding = workspace.bind_indexer_extend(k_start=k_start, k_end=k_end, topk=3)
 
     assert isinstance(binding, B12XIndexerExtendBinding)
-    assert binding.workspace is workspace
+    assert not hasattr(binding, "workspace")
+    assert binding.scratch is workspace
     assert binding.metadata.k_start is k_start
     assert binding.metadata.k_end is k_end
     assert binding.topk == 3

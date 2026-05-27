@@ -97,14 +97,14 @@ class B12XIndexerExtendScratchCaps:
 
 @dataclass(frozen=True, kw_only=True)
 class B12XIndexerPagedBinding:
-    workspace: B12XAttentionWorkspace
+    scratch: B12XAttentionWorkspace
     metadata: IndexerPagedDecodeMetadata
     active_width: torch.Tensor
 
 
 @dataclass(frozen=True, kw_only=True)
 class B12XIndexerExtendBinding:
-    workspace: B12XAttentionWorkspace
+    scratch: B12XAttentionWorkspace
     metadata: IndexerExtendMetadata
     gather_k_quant: torch.Tensor | None = None
     gather_k_scale: torch.Tensor | None = None
@@ -208,7 +208,7 @@ def build_indexer_paged_binding(
                 f"got {tuple(paged_mqa_schedule_metadata.shape)}"
             )
     return B12XIndexerPagedBinding(
-        workspace=workspace,
+        scratch=workspace,
         metadata=IndexerPagedDecodeMetadata(
             real_page_table=real_page_table,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -300,7 +300,7 @@ def build_indexer_extend_binding(
                 merge_positions = merge_positions[:, :resolved_topk]
 
     return B12XIndexerExtendBinding(
-        workspace=workspace,
+        scratch=workspace,
         metadata=IndexerExtendMetadata(k_start=k_start, k_end=k_end),
         gather_k_quant=gather_k_quant,
         gather_k_scale=gather_k_scale,

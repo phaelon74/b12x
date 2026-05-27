@@ -72,7 +72,7 @@ class B12XSparseMLAScratchCaps:
 
 @dataclass(frozen=True, kw_only=True)
 class B12XSparseMLABinding:
-    workspace: B12XAttentionWorkspace
+    scratch: B12XAttentionWorkspace
     q: torch.Tensor
     selected_indices: torch.Tensor
     cache_seqlens_int32: torch.Tensor
@@ -180,7 +180,7 @@ def build_sparse_mla_binding(
         rows=rows,
     )
     return B12XSparseMLABinding(
-        workspace=workspace,
+        scratch=workspace,
         q=q,
         selected_indices=selected_indices,
         cache_seqlens_int32=cache_seqlens_int32,

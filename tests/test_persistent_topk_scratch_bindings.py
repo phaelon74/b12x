@@ -45,8 +45,9 @@ def test_persistent_topk2048_scratch_plan_binds_caller_owned_arena() -> None:
     assert isinstance(binding, B12XPersistentTopK2048Binding)
     assert binding.logits is logits
     assert binding.lengths is lengths
-    assert binding.workspace.dtype == torch.int32
-    assert binding.workspace.data_ptr() == scratch.data_ptr()
+    assert not hasattr(binding, "workspace")
+    assert binding.scratch.dtype == torch.int32
+    assert binding.scratch.data_ptr() == scratch.data_ptr()
 
 
 def test_persistent_topk2048_binding_run_uses_function_binding_argument(monkeypatch) -> None:

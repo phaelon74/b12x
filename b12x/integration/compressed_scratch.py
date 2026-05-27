@@ -211,7 +211,7 @@ class B12XCompressedMLABinding:
 
 @dataclass(frozen=True, kw_only=True)
 class B12XCompressedIndexerBinding:
-    workspace: B12XAttentionWorkspace
+    scratch: B12XAttentionWorkspace
     real_page_table: torch.Tensor
     cache_seqlens_int32: torch.Tensor
     active_width: torch.Tensor
@@ -627,7 +627,7 @@ def build_compressed_indexer_binding(
         if expected_num_q_heads <= 0:
             raise ValueError(f"expected_num_q_heads must be positive, got {expected_num_q_heads}")
     return B12XCompressedIndexerBinding(
-        workspace=workspace,
+        scratch=workspace,
         real_page_table=real_page_table,
         cache_seqlens_int32=cache_seqlens_int32,
         active_width=active_width,

@@ -330,11 +330,11 @@ def paged_decode_logits(
         ]
         if extras:
             raise ValueError(
-                "paged indexer binding owns metadata, workspace, and active width; "
+                "paged indexer binding owns metadata, scratch, and active width; "
                 f"do not also pass {', '.join(extras)}"
             )
         metadata = binding.metadata
-        workspace = binding.workspace
+        workspace = binding.scratch
         active_width_override = binding.active_width
     if metadata is None:
         raise TypeError("paged_decode_logits requires metadata or binding")
@@ -499,12 +499,12 @@ def extend_logits(
         ]
         if extras:
             raise ValueError(
-                "indexer extend binding owns metadata, contract phantoms, workspace, "
+                "indexer extend binding owns metadata, contract phantoms, scratch, "
                 f"and tile logits; do not also pass {', '.join(extras)}"
             )
         metadata = binding.metadata
         contract_phantoms = binding.contract_phantoms
-        workspace = binding.workspace
+        workspace = binding.scratch
         tile_logits = binding.tile_logits
     if metadata is None:
         raise TypeError("extend_logits requires metadata or binding")
@@ -649,7 +649,7 @@ def extend_tiled_topk(
         ]
         if extras:
             raise ValueError(
-                "indexer extend binding owns metadata, contract phantoms, workspace, "
+                "indexer extend binding owns metadata, contract phantoms, scratch, "
                 "and top-k scratch buffers; do not also pass "
                 f"{', '.join(extras)}"
             )
@@ -661,7 +661,7 @@ def extend_tiled_topk(
             )
         metadata = binding.metadata
         contract_phantoms = binding.contract_phantoms
-        workspace = binding.workspace
+        workspace = binding.scratch
         tile_logits = binding.tile_logits
         lengths = binding.lengths
         output_values = binding.output_values
