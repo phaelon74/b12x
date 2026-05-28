@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 
+from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
 from b12x.gemm.block_fp8_linear import (
     BlockFP8LinearScratchCaps,
     block_fp8_linear_mxfp8,
@@ -183,3 +184,75 @@ def test_block_fp8_linear_default_workspace_path_captures() -> None:
     torch.cuda.synchronize()
 
     torch.testing.assert_close(actual, eager, rtol=0, atol=0)
+
+
+def test_block_fp8_linear_live_m_does_not_resolve_new_dense_kernel() -> None:
+    require_sm120()
+    torch.manual_seed(20260528)
+
+    warm_tokens, live_tokens = 4096, 1824
+    in_features, out_features = 128, 1536
+    weight, scale = _make_block_fp8_weight(out_features, in_features)
+    packed = pack_block_fp8_linear_weight_mxfp8(weight, scale)
+
+    warm_x = (
+        torch.randn((warm_tokens, in_features), device="cuda", dtype=torch.bfloat16)
+        / 4
+    ).contiguous()
+    live_x = (
+        torch.randn((live_tokens, in_features), device="cuda", dtype=torch.bfloat16)
+        / 4
+    ).contiguous()
+
+    block_fp8_linear_mxfp8(warm_x, packed)
+    torch.cuda.synchronize()
+
+    freeze_kernel_resolution("block FP8 dense GEMM live M should be runtime")
+    try:
+        actual = block_fp8_linear_mxfp8(live_x, packed)
+        torch.cuda.synchronize()
+    finally:
+        unfreeze_kernel_resolution()
+
+    expected = _reference_from_quantized_operands(live_x, weight, scale)
+    torch.testing.assert_close(
+        actual.float(),
+        expected.to(actual.dtype).float(),
+        rtol=1e-2,
+        atol=1e-4,
+    )
+
+
+def test_block_fp8_linear_small_live_m_reuses_prefill_dense_kernel() -> None:
+    require_sm120()
+    torch.manual_seed(20260529)
+
+    warm_tokens = 512
+    live_token_counts = (16, 32, 128)
+    in_features, out_features = 1024, 8192
+    weight, scale = _make_block_fp8_weight(out_features, in_features)
+    packed = pack_block_fp8_linear_weight_mxfp8(weight, scale)
+
+    warm_x = (
+        torch.randn((warm_tokens, in_features), device="cuda", dtype=torch.bfloat16)
+        / 4
+    ).contiguous()
+    live_xs = [
+        (
+            torch.randn((tokens, in_features), device="cuda", dtype=torch.bfloat16)
+            / 4
+        ).contiguous()
+        for tokens in live_token_counts
+    ]
+
+    block_fp8_linear_mxfp8(warm_x, packed)
+    torch.cuda.synchronize()
+
+    freeze_kernel_resolution("small live M should reuse the prefill dense kernel")
+    try:
+        for tokens, live_x in zip(live_token_counts, live_xs, strict=True):
+            actual = block_fp8_linear_mxfp8(live_x, packed)
+            torch.cuda.synchronize()
+            assert actual.shape == (tokens, out_features)
+    finally:
+        unfreeze_kernel_resolution()

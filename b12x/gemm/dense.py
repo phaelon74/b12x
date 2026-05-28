@@ -134,18 +134,18 @@ def _dense_gemm_policy_for(
 ) -> _DenseGemmPolicy:
     max_active_clusters = _max_active_clusters_for(cluster_shape_mn, sm_count)
     tile_m, tile_n = mma_tiler_mn
-    single_work_tile_per_cta = (
+    one_work_tile_per_cta = (
         ((m + tile_m - 1) // tile_m)
         * ((n + tile_n - 1) // tile_n)
         * l
         <= max_active_clusters
     )
     direct_one_m_tile_scheduler = (
-        single_work_tile_per_cta and m < 16 and m <= tile_m and l == 1
+        one_work_tile_per_cta and m < 16 and m <= tile_m and l == 1
     )
     use_m1_non_tma = ab_dtype == cutlass.Float8E4M3FN and m == 1
     return _DenseGemmPolicy(
-        single_work_tile_per_cta=single_work_tile_per_cta,
+        single_work_tile_per_cta=direct_one_m_tile_scheduler,
         direct_one_m_tile_scheduler=direct_one_m_tile_scheduler,
         use_m1_non_tma=use_m1_non_tma,
     )
@@ -1870,23 +1870,19 @@ def _select_default_mma_tiler_mn(
     is_mxfp8: bool,
 ) -> Tuple[int, int]:
     coarse_tile = (128, 128)
+    if is_mxfp8 and n > 1536:
+        # Keep the true single-token decode specialization, but do not let
+        # ordinary live prefill tails choose compile-time-only small-M tiles.
+        # vLLM warms attention with large prefill shapes and then passes the
+        # live token count at launch; prefix-cache continuations can otherwise
+        # hit first-use compiles for m=16/32/128 during serving.
+        if m == 1:
+            return (16, 128)
+        return coarse_tile
+
     coarse_tiles = ((m + coarse_tile[0] - 1) // coarse_tile[0]) * (
         (n + coarse_tile[1] - 1) // coarse_tile[1]
     )
-    if is_mxfp8 and n > 1536 and m == 2:
-        return (16, 64)
-    if is_mxfp8 and n > 1536 and m == 32:
-        return (16, 64)
-    if is_mxfp8 and n > 1536 and m == 16:
-        return (16, 128)
-    if is_mxfp8 and n > 1536 and m == 1:
-        return (16, 128)
-    if is_mxfp8 and n > 1536 and m == 128:
-        return (32, 128)
-    if is_mxfp8 and n > 1536 and 1 < m <= 64:
-        return (32, 64)
-    if is_mxfp8 and n > 1536 and m <= 128:
-        return (64, 64)
     # The coarse CTA-count heuristic misses exact-small-M, wide-N cases: a wide
     # N dimension can generate plenty of CTAs even while each 128-row M tile is
     # mostly empty. Keep using the narrower 64x128 tile while the 128x128 plan

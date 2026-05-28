@@ -152,7 +152,11 @@ def compressed_mla_decode_forward(
         if indexed_topk_lengths.device != q3.device:
             raise ValueError("indexed_topk_lengths must be on the same device as q_all")
         if indexed_page_table is not None:
-            indexed_page_table_2d = _normalize_index_matrix(indexed_page_table, name="indexed_page_table")
+            indexed_page_table_2d = _normalize_index_matrix(
+                indexed_page_table,
+                name="indexed_page_table",
+                allow_row_shared=True,
+            )
             if indexed_page_table_2d.device != q3.device:
                 raise ValueError("indexed_page_table must be on the same device as q_all")
             if indexed_page_table_2d.shape[0] != rows:
@@ -597,14 +601,23 @@ def _validate_compressed_launch_views(
         )
 
 
-def _normalize_index_matrix(indices: torch.Tensor, *, name: str) -> torch.Tensor:
+def _is_row_shared_index_matrix(indices: torch.Tensor) -> bool:
+    return indices.ndim == 2 and int(indices.stride(0)) == 0 and int(indices.stride(1)) == 1
+
+
+def _normalize_index_matrix(
+    indices: torch.Tensor,
+    *,
+    name: str,
+    allow_row_shared: bool = False,
+) -> torch.Tensor:
     if indices.ndim == 3 and indices.shape[1] == 1:
         indices = indices[:, 0]
     if indices.ndim != 2:
         raise ValueError(f"{name} must have shape [rows, width] or [rows, 1, width], got {tuple(indices.shape)}")
     if indices.dtype != torch.int32:
         raise TypeError(f"{name} must have dtype torch.int32, got {indices.dtype}")
-    if not indices.is_contiguous():
+    if not indices.is_contiguous() and not (allow_row_shared and _is_row_shared_index_matrix(indices)):
         raise ValueError(f"{name} must be contiguous for compressed MLA")
     return indices
 

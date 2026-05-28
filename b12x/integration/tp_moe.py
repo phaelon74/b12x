@@ -62,6 +62,7 @@ _RUNTIME_MEMREF_LIMIT = (1 << 31) - 1
 _LEVEL_TILE_M = 128
 _LEVEL_TILE_N = 128
 _DYNAMIC_SLICE_CHUNK = 1
+_W4A16_ROUTE_PACK_PREWARMED: set[tuple[object, ...]] = set()
 _MOE_FORCE_A16_ENV = "B12X_MOE_FORCE_A16"
 _FP4_SOURCE_FORMATS = {
     "modelopt_nvfp4": "modelopt_nvfp4",
@@ -935,16 +936,31 @@ def _arena_core_token_counts(
     max_tokens = max(int(max_tokens), 1)
     num_topk = max(int(num_topk), 1)
     quant_mode = _normalize_quant_mode(quant_mode)
+    if quant_mode == "w4a16":
+        from b12x.moe.fused.w4a16.host import route_pack_token_capacity
+
+        max_tokens = route_pack_token_capacity(max_tokens, num_topk)
     if core_token_counts is None:
         normalized = (max_tokens,)
     else:
         normalized = tuple(max(int(token_count), 1) for token_count in core_token_counts)
+        if quant_mode == "w4a16":
+            normalized = tuple(
+                route_pack_token_capacity(token_count, num_topk)
+                for token_count in normalized
+            )
         if max_tokens not in normalized:
             normalized = (max_tokens, *normalized)
+    normalized = tuple(dict.fromkeys(normalized))
     static_cutover_pairs = _get_static_compact_cutover_pairs(quant_mode)
     max_static_tokens = static_cutover_pairs // num_topk
     if max_static_tokens >= 1:
         static_boundary_tokens = min(max_tokens, max_static_tokens)
+        if quant_mode == "w4a16":
+            static_boundary_tokens = route_pack_token_capacity(
+                static_boundary_tokens,
+                num_topk,
+            )
         if static_boundary_tokens not in normalized:
             normalized = (*normalized, static_boundary_tokens)
     return normalized
@@ -2969,6 +2985,31 @@ def _prewarm_w4a16_planned_launches(
                         )
                 continue
 
+            route_pack_key = (
+                workspace.device.type,
+                int(torch.cuda.current_device()),
+                int(token_count) * int(workspace.num_topk),
+                int(block_size_m),
+                int(workspace.weight_E),
+                bool(False),
+            )
+            if route_pack_key in _W4A16_ROUTE_PACK_PREWARMED:
+                if _B12X_TIMING:
+                    total_ms = (t_sum - t_token) * 1000.0
+                    if total_ms >= _B12X_TIMING_THRESHOLD_MS:
+                        logger.warning(
+                            "b12x_w4a16_prewarm timing tokens=%d capturing=%s "
+                            "shape=%.3fms compile_fused=%.3fms "
+                            "compile_sum=%.3fms route_pack=cached total=%.3fms",
+                            int(token_count),
+                            is_capturing,
+                            (t_shape - t_token) * 1000.0,
+                            (t_fused - t_shape) * 1000.0,
+                            (t_sum - t_fused) * 1000.0,
+                            total_ms,
+                        )
+                continue
+
             dummy_topk_ids = torch.empty(
                 token_count,
                 workspace.num_topk,
@@ -2985,6 +3026,7 @@ def _prewarm_w4a16_planned_launches(
                 packed_route_count=workspace.packed_route_count,
                 expert_offsets=workspace.expert_offsets,
             )
+            _W4A16_ROUTE_PACK_PREWARMED.add(route_pack_key)
             if _B12X_TIMING:
                 t_route = time.perf_counter()
                 total_ms = (t_route - t_token) * 1000.0

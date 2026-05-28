@@ -22,7 +22,12 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.cute.runtime import from_dlpack
 
-from b12x.cute.compiler import KernelCompileSpec, launch as b12x_launch
+from b12x.cute.compiler import (
+    DimKey,
+    KernelCompileSpec,
+    TensorKey,
+    launch as b12x_launch,
+)
 from b12x.cute.fp4 import (
     atomic_add_shared_i32,
     ld_shared_i32,
@@ -154,11 +159,28 @@ def _convert_to_uint32(x: Float32) -> Uint32:
 def _to_kernel_tensor(tensor, dtype, *, assumed_align=16):
     cute_tensor = from_dlpack(tensor, assumed_align=assumed_align)
     cute_tensor.element_type = dtype
-    if tensor.ndim >= 2:
-        leading_dim = next((idx for idx, stride in enumerate(tensor.stride()) if stride == 1), None)
+    if tensor.ndim >= 1:
+        leading_dim = next(
+            (idx for idx, stride in enumerate(tensor.stride()) if stride == 1), None
+        )
         if leading_dim is not None:
             cute_tensor = cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
     return cute_tensor
+
+
+def _tensor_compile_key(name, tensor, *, dynamic_dims=()):
+    dynamic_dim_set = set(dynamic_dims)
+    dims = tuple(
+        DimKey.dynamic() if idx in dynamic_dim_set else DimKey.exact(int(dim))
+        for idx, dim in enumerate(tensor.shape)
+    )
+    return TensorKey.from_tensor(name, tensor, dims=dims)
+
+
+def _flat_tensor_compile_key(name, tensor, *, dynamic=False):
+    flat = tensor.reshape(-1)
+    dims = (DimKey.dynamic() if dynamic else DimKey.exact(int(flat.shape[0])),)
+    return TensorKey.from_tensor(name, flat, dims=dims)
 
 
 def _tensor_meta_key(tensor):
@@ -211,14 +233,39 @@ class SparseNSATiledTopkKernel:
     @cute.jit
     def __call__(
         self,
-        input_tensor, row_starts, lengths, values, indices,
-        batch_size, input_stride, num_k_tiles, tile_k_offset, block_q, block_k, topk_val,
-        input_index_offset, input_extent, output_index_offset, stream,
+        input_tensor,
+        row_starts,
+        lengths,
+        values,
+        indices,
+        batch_size,
+        input_stride,
+        num_k_tiles,
+        tile_k_offset,
+        block_q,
+        block_k,
+        topk_val,
+        input_index_offset,
+        input_extent,
+        output_index_offset,
+        stream,
     ):
         self.kernel(
-            input_tensor, row_starts, lengths, values, indices,
-            batch_size, input_stride, num_k_tiles, tile_k_offset, block_q, block_k, topk_val,
-            input_index_offset, input_extent, output_index_offset,
+            input_tensor,
+            row_starts,
+            lengths,
+            values,
+            indices,
+            batch_size,
+            input_stride,
+            num_k_tiles,
+            tile_k_offset,
+            block_q,
+            block_k,
+            topk_val,
+            input_index_offset,
+            input_extent,
+            output_index_offset,
         ).launch(
             grid=(batch_size, 1, 1),
             block=[_THREADS_PER_CTA, 1, 1],
@@ -289,22 +336,34 @@ class SparseNSATiledTopkKernel:
         class SharedStorage:
             hist0: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 384], 128]
             hist1: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 384], 128]
-            out_idx: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, topk_capacity], 128]
+            out_idx: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, topk_capacity], 128
+            ]
             counter: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 1], 128]
             thr_id: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 1], 128]
             ni0: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 1], 128]
             ni1: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 1], 128]
             last_rem: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 1], 128]
-            cand0: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, _SMEM_CANDS], 128]
-            cand1: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, _SMEM_CANDS], 128]
+            cand0: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, _SMEM_CANDS], 128
+            ]
+            cand1: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, _SMEM_CANDS], 128
+            ]
 
         storage = smem_alloc.allocate(SharedStorage)
 
         s_hist0 = storage.hist0.get_tensor(cute.make_layout((384,), stride=(1,)))
         s_hist1 = storage.hist1.get_tensor(cute.make_layout((384,), stride=(1,)))
-        s_out = storage.out_idx.get_tensor(cute.make_layout((topk_capacity,), stride=(1,)))
-        s_cand0 = storage.cand0.get_tensor(cute.make_layout((_SMEM_CANDS,), stride=(1,)))
-        s_cand1 = storage.cand1.get_tensor(cute.make_layout((_SMEM_CANDS,), stride=(1,)))
+        s_out = storage.out_idx.get_tensor(
+            cute.make_layout((topk_capacity,), stride=(1,))
+        )
+        s_cand0 = storage.cand0.get_tensor(
+            cute.make_layout((_SMEM_CANDS,), stride=(1,))
+        )
+        s_cand1 = storage.cand1.get_tensor(
+            cute.make_layout((_SMEM_CANDS,), stride=(1,))
+        )
 
         h0 = shared_ptr_to_u32(storage.hist0.data_ptr())
         h1 = shared_ptr_to_u32(storage.hist1.data_ptr())
@@ -332,7 +391,9 @@ class SparseNSATiledTopkKernel:
                     if is_valid
                     else Float32(float("-inf"))
                 )
-                indices[out_base + i] = row_start + i + output_index_offset if is_valid else Int32(-1)
+                indices[out_base + i] = (
+                    row_start + i + output_index_offset if is_valid else Int32(-1)
+                )
                 i = i + Int32(_THREADS_PER_CTA)
 
         if need_radix:
@@ -501,8 +562,16 @@ class SparseNSATiledTopkKernel:
                         r_idx_is_0 = (round_idx % 2) == 0
                         r_idx_next_is_0 = not r_idx_is_0
 
-                        raw_num_input = _smem_ld(ni0, Int32(0)) if cutlass.const_expr(r_idx_is_0) else _smem_ld(ni1, Int32(0))
-                        num_input = raw_num_input if raw_num_input < Int32(_SMEM_CANDS) else Int32(_SMEM_CANDS)
+                        raw_num_input = (
+                            _smem_ld(ni0, Int32(0))
+                            if cutlass.const_expr(r_idx_is_0)
+                            else _smem_ld(ni1, Int32(0))
+                        )
+                        num_input = (
+                            raw_num_input
+                            if raw_num_input < Int32(_SMEM_CANDS)
+                            else Int32(_SMEM_CANDS)
+                        )
 
                         # Prefix sum
                         for stage in cutlass.range_constexpr(8):
@@ -541,7 +610,11 @@ class SparseNSATiledTopkKernel:
                         if topk == Int32(0):
                             i = Int32(tx)
                             while i < num_input:
-                                c_idx = Int32(s_cand0[i]) if cutlass.const_expr(r_idx_is_0) else Int32(s_cand1[i])
+                                c_idx = (
+                                    Int32(s_cand0[i])
+                                    if cutlass.const_expr(r_idx_is_0)
+                                    else Int32(s_cand1[i])
+                                )
                                 offset = Int32(24 - round_idx * 8)
                                 raw_val = _load_topk_input_from_row_base(
                                     input_tensor,
@@ -569,7 +642,11 @@ class SparseNSATiledTopkKernel:
 
                             i = Int32(tx)
                             while i < num_input:
-                                c_idx = Int32(s_cand0[i]) if cutlass.const_expr(r_idx_is_0) else Int32(s_cand1[i])
+                                c_idx = (
+                                    Int32(s_cand0[i])
+                                    if cutlass.const_expr(r_idx_is_0)
+                                    else Int32(s_cand1[i])
+                                )
                                 raw_val = _load_topk_input_from_row_base(
                                     input_tensor,
                                     row_base,
@@ -588,18 +665,29 @@ class SparseNSATiledTopkKernel:
                                 else:
                                     if Int32(bin) == sub_threshold:
                                         if cutlass.const_expr(round_idx == 3):
-                                            old_rem = _smem_xadd(lr, Int32(0), Int32(-1))
+                                            old_rem = _smem_xadd(
+                                                lr, Int32(0), Int32(-1)
+                                            )
                                             if old_rem > Int32(0):
                                                 s_out[topk_static - old_rem] = c_idx
                                         else:
-                                            cand_pos = _smem_xadd(ni0, Int32(0), Int32(1)) if cutlass.const_expr(r_idx_next_is_0) else _smem_xadd(ni1, Int32(0), Int32(1))
+                                            cand_pos = (
+                                                _smem_xadd(ni0, Int32(0), Int32(1))
+                                                if cutlass.const_expr(r_idx_next_is_0)
+                                                else _smem_xadd(ni1, Int32(0), Int32(1))
+                                            )
                                             if cand_pos < Int32(_SMEM_CANDS):
                                                 if cutlass.const_expr(r_idx_next_is_0):
                                                     s_cand0[cand_pos] = c_idx
                                                 else:
                                                     s_cand1[cand_pos] = c_idx
-                                                sub_bin = (key32 >> Uint32(24 - (round_idx + 1) * 8)) & Uint32(0xFF)
-                                                _smem_red_add(h0, Int32(sub_bin), Int32(1))
+                                                sub_bin = (
+                                                    key32
+                                                    >> Uint32(24 - (round_idx + 1) * 8)
+                                                ) & Uint32(0xFF)
+                                                _smem_red_add(
+                                                    h0, Int32(sub_bin), Int32(1)
+                                                )
 
                                 i = i + Int32(_THREADS_PER_CTA)
 
@@ -633,7 +721,9 @@ class SparseNSATiledTopkKernel:
 
 
 @lru_cache(maxsize=32)
-def _build_tiled_topk_kernel(block_q: int, block_k: int, topk: int, zero_row_start: bool = False):
+def _build_tiled_topk_kernel(
+    block_q: int, block_k: int, topk: int, zero_row_start: bool = False
+):
     return SparseNSATiledTopkKernel(
         is_tiled=True,
         block_q=block_q,
@@ -694,7 +784,9 @@ def run_tiled_topk(
         raise ValueError("tile_logits must be contiguous")
     if k_start is None:
         if not zero_row_start:
-            raise ValueError("run_tiled_topk requires k_start unless zero_row_start is true")
+            raise ValueError(
+                "run_tiled_topk requires k_start unless zero_row_start is true"
+            )
         if lengths is None:
             raise ValueError("run_tiled_topk zero_row_start requires explicit lengths")
         k_start = lengths
@@ -714,7 +806,7 @@ def run_tiled_topk(
     if num_k_tiles is None:
         num_k_tiles = total_elements // (num_q_tiles * tile_size)
         if num_k_tiles == 0:
-            num_k_tiles = getattr(tile_logits, '_b12x_num_k_tiles', None)
+            num_k_tiles = getattr(tile_logits, "_b12x_num_k_tiles", None)
             if num_k_tiles is None:
                 raise ValueError("Cannot determine num_k_tiles")
     if int(num_k_tiles) <= 0:
@@ -722,7 +814,9 @@ def run_tiled_topk(
 
     if output_indices is None:
         topk_indices = torch.empty(
-            (num_q_rows, topk), dtype=torch.int32, device=tile_logits.device,
+            (num_q_rows, topk),
+            dtype=torch.int32,
+            device=tile_logits.device,
         )
     else:
         if output_indices.shape != (num_q_rows, topk):
@@ -734,7 +828,9 @@ def run_tiled_topk(
         topk_indices = output_indices
     if output_values is None:
         topk_values = torch.empty(
-            (num_q_rows, topk), dtype=torch.float32, device=tile_logits.device,
+            (num_q_rows, topk),
+            dtype=torch.float32,
+            device=tile_logits.device,
         )
     else:
         if output_values.shape != (num_q_rows, topk):
@@ -805,11 +901,11 @@ def run_tiled_topk(
         current_cuda_stream(),
     )
     cache_key = (
-        _flat_tensor_meta_key(input_key_tensor),
-        _tensor_meta_key(row_start_key_tensor),
-        _tensor_meta_key(lengths_key_tensor),
-        _flat_tensor_meta_key(values_key_tensor),
-        _flat_tensor_meta_key(indices_key_tensor),
+        _flat_tensor_compile_key("input", input_key_tensor, dynamic=True),
+        _tensor_compile_key("row_start", row_start_key_tensor, dynamic_dims=(0,)),
+        _tensor_compile_key("lengths", lengths_key_tensor, dynamic_dims=(0,)),
+        _flat_tensor_compile_key("topk_values", values_key_tensor, dynamic=True),
+        _flat_tensor_compile_key("topk_indices", indices_key_tensor, dynamic=True),
         (
             "tiled_topk_v18",
             topk,
@@ -820,7 +916,7 @@ def run_tiled_topk(
     )
     compile_spec = KernelCompileSpec.from_key(
         "attention.indexer.tiled_topk",
-        1,
+        2,
         cache_key,
         labels=(
             "input",
@@ -857,7 +953,9 @@ def run_row_topk(
     if not row_logits.is_contiguous():
         raise ValueError("row_logits must be contiguous")
     if row_logits.dtype != torch.float32:
-        raise ValueError(f"row_logits must have dtype torch.float32, got {row_logits.dtype}")
+        raise ValueError(
+            f"row_logits must have dtype torch.float32, got {row_logits.dtype}"
+        )
     if lengths.ndim != 1:
         raise ValueError(f"lengths must be rank-1, got {tuple(lengths.shape)}")
     if lengths.dtype != torch.int32:
@@ -873,7 +971,9 @@ def run_row_topk(
 
     if output_indices is None:
         topk_indices = torch.empty(
-            (num_q_rows, topk), dtype=torch.int32, device=row_logits.device,
+            (num_q_rows, topk),
+            dtype=torch.int32,
+            device=row_logits.device,
         )
     else:
         if output_indices.shape != (num_q_rows, topk):
@@ -885,7 +985,9 @@ def run_row_topk(
         topk_indices = output_indices
     if output_values is None:
         topk_values = torch.empty(
-            (num_q_rows, topk), dtype=torch.float32, device=row_logits.device,
+            (num_q_rows, topk),
+            dtype=torch.float32,
+            device=row_logits.device,
         )
     else:
         if output_values.shape != (num_q_rows, topk):
@@ -944,10 +1046,10 @@ def run_row_topk(
         current_cuda_stream(),
     )
     cache_key = (
-        _flat_tensor_meta_key(input_key_tensor),
-        _tensor_meta_key(lengths_key_tensor),
-        _flat_tensor_meta_key(values_key_tensor),
-        _flat_tensor_meta_key(indices_key_tensor),
+        _flat_tensor_compile_key("logits", input_key_tensor, dynamic=True),
+        _tensor_compile_key("lengths", lengths_key_tensor, dynamic_dims=(0,)),
+        _flat_tensor_compile_key("topk_values", values_key_tensor, dynamic=True),
+        _flat_tensor_compile_key("topk_indices", indices_key_tensor, dynamic=True),
         (
             "row_topk_v2",
             topk,
@@ -955,7 +1057,7 @@ def run_row_topk(
     )
     compile_spec = KernelCompileSpec.from_key(
         "attention.indexer.row_topk",
-        1,
+        2,
         cache_key,
         labels=(
             "logits",
@@ -983,7 +1085,9 @@ def _resolve_supertile_k(supertile_k: int | None, *, block_k: int) -> int:
             try:
                 supertile_k = int(raw)
             except ValueError as exc:
-                raise ValueError(f"{_SUPERTILE_K_ENV} must be an integer, got {raw!r}") from exc
+                raise ValueError(
+                    f"{_SUPERTILE_K_ENV} must be an integer, got {raw!r}"
+                ) from exc
     supertile_k = max(int(supertile_k), int(block_k))
     return ((supertile_k + block_k - 1) // block_k) * block_k
 
@@ -1004,13 +1108,21 @@ def merge_tiled_topk_candidates(
             f"{tuple(candidate_values.shape)} vs {tuple(candidate_indices.shape)}"
         )
     if candidate_values.ndim != 3:
-        raise ValueError(f"candidates must have shape (chunks, rows, topk), got {tuple(candidate_values.shape)}")
+        raise ValueError(
+            f"candidates must have shape (chunks, rows, topk), got {tuple(candidate_values.shape)}"
+        )
     num_chunks, num_q_rows, local_topk = candidate_values.shape
     if int(local_topk) != int(topk):
-        raise ValueError(f"candidate local topk {local_topk} does not match requested topk {topk}")
+        raise ValueError(
+            f"candidate local topk {local_topk} does not match requested topk {topk}"
+        )
     candidate_cols = int(num_chunks) * int(topk)
-    candidate_values_2d = candidate_values.permute(1, 0, 2).reshape(num_q_rows, candidate_cols)
-    candidate_indices_2d = candidate_indices.permute(1, 0, 2).reshape(num_q_rows, candidate_cols)
+    candidate_values_2d = candidate_values.permute(1, 0, 2).reshape(
+        num_q_rows, candidate_cols
+    )
+    candidate_indices_2d = candidate_indices.permute(1, 0, 2).reshape(
+        num_q_rows, candidate_cols
+    )
     if output_values is None:
         topk_values = torch.empty(
             (num_q_rows, topk),
@@ -1018,7 +1130,11 @@ def merge_tiled_topk_candidates(
             device=candidate_values.device,
         )
     else:
-        if output_values.ndim != 2 or output_values.shape[0] < num_q_rows or output_values.shape[1] < topk:
+        if (
+            output_values.ndim != 2
+            or output_values.shape[0] < num_q_rows
+            or output_values.shape[1] < topk
+        ):
             raise ValueError(
                 "output_values must have shape at least "
                 f"({num_q_rows}, {topk}), got {tuple(output_values.shape)}"
@@ -1069,7 +1185,11 @@ def merge_tiled_topk_candidates(
     if output_indices is None:
         topk_indices = torch.gather(candidate_indices_2d, 1, merge_pos).contiguous()
     else:
-        if output_indices.ndim != 2 or output_indices.shape[0] < num_q_rows or output_indices.shape[1] < topk:
+        if (
+            output_indices.ndim != 2
+            or output_indices.shape[0] < num_q_rows
+            or output_indices.shape[1] < topk
+        ):
             raise ValueError(
                 "output_indices must have shape at least "
                 f"({num_q_rows}, {topk}), got {tuple(output_indices.shape)}"
@@ -1124,8 +1244,12 @@ def run_tiled_supertile_topk(
             block_k=block_k,
         )
 
-    candidate_values = torch.empty((num_chunks, num_q_rows, topk), dtype=torch.float32, device=tile_logits.device)
-    candidate_indices = torch.empty((num_chunks, num_q_rows, topk), dtype=torch.int32, device=tile_logits.device)
+    candidate_values = torch.empty(
+        (num_chunks, num_q_rows, topk), dtype=torch.float32, device=tile_logits.device
+    )
+    candidate_indices = torch.empty(
+        (num_chunks, num_q_rows, topk), dtype=torch.int32, device=tile_logits.device
+    )
     global_lengths = (k_end - k_start).contiguous()
 
     for chunk_idx in range(num_chunks):

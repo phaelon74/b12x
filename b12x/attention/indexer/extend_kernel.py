@@ -18,7 +18,12 @@ from cutlass.cutlass_dsl import Int64, T, dsl_user_op
 
 from b12x.attention._cute import pipeline as cute_pipeline
 from b12x.attention._cute import ops as attention_ops
-from b12x.cute.compiler import KernelCompileSpec, launch as b12x_launch
+from b12x.cute.compiler import (
+    DimKey,
+    KernelCompileSpec,
+    TensorKey,
+    launch as b12x_launch,
+)
 from b12x.cute.fp4 import (
     frag_layout_swizzle_16b_to_8b,
     get_ptr_as_int64,
@@ -58,10 +63,12 @@ _PREFILL_THREADS_PER_CTA = _PREFILL_WARPS_PER_CTA * _WARP_THREADS  # 256
 _PREFILL_NUM_MMA_Q = 1  # same as decode
 _PREFILL_NUM_MMA_KV = 4  # each K-warp covers 64 K-rows (4x16)
 
-_PREFILL_Q_STAGE_ROWS = _PREFILL_BLOCK_Q   # 32 Q rows per tile
-_PREFILL_Q_STAGE_COLS = _INDEX_HEAD_DIM    # 128 bytes per Q row
-_PREFILL_WEIGHT_COLS = _MAX_Q_HEADS   # 64 heads per Q row
-_PREFILL_Q_HEADS_BATCH = 8  # Number of Q heads staged in smem at once (fits in 102KB SMEM).
+_PREFILL_Q_STAGE_ROWS = _PREFILL_BLOCK_Q  # 32 Q rows per tile
+_PREFILL_Q_STAGE_COLS = _INDEX_HEAD_DIM  # 128 bytes per Q row
+_PREFILL_WEIGHT_COLS = _MAX_Q_HEADS  # 64 heads per Q row
+_PREFILL_Q_HEADS_BATCH = (
+    8  # Number of Q heads staged in smem at once (fits in 102KB SMEM).
+)
 _PREFILL_Q_STAGE_BYTES = _PREFILL_Q_STAGE_ROWS * _PREFILL_Q_STAGE_COLS
 _PREFILL_WEIGHT_BYTES = _PREFILL_BLOCK_Q * _PREFILL_WEIGHT_COLS * 4  # 8KB
 
@@ -155,10 +162,37 @@ def _to_kernel_tensor(
 ) -> cutlass.cute.Tensor:
     cute_tensor = from_dlpack(tensor, assumed_align=assumed_align)
     cute_tensor.element_type = dtype
-    leading_dim = next((idx for idx, stride in enumerate(tensor.stride()) if stride == 1), None)
-    if leading_dim is not None and tensor.ndim >= 2:
+    leading_dim = next(
+        (idx for idx, stride in enumerate(tensor.stride()) if stride == 1), None
+    )
+    if leading_dim is not None and tensor.ndim >= 1:
         cute_tensor = cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
     return cute_tensor
+
+
+def _tensor_compile_key(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    dynamic_dims: tuple[int, ...] = (),
+) -> TensorKey:
+    dynamic_dim_set = set(dynamic_dims)
+    dims = tuple(
+        DimKey.dynamic() if idx in dynamic_dim_set else DimKey.exact(int(dim))
+        for idx, dim in enumerate(tensor.shape)
+    )
+    return TensorKey.from_tensor(name, tensor, dims=dims)
+
+
+def _flat_tensor_compile_key(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    dynamic: bool = False,
+) -> TensorKey:
+    flat = tensor.reshape(-1)
+    dims = (DimKey.dynamic() if dynamic else DimKey.exact(int(flat.shape[0])),)
+    return TensorKey.from_tensor(name, flat, dims=dims)
 
 
 def _tensor_meta_key(
@@ -220,7 +254,9 @@ def _encode_extend_k_tma_descriptor(
             f"k_quant_bytes must have shape (rows, {_INDEX_HEAD_DIM}), got {tuple(k_quant_bytes.shape)}"
         )
     if k_quant_bytes.dtype != torch.uint8:
-        raise TypeError(f"k_quant_bytes must have dtype torch.uint8, got {k_quant_bytes.dtype}")
+        raise TypeError(
+            f"k_quant_bytes must have dtype torch.uint8, got {k_quant_bytes.dtype}"
+        )
 
     # Phase 3: Always use SWIZZLE_128B — hardware XOR pattern matches _permuted_offset_128b
     U64 = cuda.cuuint64_t
@@ -250,7 +286,9 @@ def _encode_extend_k_tma_descriptor(
         dtype=torch.uint64,
         device=k_quant_bytes.device,
     )
-    desc_ptrs = torch.tensor([int(desc.data_ptr())], dtype=torch.int64, device=k_quant_bytes.device)
+    desc_ptrs = torch.tensor(
+        [int(desc.data_ptr())], dtype=torch.int64, device=k_quant_bytes.device
+    )
     return desc, desc_ptrs
 
 
@@ -288,7 +326,9 @@ def _encode_extend_k_tma_descriptor_prefill(
             f"k_quant_bytes must have shape (rows, {_INDEX_HEAD_DIM}), got {tuple(k_quant_bytes.shape)}"
         )
     if k_quant_bytes.dtype != torch.uint8:
-        raise TypeError(f"k_quant_bytes must be dtype torch.uint8, got {k_quant_bytes.dtype}")
+        raise TypeError(
+            f"k_quant_bytes must be dtype torch.uint8, got {k_quant_bytes.dtype}"
+        )
 
     U64 = cuda.cuuint64_t
     U32 = cuda.cuuint32_t
@@ -317,7 +357,9 @@ def _encode_extend_k_tma_descriptor_prefill(
         dtype=torch.uint64,
         device=k_quant_bytes.device,
     )
-    desc_ptrs = torch.tensor([int(desc.data_ptr())], dtype=torch.int64, device=k_quant_bytes.device)
+    desc_ptrs = torch.tensor(
+        [int(desc.data_ptr())], dtype=torch.int64, device=k_quant_bytes.device
+    )
     return desc, desc_ptrs
 
 
@@ -356,7 +398,9 @@ def _encode_extend_k_tma_descriptor_prefill512(
             f"k_quant_bytes must have shape (rows, {_INDEX_HEAD_DIM}), got {tuple(k_quant_bytes.shape)}"
         )
     if k_quant_bytes.dtype != torch.uint8:
-        raise TypeError(f"k_quant_bytes must be dtype torch.uint8, got {k_quant_bytes.dtype}")
+        raise TypeError(
+            f"k_quant_bytes must be dtype torch.uint8, got {k_quant_bytes.dtype}"
+        )
 
     U64 = cuda.cuuint64_t
     U32 = cuda.cuuint32_t
@@ -385,7 +429,9 @@ def _encode_extend_k_tma_descriptor_prefill512(
         dtype=torch.uint64,
         device=k_quant_bytes.device,
     )
-    desc_ptrs = torch.tensor([int(desc.data_ptr())], dtype=torch.int64, device=k_quant_bytes.device)
+    desc_ptrs = torch.tensor(
+        [int(desc.data_ptr())], dtype=torch.int64, device=k_quant_bytes.device
+    )
     return desc, desc_ptrs
 
 
@@ -471,6 +517,7 @@ def _zero_score_frag(score_frag: cute.Tensor) -> None:
     for reg_id in cutlass.range_constexpr(8):
         score_frag[0, 0, reg_id] = Float32(0.0)
 
+
 @cute.jit
 def _pack_q_mxfp8_reg_global(
     q_u32: cute.Tensor,
@@ -489,8 +536,16 @@ def _pack_q_mxfp8_reg_global(
     u32_idx_lo = col_pair_base // Int32(4)
     u32_idx_hi = u32_idx_lo + Int32(2)
     byte_shift = (col_pair_base % Int32(4)) * Int32(8)
-    lo = Uint32(q_u32[abs_row, head_idx, u32_idx_lo]) if abs_row < valid_q_rows else Uint32(0)
-    hi = Uint32(q_u32[abs_row, head_idx, u32_idx_hi]) if abs_row < valid_q_rows else Uint32(0)
+    lo = (
+        Uint32(q_u32[abs_row, head_idx, u32_idx_lo])
+        if abs_row < valid_q_rows
+        else Uint32(0)
+    )
+    hi = (
+        Uint32(q_u32[abs_row, head_idx, u32_idx_hi])
+        if abs_row < valid_q_rows
+        else Uint32(0)
+    )
     lo_half = (lo >> byte_shift) & Uint32(0xFFFF)
     hi_half = ((hi >> byte_shift) & Uint32(0xFFFF)) << Int32(16)
     return lo_half | hi_half
@@ -515,7 +570,10 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
 ):
     unit_scale = Uint32(0x7F7F7F7F)
     k_offset = _permuted_offset_128b(
-        row_base + warp_kv_idx * num_mma_kv * Int32(16) + Int32(8) * (lane // Int32(16)) + lane % Int32(8),
+        row_base
+        + warp_kv_idx * num_mma_kv * Int32(16)
+        + Int32(8) * (lane // Int32(16))
+        + lane % Int32(8),
         (lane % Int32(16)) // Int32(8),
         upcast_stride_k,
     )
@@ -540,7 +598,11 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
                 q_u32, head_idx, abs_row_0, col_base + Int32(16), valid_q_rows
             )
             q_regs[mma_q, 3] = _pack_q_mxfp8_reg_global(
-                q_u32, head_idx, abs_row_0 + Int32(8), col_base + Int32(16), valid_q_rows
+                q_u32,
+                head_idx,
+                abs_row_0 + Int32(8),
+                col_base + Int32(16),
+                valid_q_rows,
             )
 
         k_offset_cur = k_offset
@@ -555,7 +617,9 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
             b1_k0 = frag_layout_swizzle_16b_to_8b(b1_k0)
             b0_k1 = frag_layout_swizzle_16b_to_8b(b0_k1)
             b1_k1 = frag_layout_swizzle_16b_to_8b(b1_k1)
-            k_offset_cur = _advance_offset_by_row_128b(k_offset_cur, Int32(16), upcast_stride_k)
+            k_offset_cur = _advance_offset_by_row_128b(
+                k_offset_cur, Int32(16), upcast_stride_k
+            )
 
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
@@ -598,8 +662,6 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
         k_offset = _advance_offset_by_column_128b_2(k_offset_cur, mma_pair) - Int32(
             num_mma_kv * Int32(16) * upcast_stride_k
         )
-
-
 
 
 class SparseNSAExtendLogitsKernel:
@@ -720,7 +782,9 @@ class SparseNSAExtendLogitsKernel:
             cute.make_layout((_BLOCK_K * _INDEX_HEAD_DIM,), stride=(1,))
         )
         s_scales = storage.scales.get_tensor(cute.make_layout((_BLOCK_K,), stride=(1,)))
-        s_k_start = storage.k_start.get_tensor(cute.make_layout((_BLOCK_Q,), stride=(1,)))
+        s_k_start = storage.k_start.get_tensor(
+            cute.make_layout((_BLOCK_Q,), stride=(1,))
+        )
         s_k_end = storage.k_end.get_tensor(cute.make_layout((_BLOCK_Q,), stride=(1,)))
         s_tile_live = storage.tile_live.get_tensor(cute.make_layout((1,), stride=(1,)))
 
@@ -729,8 +793,12 @@ class SparseNSAExtendLogitsKernel:
         row_linear = tx
         while row_linear < Int32(_BLOCK_Q):
             q_row = q_tile_base + row_linear
-            s_k_start[row_linear] = Int32(k_start[q_row]) if q_row < valid_q_rows else Int32(0)
-            s_k_end[row_linear] = Int32(k_end[q_row]) if q_row < valid_q_rows else Int32(0)
+            s_k_start[row_linear] = (
+                Int32(k_start[q_row]) if q_row < valid_q_rows else Int32(0)
+            )
+            s_k_end[row_linear] = (
+                Int32(k_end[q_row]) if q_row < valid_q_rows else Int32(0)
+            )
             row_linear += Int32(_THREADS_PER_CTA)
         cute.arch.sync_threads()
 
@@ -743,7 +811,11 @@ class SparseNSAExtendLogitsKernel:
                 tile_k_end = k_total_rows
             row_start = Int32(s_k_start[tx])
             row_end = Int32(s_k_end[tx])
-            row_live = (row_end > k_tile_base) & (row_start < tile_k_end) & (k_tile_base < tile_k_end)
+            row_live = (
+                (row_end > k_tile_base)
+                & (row_start < tile_k_end)
+                & (k_tile_base < tile_k_end)
+            )
             ballot = cute.arch.vote_ballot_sync(Boolean(row_live))
             if tx == Int32(0):
                 s_tile_live[Int32(0)] = ballot
@@ -810,10 +882,10 @@ class SparseNSAExtendLogitsKernel:
                             acc_frag[0, 0, reg_id]
                             + attention_ops.fmax(score_frag[0, 0, reg_id], Float32(0.0))
                             * (
-                        Float32(weights[q_tile_base + q_local, head_idx])
-                        if q_tile_base + q_local < valid_q_rows
-                        else Float32(0.0)
-                    )
+                                Float32(weights[q_tile_base + q_local, head_idx])
+                                if q_tile_base + q_local < valid_q_rows
+                                else Float32(0.0)
+                            )
                         )
                 head_idx += Int32(1)
 
@@ -839,7 +911,9 @@ class SparseNSAExtendLogitsKernel:
                     row_start = Int32(s_k_start[q_local])
                     row_end = Int32(s_k_end[q_local])
                     if k_row >= row_start and k_row < row_end:
-                        logits_out[q_row, k_row] = Float32(acc_frag[0, 0, reg_id] * s_scales[k_local])
+                        logits_out[q_row, k_row] = Float32(
+                            acc_frag[0, 0, reg_id] * s_scales[k_local]
+                        )
                     elif write_invalid_logits != Int32(0):
                         logits_out[q_row, k_row] = Float32(-Float32.inf)
         else:
@@ -866,11 +940,9 @@ class SparseNSAExtendLogitsKernel:
                         logits_out[q_row, k_row] = Float32(-Float32.inf)
 
 
-
-
-
-
-def cp_async_128b_pred(smem_addr: Int32, gmem_addr: Int64, predicate: Int32, *, loc=None, ip=None):
+def cp_async_128b_pred(
+    smem_addr: Int32, gmem_addr: Int64, predicate: Int32, *, loc=None, ip=None
+):
     """Async 16B global→shared copy, predicated. Both addresses must be 16B-aligned."""
     llvm.inline_asm(
         None,
@@ -923,7 +995,16 @@ def ld_shared_f32(smem_addr: Int32, *, loc=None, ip=None) -> Float32:
     return Float32(result)
 
 
-def st_shared_v4_f32(smem_addr: Int32, v0: Float32, v1: Float32, v2: Float32, v3: Float32, *, loc=None, ip=None):
+def st_shared_v4_f32(
+    smem_addr: Int32,
+    v0: Float32,
+    v1: Float32,
+    v2: Float32,
+    v3: Float32,
+    *,
+    loc=None,
+    ip=None,
+):
     """Store 128 bits (4 x f32) to shared memory. smem_addr is a u32 shared-memory address."""
     llvm.inline_asm(
         None,
@@ -1028,7 +1109,10 @@ def _prefill_qk_mma_from_smem_q(
     """QK MMA using Q from smem (via raw pointer) instead of global memory."""
     unit_scale = Uint32(0x7F7F7F7F)
     k_offset = _permuted_offset_128b(
-        row_base + warp_kv_idx * num_mma_kv * Int32(16) + Int32(8) * (lane // Int32(16)) + lane % Int32(8),
+        row_base
+        + warp_kv_idx * num_mma_kv * Int32(16)
+        + Int32(8) * (lane // Int32(16))
+        + lane % Int32(8),
         (lane % Int32(16)) // Int32(8),
         upcast_stride_k,
     )
@@ -1044,10 +1128,18 @@ def _prefill_qk_mma_from_smem_q(
             row_base_q = warp_q_idx * Int32(16) + mma_q * Int32(16)
             row_local_0 = row_base_q + group_id
             row_local_8 = row_local_0 + Int32(8)
-            q_regs[mma_q, 0] = _pack_q_mxfp8_reg_smem_ptr(q_smem_base, row_local_0, col_base)
-            q_regs[mma_q, 1] = _pack_q_mxfp8_reg_smem_ptr(q_smem_base, row_local_8, col_base)
-            q_regs[mma_q, 2] = _pack_q_mxfp8_reg_smem_ptr(q_smem_base, row_local_0, col_base + Int32(16))
-            q_regs[mma_q, 3] = _pack_q_mxfp8_reg_smem_ptr(q_smem_base, row_local_8, col_base + Int32(16))
+            q_regs[mma_q, 0] = _pack_q_mxfp8_reg_smem_ptr(
+                q_smem_base, row_local_0, col_base
+            )
+            q_regs[mma_q, 1] = _pack_q_mxfp8_reg_smem_ptr(
+                q_smem_base, row_local_8, col_base
+            )
+            q_regs[mma_q, 2] = _pack_q_mxfp8_reg_smem_ptr(
+                q_smem_base, row_local_0, col_base + Int32(16)
+            )
+            q_regs[mma_q, 3] = _pack_q_mxfp8_reg_smem_ptr(
+                q_smem_base, row_local_8, col_base + Int32(16)
+            )
 
         k_offset_cur = k_offset
         for mma_kv in cutlass.range_constexpr(num_mma_kv):
@@ -1061,22 +1153,38 @@ def _prefill_qk_mma_from_smem_q(
             b1_k0 = frag_layout_swizzle_16b_to_8b(b1_k0)
             b0_k1 = frag_layout_swizzle_16b_to_8b(b0_k1)
             b1_k1 = frag_layout_swizzle_16b_to_8b(b1_k1)
-            k_offset_cur = _advance_offset_by_row_128b(k_offset_cur, Int32(16), upcast_stride_k)
+            k_offset_cur = _advance_offset_by_row_128b(
+                k_offset_cur, Int32(16), upcast_stride_k
+            )
 
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
-                    s_frag[mma_q, mma_kv, 0], s_frag[mma_q, mma_kv, 1],
-                    s_frag[mma_q, mma_kv, 2], s_frag[mma_q, mma_kv, 3],
-                    q_regs[mma_q, 0], q_regs[mma_q, 1],
-                    q_regs[mma_q, 2], q_regs[mma_q, 3],
-                    b0_k0, b0_k1, unit_scale, unit_scale,
+                    s_frag[mma_q, mma_kv, 0],
+                    s_frag[mma_q, mma_kv, 1],
+                    s_frag[mma_q, mma_kv, 2],
+                    s_frag[mma_q, mma_kv, 3],
+                    q_regs[mma_q, 0],
+                    q_regs[mma_q, 1],
+                    q_regs[mma_q, 2],
+                    q_regs[mma_q, 3],
+                    b0_k0,
+                    b0_k1,
+                    unit_scale,
+                    unit_scale,
                 )
                 d4, d5, d6, d7 = mxfp8_mma_m16n8k32_f32_e4m3(
-                    s_frag[mma_q, mma_kv, 4], s_frag[mma_q, mma_kv, 5],
-                    s_frag[mma_q, mma_kv, 6], s_frag[mma_q, mma_kv, 7],
-                    q_regs[mma_q, 0], q_regs[mma_q, 1],
-                    q_regs[mma_q, 2], q_regs[mma_q, 3],
-                    b1_k0, b1_k1, unit_scale, unit_scale,
+                    s_frag[mma_q, mma_kv, 4],
+                    s_frag[mma_q, mma_kv, 5],
+                    s_frag[mma_q, mma_kv, 6],
+                    s_frag[mma_q, mma_kv, 7],
+                    q_regs[mma_q, 0],
+                    q_regs[mma_q, 1],
+                    q_regs[mma_q, 2],
+                    q_regs[mma_q, 3],
+                    b1_k0,
+                    b1_k1,
+                    unit_scale,
+                    unit_scale,
                 )
                 s_frag[mma_q, mma_kv, 0] = d0
                 s_frag[mma_q, mma_kv, 1] = d1
@@ -1090,6 +1198,7 @@ def _prefill_qk_mma_from_smem_q(
         k_offset = _advance_offset_by_column_128b_2(k_offset_cur, mma_pair) - Int32(
             num_mma_kv * Int32(16) * upcast_stride_k
         )
+
 
 class SparseNSAExtendLogitsPrefillKernel:
     """Prefill-specialized extend logits kernel with _PREFILL_BLOCK_K=256.
@@ -1196,7 +1305,12 @@ class SparseNSAExtendLogitsPrefillKernel:
             ]
             q_bytes_smem: cute.struct.Align[
                 # Batch _PREFILL_Q_HEADS_BATCH Q heads in smem (no double-buffering needed).
-                cute.struct.MemRange[cutlass.Uint8, _PREFILL_Q_STAGE_ROWS * _PREFILL_Q_STAGE_COLS * _PREFILL_Q_HEADS_BATCH],
+                cute.struct.MemRange[
+                    cutlass.Uint8,
+                    _PREFILL_Q_STAGE_ROWS
+                    * _PREFILL_Q_STAGE_COLS
+                    * _PREFILL_Q_HEADS_BATCH,
+                ],
                 1024,
             ]
             w_smem: cute.struct.Align[
@@ -1222,9 +1336,15 @@ class SparseNSAExtendLogitsPrefillKernel:
         s_k_perm_bytes = storage.k_perm.get_tensor(
             cute.make_layout((_PREFILL_BLOCK_K * _INDEX_HEAD_DIM,), stride=(1,))
         )
-        s_scales = storage.scales.get_tensor(cute.make_layout((_PREFILL_BLOCK_K,), stride=(1,)))
-        s_k_start = storage.k_start.get_tensor(cute.make_layout((_PREFILL_BLOCK_Q,), stride=(1,)))
-        s_k_end = storage.k_end.get_tensor(cute.make_layout((_PREFILL_BLOCK_Q,), stride=(1,)))
+        s_scales = storage.scales.get_tensor(
+            cute.make_layout((_PREFILL_BLOCK_K,), stride=(1,))
+        )
+        s_k_start = storage.k_start.get_tensor(
+            cute.make_layout((_PREFILL_BLOCK_Q,), stride=(1,))
+        )
+        s_k_end = storage.k_end.get_tensor(
+            cute.make_layout((_PREFILL_BLOCK_Q,), stride=(1,))
+        )
         s_tile_live = storage.tile_live.get_tensor(cute.make_layout((1,), stride=(1,)))
 
         if tx == 0:
@@ -1232,8 +1352,12 @@ class SparseNSAExtendLogitsPrefillKernel:
         row_linear = tx
         while row_linear < Int32(_PREFILL_BLOCK_Q):
             q_row = q_tile_base + row_linear
-            s_k_start[row_linear] = Int32(k_start[q_row]) if q_row < valid_q_rows else Int32(0)
-            s_k_end[row_linear] = Int32(k_end[q_row]) if q_row < valid_q_rows else Int32(0)
+            s_k_start[row_linear] = (
+                Int32(k_start[q_row]) if q_row < valid_q_rows else Int32(0)
+            )
+            s_k_end[row_linear] = (
+                Int32(k_end[q_row]) if q_row < valid_q_rows else Int32(0)
+            )
             row_linear += Int32(_PREFILL_THREADS_PER_CTA)
         cute.arch.sync_threads()
 
@@ -1244,7 +1368,11 @@ class SparseNSAExtendLogitsPrefillKernel:
                 tile_k_end = k_total_rows
             row_start = Int32(s_k_start[tx])
             row_end = Int32(s_k_end[tx])
-            row_live = (row_end > k_tile_base) & (row_start < tile_k_end) & (k_tile_base < tile_k_end)
+            row_live = (
+                (row_end > k_tile_base)
+                & (row_start < tile_k_end)
+                & (k_tile_base < tile_k_end)
+            )
             ballot = cute.arch.vote_ballot_sync(Boolean(row_live))
             if tx == Int32(0):
                 s_tile_live[Int32(0)] = ballot
@@ -1254,7 +1382,9 @@ class SparseNSAExtendLogitsPrefillKernel:
             # q_bytes_smem now batches _PREFILL_Q_HEADS_BATCH Q heads (32KB for 8),
             # w_smem sits after all Q buffers.
             q_smem_base = k_perm_base_addr + Int32(_PREFILL_BLOCK_K * _INDEX_HEAD_DIM)
-            w_smem_base = q_smem_base + Int32(_PREFILL_Q_STAGE_BYTES * _PREFILL_Q_HEADS_BATCH)
+            w_smem_base = q_smem_base + Int32(
+                _PREFILL_Q_STAGE_BYTES * _PREFILL_Q_HEADS_BATCH
+            )
             # TMA load K-tile (256 rows x 128 bytes = 32 KB)
             producer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
             consumer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
@@ -1283,13 +1413,32 @@ class SparseNSAExtendLogitsPrefillKernel:
                 w_q_local = w_linear // num_heads
                 w_head = w_linear % num_heads
                 w_q_row = q_tile_base + w_q_local
-                w0 = Float32(weights[w_q_row, w_head]) if (w_q_row < valid_q_rows and w_head < num_heads) else Float32(0.0)
-                w1 = Float32(weights[w_q_row, w_head + Int32(1)]) if (w_q_row < valid_q_rows and w_head + Int32(1) < num_heads) else Float32(0.0)
-                w2 = Float32(weights[w_q_row, w_head + Int32(2)]) if (w_q_row < valid_q_rows and w_head + Int32(2) < num_heads) else Float32(0.0)
-                w3 = Float32(weights[w_q_row, w_head + Int32(3)]) if (w_q_row < valid_q_rows and w_head + Int32(3) < num_heads) else Float32(0.0)
+                w0 = (
+                    Float32(weights[w_q_row, w_head])
+                    if (w_q_row < valid_q_rows and w_head < num_heads)
+                    else Float32(0.0)
+                )
+                w1 = (
+                    Float32(weights[w_q_row, w_head + Int32(1)])
+                    if (w_q_row < valid_q_rows and w_head + Int32(1) < num_heads)
+                    else Float32(0.0)
+                )
+                w2 = (
+                    Float32(weights[w_q_row, w_head + Int32(2)])
+                    if (w_q_row < valid_q_rows and w_head + Int32(2) < num_heads)
+                    else Float32(0.0)
+                )
+                w3 = (
+                    Float32(weights[w_q_row, w_head + Int32(3)])
+                    if (w_q_row < valid_q_rows and w_head + Int32(3) < num_heads)
+                    else Float32(0.0)
+                )
                 st_shared_v4_f32(
                     w_smem_base + w_linear * Int32(4),
-                    w0, w1, w2, w3,
+                    w0,
+                    w1,
+                    w2,
+                    w3,
                 )
                 w_linear += Int32(_PREFILL_THREADS_PER_CTA * 4)
             cute.arch.sync_threads()
@@ -1324,11 +1473,19 @@ class SparseNSAExtendLogitsPrefillKernel:
             col_group = tx % threads_per_row
             u32_col_base = col_group * Int32(4)
             q_row = q_tile_base + row_local
-            in_bounds_pred = Int32(1) if (row_local < Int32(_PREFILL_Q_STAGE_ROWS) and q_row < valid_q_rows) else Int32(0)
+            in_bounds_pred = (
+                Int32(1)
+                if (row_local < Int32(_PREFILL_Q_STAGE_ROWS) and q_row < valid_q_rows)
+                else Int32(0)
+            )
             q_smem_stride = Int32(_PREFILL_Q_STAGE_BYTES)
             q_rs = Int32(_PREFILL_Q_STAGE_COLS // 16)
-            thread_offset = _permuted_offset_128b(row_local, col_group, q_rs) * Int32(16)
-            q_row_for_async = q_row if row_local < Int32(_PREFILL_Q_STAGE_ROWS) else Int32(0)
+            thread_offset = _permuted_offset_128b(row_local, col_group, q_rs) * Int32(
+                16
+            )
+            q_row_for_async = (
+                q_row if row_local < Int32(_PREFILL_Q_STAGE_ROWS) else Int32(0)
+            )
 
             batch_base_head = Int32(0)
             while batch_base_head < num_heads:
@@ -1353,7 +1510,9 @@ class SparseNSAExtendLogitsPrefillKernel:
                 for block_offset in cutlass.range_constexpr(_PREFILL_Q_HEADS_BATCH):
                     head_idx = batch_base_head + Int32(block_offset)
                     if head_idx < num_heads:
-                        curr_mma_base = q_smem_base + Int32(block_offset) * q_smem_stride
+                        curr_mma_base = (
+                            q_smem_base + Int32(block_offset) * q_smem_stride
+                        )
 
                         score_frag = cute.make_rmem_tensor(acc_layout, Float32)
                         for mma_kv in cutlass.range_constexpr(_PREFILL_NUM_MMA_KV):
@@ -1374,12 +1533,20 @@ class SparseNSAExtendLogitsPrefillKernel:
                         )
                         # Accumulate per K-sub-tile (q_local always in [0,31], no bounds check needed)
                         lane_group = lane // Int32(4)
-                        w_rs0 = ld_shared_f32(w_smem_base + w_off_rs0 + head_idx * Int32(4))
-                        w_rs1 = ld_shared_f32(w_smem_base + w_off_rs1 + head_idx * Int32(4))
+                        w_rs0 = ld_shared_f32(
+                            w_smem_base + w_off_rs0 + head_idx * Int32(4)
+                        )
+                        w_rs1 = ld_shared_f32(
+                            w_smem_base + w_off_rs1 + head_idx * Int32(4)
+                        )
                         for mma_kv in cutlass.range_constexpr(_PREFILL_NUM_MMA_KV):
                             for reg_id in cutlass.range_constexpr(8):
                                 row_slot = (reg_id % 4) // 2
-                                q_local = warp_q_idx * Int32(16) + lane_group + Int32(8 * row_slot)
+                                q_local = (
+                                    warp_q_idx * Int32(16)
+                                    + lane_group
+                                    + Int32(8 * row_slot)
+                                )
                                 w_val = w_rs0 if row_slot == Int32(0) else w_rs1
                                 acc_frag[Int32(0), mma_kv, reg_id] = Float32(
                                     acc_frag[Int32(0), mma_kv, reg_id]
@@ -1400,7 +1567,9 @@ class SparseNSAExtendLogitsPrefillKernel:
                 for mma_kv in cutlass.range_constexpr(_PREFILL_NUM_MMA_KV):
                     for reg_id in cutlass.range_constexpr(8):
                         row_slot = (reg_id % 4) // 2
-                        q_local = warp_q_idx * Int32(16) + lane_group + Int32(8 * row_slot)
+                        q_local = (
+                            warp_q_idx * Int32(16) + lane_group + Int32(8 * row_slot)
+                        )
                         k_local = (
                             warp_k_idx * Int32(_PREFILL_NUM_MMA_KV * 16)
                             + mma_kv * Int32(16)
@@ -1413,9 +1582,17 @@ class SparseNSAExtendLogitsPrefillKernel:
                             and k_local < Int32(_PREFILL_BLOCK_K)
                             and q_tile_base + q_local < valid_q_rows
                         ):
-                            _tile_id = q_tile_idx * Int32(output_num_k_tiles) + local_k_tile_idx
-                            _offset_in_tile = q_local * Int32(_PREFILL_BLOCK_K) + k_local
-                            _flat_offset = _tile_id * Int32(_PREFILL_BLOCK_Q * _PREFILL_BLOCK_K) + _offset_in_tile
+                            _tile_id = (
+                                q_tile_idx * Int32(output_num_k_tiles)
+                                + local_k_tile_idx
+                            )
+                            _offset_in_tile = (
+                                q_local * Int32(_PREFILL_BLOCK_K) + k_local
+                            )
+                            _flat_offset = (
+                                _tile_id * Int32(_PREFILL_BLOCK_Q * _PREFILL_BLOCK_K)
+                                + _offset_in_tile
+                            )
                             tile_logits[_flat_offset] = Float32(
                                 acc_frag[Int32(0), mma_kv, reg_id] * s_scales[k_local]
                             )
@@ -1423,7 +1600,9 @@ class SparseNSAExtendLogitsPrefillKernel:
                 for mma_kv in cutlass.range_constexpr(_PREFILL_NUM_MMA_KV):
                     for reg_id in cutlass.range_constexpr(8):
                         row_slot = (reg_id % 4) // 2
-                        q_local = warp_q_idx * Int32(16) + lane_group + Int32(8 * row_slot)
+                        q_local = (
+                            warp_q_idx * Int32(16) + lane_group + Int32(8 * row_slot)
+                        )
                         k_local = (
                             warp_k_idx * Int32(_PREFILL_NUM_MMA_KV * 16)
                             + mma_kv * Int32(16)
@@ -1443,7 +1622,8 @@ class SparseNSAExtendLogitsPrefillKernel:
                             row_end = Int32(s_k_end[q_local])
                             if k_row >= row_start and k_row < row_end:
                                 logits_out[q_row, k_row] = Float32(
-                                    acc_frag[Int32(0), mma_kv, reg_id] * s_scales[k_local]
+                                    acc_frag[Int32(0), mma_kv, reg_id]
+                                    * s_scales[k_local]
                                 )
                             elif write_invalid_logits != Int32(0):
                                 logits_out[q_row, k_row] = Float32(-Float32.inf)
@@ -1456,7 +1636,9 @@ class SparseNSAExtendLogitsPrefillKernel:
                 for mma_kv in cutlass.range_constexpr(_PREFILL_NUM_MMA_KV):
                     for reg_id in cutlass.range_constexpr(8):
                         row_slot = (reg_id % 4) // 2
-                        q_local = warp_q_idx * Int32(16) + lane_group + Int32(8 * row_slot)
+                        q_local = (
+                            warp_q_idx * Int32(16) + lane_group + Int32(8 * row_slot)
+                        )
                         k_local = (
                             warp_k_idx * Int32(_PREFILL_NUM_MMA_KV * 16)
                             + mma_kv * Int32(16)
@@ -1581,9 +1763,15 @@ class SparseNSAExtendLogitsPrefill512Kernel:
         s_k_perm_bytes = storage.k_perm.get_tensor(
             cute.make_layout((_PREFILL512_BLOCK_K * _INDEX_HEAD_DIM,), stride=(1,))
         )
-        s_scales = storage.scales.get_tensor(cute.make_layout((_PREFILL512_BLOCK_K,), stride=(1,)))
-        s_k_start = storage.k_start.get_tensor(cute.make_layout((_PREFILL512_BLOCK_Q,), stride=(1,)))
-        s_k_end = storage.k_end.get_tensor(cute.make_layout((_PREFILL512_BLOCK_Q,), stride=(1,)))
+        s_scales = storage.scales.get_tensor(
+            cute.make_layout((_PREFILL512_BLOCK_K,), stride=(1,))
+        )
+        s_k_start = storage.k_start.get_tensor(
+            cute.make_layout((_PREFILL512_BLOCK_Q,), stride=(1,))
+        )
+        s_k_end = storage.k_end.get_tensor(
+            cute.make_layout((_PREFILL512_BLOCK_Q,), stride=(1,))
+        )
         s_tile_live = storage.tile_live.get_tensor(cute.make_layout((1,), stride=(1,)))
         s_tile_full = storage.tile_full.get_tensor(cute.make_layout((1,), stride=(1,)))
 
@@ -1592,8 +1780,12 @@ class SparseNSAExtendLogitsPrefill512Kernel:
         row_linear = tx
         while row_linear < Int32(_PREFILL512_BLOCK_Q):
             q_row = q_tile_base + row_linear
-            s_k_start[row_linear] = Int32(k_start[q_row]) if q_row < valid_q_rows else Int32(0)
-            s_k_end[row_linear] = Int32(k_end[q_row]) if q_row < valid_q_rows else Int32(0)
+            s_k_start[row_linear] = (
+                Int32(k_start[q_row]) if q_row < valid_q_rows else Int32(0)
+            )
+            s_k_end[row_linear] = (
+                Int32(k_end[q_row]) if q_row < valid_q_rows else Int32(0)
+            )
             row_linear += Int32(_PREFILL512_THREADS_PER_CTA)
         cute.arch.sync_threads()
 
@@ -1604,7 +1796,11 @@ class SparseNSAExtendLogitsPrefill512Kernel:
             row_start = Int32(s_k_start[tx])
             row_end = Int32(s_k_end[tx])
             physical_tile_full = tile_k_end == k_tile_base + Int32(_PREFILL512_BLOCK_K)
-            row_live = (row_end > k_tile_base) & (row_start < tile_k_end) & (k_tile_base < tile_k_end)
+            row_live = (
+                (row_end > k_tile_base)
+                & (row_start < tile_k_end)
+                & (k_tile_base < tile_k_end)
+            )
             row_full = (
                 (q_tile_base + tx < valid_q_rows)
                 & physical_tile_full
@@ -1615,11 +1811,15 @@ class SparseNSAExtendLogitsPrefill512Kernel:
             full_ballot = cute.arch.vote_ballot_sync(Boolean(row_full))
             if tx == Int32(0):
                 s_tile_live[Int32(0)] = ballot
-                s_tile_full[Int32(0)] = Int32(1) if full_ballot == Int32(-1) else Int32(0)
+                s_tile_full[Int32(0)] = (
+                    Int32(1) if full_ballot == Int32(-1) else Int32(0)
+                )
         cute.arch.sync_threads()
 
         if s_tile_live[Int32(0)] != Int32(0):
-            q_smem_base = k_perm_base_addr + Int32(_PREFILL512_BLOCK_K * _INDEX_HEAD_DIM)
+            q_smem_base = k_perm_base_addr + Int32(
+                _PREFILL512_BLOCK_K * _INDEX_HEAD_DIM
+            )
             producer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
             consumer_state = cute_pipeline.PipelineStateSimple(1, Int32(0))
             if warp_idx == Int32(0):
@@ -1637,7 +1837,8 @@ class SparseNSAExtendLogitsPrefill512Kernel:
                         shared_ptr_to_u32(full_mbar_ptr),
                     )
                     _cp_async_bulk_tensor_2d(
-                        shared_ptr_to_u32(s_k_perm_bytes.iterator) + Int32(_PREFILL_BLOCK_K * _INDEX_HEAD_DIM),
+                        shared_ptr_to_u32(s_k_perm_bytes.iterator)
+                        + Int32(_PREFILL_BLOCK_K * _INDEX_HEAD_DIM),
                         Int64(k_tma_desc_ptrs[Int32(0)]),
                         Int32(0),
                         k_tile_base + Int32(_PREFILL_BLOCK_K),
@@ -1666,11 +1867,19 @@ class SparseNSAExtendLogitsPrefill512Kernel:
             col_group = tx % threads_per_row
             u32_col_base = col_group * Int32(4)
             q_row = q_tile_base + row_local
-            in_bounds_pred = Int32(1) if (row_local < Int32(_PREFILL_Q_STAGE_ROWS) and q_row < valid_q_rows) else Int32(0)
+            in_bounds_pred = (
+                Int32(1)
+                if (row_local < Int32(_PREFILL_Q_STAGE_ROWS) and q_row < valid_q_rows)
+                else Int32(0)
+            )
             q_smem_stride = Int32(_PREFILL_Q_STAGE_BYTES)
             q_rs = Int32(_PREFILL_Q_STAGE_COLS // 16)
-            thread_offset = _permuted_offset_128b(row_local, col_group, q_rs) * Int32(16)
-            q_row_for_async = q_row if row_local < Int32(_PREFILL_Q_STAGE_ROWS) else Int32(0)
+            thread_offset = _permuted_offset_128b(row_local, col_group, q_rs) * Int32(
+                16
+            )
+            q_row_for_async = (
+                q_row if row_local < Int32(_PREFILL_Q_STAGE_ROWS) else Int32(0)
+            )
 
             batch_base_head = Int32(0)
             for block_offset in cutlass.range_constexpr(Q_HEADS_BATCH):
@@ -1706,7 +1915,9 @@ class SparseNSAExtendLogitsPrefill512Kernel:
                 for block_offset in cutlass.range_constexpr(Q_HEADS_BATCH):
                     head_idx = batch_base_head + Int32(block_offset)
                     if head_idx < num_heads:
-                        curr_mma_base = q_smem_base + Int32(block_offset) * q_smem_stride
+                        curr_mma_base = (
+                            q_smem_base + Int32(block_offset) * q_smem_stride
+                        )
 
                         score_frag = cute.make_rmem_tensor(acc_layout, Float32)
                         for mma_kv in cutlass.range_constexpr(_PREFILL512_NUM_MMA_KV):
@@ -1728,8 +1939,16 @@ class SparseNSAExtendLogitsPrefill512Kernel:
                         lane_group = lane // Int32(4)
                         q_row_rs0 = q_tile_base + q_local_rs0
                         q_row_rs1 = q_tile_base + q_local_rs1
-                        w_rs0 = Float32(weights[q_row_rs0, head_idx]) if q_row_rs0 < valid_q_rows else Float32(0.0)
-                        w_rs1 = Float32(weights[q_row_rs1, head_idx]) if q_row_rs1 < valid_q_rows else Float32(0.0)
+                        w_rs0 = (
+                            Float32(weights[q_row_rs0, head_idx])
+                            if q_row_rs0 < valid_q_rows
+                            else Float32(0.0)
+                        )
+                        w_rs1 = (
+                            Float32(weights[q_row_rs1, head_idx])
+                            if q_row_rs1 < valid_q_rows
+                            else Float32(0.0)
+                        )
                         for mma_kv in cutlass.range_constexpr(_PREFILL512_NUM_MMA_KV):
                             for reg_id in cutlass.range_constexpr(8):
                                 row_slot = (reg_id % 4) // 2
@@ -1755,7 +1974,9 @@ class SparseNSAExtendLogitsPrefill512Kernel:
                                 q_row_for_async * num_heads + global_head
                             ) * Int32(_INDEX_HEAD_DIM // 4) + u32_col_base
                             cp_async_128b_pred(
-                                q_smem_base + head_in_batch * q_smem_stride + thread_offset,
+                                q_smem_base
+                                + head_in_batch * q_smem_stride
+                                + thread_offset,
                                 get_ptr_as_int64(q_u32, gmem_u32_offset),
                                 in_bounds_pred,
                             )
@@ -1767,7 +1988,9 @@ class SparseNSAExtendLogitsPrefill512Kernel:
                 for mma_kv in cutlass.range_constexpr(_PREFILL512_NUM_MMA_KV):
                     for reg_id in cutlass.range_constexpr(8):
                         row_slot = (reg_id % 4) // 2
-                        q_local = warp_q_idx * Int32(16) + lane_group + Int32(8 * row_slot)
+                        q_local = (
+                            warp_q_idx * Int32(16) + lane_group + Int32(8 * row_slot)
+                        )
                         k_local = (
                             warp_k_idx * Int32(_PREFILL512_NUM_MMA_KV * 16)
                             + mma_kv * Int32(16)
@@ -1780,9 +2003,18 @@ class SparseNSAExtendLogitsPrefill512Kernel:
                             and k_local < Int32(_PREFILL512_BLOCK_K)
                             and q_tile_base + q_local < valid_q_rows
                         ):
-                            _tile_id = q_tile_idx * Int32(output_num_k_tiles) + local_k_tile_idx
-                            _offset_in_tile = q_local * Int32(_PREFILL512_BLOCK_K) + k_local
-                            _flat_offset = _tile_id * Int32(_PREFILL512_BLOCK_Q * _PREFILL512_BLOCK_K) + _offset_in_tile
+                            _tile_id = (
+                                q_tile_idx * Int32(output_num_k_tiles)
+                                + local_k_tile_idx
+                            )
+                            _offset_in_tile = (
+                                q_local * Int32(_PREFILL512_BLOCK_K) + k_local
+                            )
+                            _flat_offset = (
+                                _tile_id
+                                * Int32(_PREFILL512_BLOCK_Q * _PREFILL512_BLOCK_K)
+                                + _offset_in_tile
+                            )
                             tile_logits[_flat_offset] = Float32(
                                 acc_frag[Int32(0), mma_kv, reg_id] * s_scales[k_local]
                             )
@@ -1827,7 +2059,11 @@ class SparseNSAExtendLogitsPrefill512Kernel:
                     for mma_kv in cutlass.range_constexpr(_PREFILL512_NUM_MMA_KV):
                         for reg_id in cutlass.range_constexpr(8):
                             row_slot = (reg_id % 4) // 2
-                            q_local = warp_q_idx * Int32(16) + lane_group + Int32(8 * row_slot)
+                            q_local = (
+                                warp_q_idx * Int32(16)
+                                + lane_group
+                                + Int32(8 * row_slot)
+                            )
                             k_local = (
                                 warp_k_idx * Int32(_PREFILL512_NUM_MMA_KV * 16)
                                 + mma_kv * Int32(16)
@@ -1847,7 +2083,8 @@ class SparseNSAExtendLogitsPrefill512Kernel:
                                 row_end = Int32(s_k_end[q_local])
                                 if k_row >= row_start and k_row < row_end:
                                     logits_out[q_row, k_row] = Float32(
-                                        acc_frag[Int32(0), mma_kv, reg_id] * s_scales[k_local]
+                                        acc_frag[Int32(0), mma_kv, reg_id]
+                                        * s_scales[k_local]
                                     )
                                 elif write_invalid_logits != Int32(0):
                                     logits_out[q_row, k_row] = Float32(-Float32.inf)
@@ -1867,10 +2104,16 @@ class SparseNSAExtendLogitsPrefill512Kernel:
                             (_PREFILL512_BLOCK_Q * _PREFILL512_BLOCK_K)
                             // (_PREFILL512_THREADS_PER_CTA * 4)
                         ):
-                            fill_linear = tx * Int32(4) + Int32(fill_iter * _PREFILL512_THREADS_PER_CTA * 4)
+                            fill_linear = tx * Int32(4) + Int32(
+                                fill_iter * _PREFILL512_THREADS_PER_CTA * 4
+                            )
                             q_local = fill_linear // Int32(_PREFILL512_BLOCK_K)
                             k_local = fill_linear - q_local * Int32(_PREFILL512_BLOCK_K)
-                            out_base = (q_tile_base + q_local) * k_total_rows + k_tile_base + k_local
+                            out_base = (
+                                (q_tile_base + q_local) * k_total_rows
+                                + k_tile_base
+                                + k_local
+                            )
                             st_global_v4_f32(
                                 get_ptr_as_int64(logits_out, out_base),
                                 neg_inf,
@@ -1882,7 +2125,11 @@ class SparseNSAExtendLogitsPrefill512Kernel:
                         for mma_kv in cutlass.range_constexpr(_PREFILL512_NUM_MMA_KV):
                             for reg_id in cutlass.range_constexpr(8):
                                 row_slot = (reg_id % 4) // 2
-                                q_local = warp_q_idx * Int32(16) + lane_group + Int32(8 * row_slot)
+                                q_local = (
+                                    warp_q_idx * Int32(16)
+                                    + lane_group
+                                    + Int32(8 * row_slot)
+                                )
                                 k_local = (
                                     warp_k_idx * Int32(_PREFILL512_NUM_MMA_KV * 16)
                                     + mma_kv * Int32(16)
@@ -1902,8 +2149,11 @@ class SparseNSAExtendLogitsPrefill512Kernel:
 
 
 @lru_cache(maxsize=16)
-def _build_sparse_nsa_extend_prefill_kernel(*, tiled_output: bool = False) -> SparseNSAExtendLogitsPrefillKernel:
+def _build_sparse_nsa_extend_prefill_kernel(
+    *, tiled_output: bool = False
+) -> SparseNSAExtendLogitsPrefillKernel:
     return SparseNSAExtendLogitsPrefillKernel(tiled_output=tiled_output)
+
 
 @lru_cache(maxsize=16)
 def _build_sparse_nsa_extend_prefill512_kernel(
@@ -1918,8 +2168,11 @@ def _build_sparse_nsa_extend_prefill512_kernel(
         )
     return SparseNSAExtendLogitsPrefill512Kernel(tiled_output=tiled_output)
 
+
 @lru_cache(maxsize=16)
-def _build_sparse_nsa_extend_kernel(*, tiled_output: bool = False) -> SparseNSAExtendLogitsKernel:
+def _build_sparse_nsa_extend_kernel(
+    *, tiled_output: bool = False
+) -> SparseNSAExtendLogitsKernel:
     return SparseNSAExtendLogitsKernel(tiled_output=tiled_output)
 
 
@@ -1942,9 +2195,9 @@ def _prefill512_unsupported_reasons(
     if k_rows < _PREFILL512_MIN_K_ROWS:
         reasons.append(f"k_rows={k_rows} < {_PREFILL512_MIN_K_ROWS}")
     if num_heads not in _PREFILL512_SUPPORTED_NUM_HEADS:
-        reasons.append(f"num_heads={num_heads} not in {_PREFILL512_SUPPORTED_NUM_HEADS}")
-    if k_rows % _PREFILL512_BLOCK_K != 0:
-        reasons.append(f"k_rows={k_rows} is not divisible by {_PREFILL512_BLOCK_K}")
+        reasons.append(
+            f"num_heads={num_heads} not in {_PREFILL512_SUPPORTED_NUM_HEADS}"
+        )
     return reasons
 
 
@@ -1968,7 +2221,9 @@ def resolve_extend_prefill_block_k(
     if not _use_sparse_nsa_extend_prefill(valid_q_rows):
         return None
 
-    block_k_env = os.environ.get(_NSA_EXTEND_PREFILL_BLOCK_K_ENV, "auto").strip().lower()
+    block_k_env = (
+        os.environ.get(_NSA_EXTEND_PREFILL_BLOCK_K_ENV, "auto").strip().lower()
+    )
     if block_k_env in ("", "auto"):
         return (
             _PREFILL512_BLOCK_K
@@ -2096,13 +2351,23 @@ def run_extend_logits_kernel(
         tile_num_k_tiles = binding.tile_num_k_tiles
 
     q_fp8 = _require_bound_arg(q_fp8, api_name="run_extend_logits_kernel", name="q_fp8")
-    weights = _require_bound_arg(weights, api_name="run_extend_logits_kernel", name="weights")
-    k_quant = _require_bound_arg(k_quant, api_name="run_extend_logits_kernel", name="k_quant")
-    k_scale = _require_bound_arg(k_scale, api_name="run_extend_logits_kernel", name="k_scale")
-    k_start = _require_bound_arg(k_start, api_name="run_extend_logits_kernel", name="k_start")
+    weights = _require_bound_arg(
+        weights, api_name="run_extend_logits_kernel", name="weights"
+    )
+    k_quant = _require_bound_arg(
+        k_quant, api_name="run_extend_logits_kernel", name="k_quant"
+    )
+    k_scale = _require_bound_arg(
+        k_scale, api_name="run_extend_logits_kernel", name="k_scale"
+    )
+    k_start = _require_bound_arg(
+        k_start, api_name="run_extend_logits_kernel", name="k_start"
+    )
     k_end = _require_bound_arg(k_end, api_name="run_extend_logits_kernel", name="k_end")
     preinitialize_invalid_logits = (
-        True if preinitialize_invalid_logits is None else bool(preinitialize_invalid_logits)
+        True
+        if preinitialize_invalid_logits is None
+        else bool(preinitialize_invalid_logits)
     )
     tile_k_offset = 0 if tile_k_offset is None else int(tile_k_offset)
 
@@ -2114,7 +2379,9 @@ def run_extend_logits_kernel(
         k_start=k_start,
         k_end=k_end,
     ):
-        raise ValueError("sparse NSA extend logits kernel only supports the exact CUDA FP8 contract")
+        raise ValueError(
+            "sparse NSA extend logits kernel only supports the exact CUDA FP8 contract"
+        )
 
     q_rows_total = int(q_fp8.shape[0])
     valid_q_rows = int(k_start.shape[0])
@@ -2155,11 +2422,19 @@ def run_extend_logits_kernel(
             "tile K range exceeds source K tiles: "
             f"offset={tile_k_offset}, tiles={output_num_k_tiles}, full={full_num_k_tiles}"
         )
-    if (tile_k_offset != 0 or tile_num_k_tiles is not None) and not (_tiled_output and _use_prefill):
-        raise ValueError("tile_k_offset/tile_num_k_tiles are only supported for tiled prefill output")
+    if (tile_k_offset != 0 or tile_num_k_tiles is not None) and not (
+        _tiled_output and _use_prefill
+    ):
+        raise ValueError(
+            "tile_k_offset/tile_num_k_tiles are only supported for tiled prefill output"
+        )
 
     if _tiled_output and _use_prefill:
-        _block_q_prefill = _PREFILL512_BLOCK_Q if _prefill_block_k == _PREFILL512_BLOCK_K else _PREFILL_BLOCK_Q
+        _block_q_prefill = (
+            _PREFILL512_BLOCK_Q
+            if _prefill_block_k == _PREFILL512_BLOCK_K
+            else _PREFILL_BLOCK_Q
+        )
         num_q_tiles = (valid_q_rows + _block_q_prefill - 1) // _block_q_prefill
         if tile_logits is None:
             # 2D layout: (num_tiles, tile_size) where tile_size = block_q * block_k
@@ -2173,7 +2448,9 @@ def run_extend_logits_kernel(
                 device=q_fp8.device,
             )
         else:
-            expected_elements = num_q_tiles * output_num_k_tiles * _block_q_prefill * _prefill_block_k
+            expected_elements = (
+                num_q_tiles * output_num_k_tiles * _block_q_prefill * _prefill_block_k
+            )
             if int(tile_logits.numel()) < expected_elements:
                 raise ValueError(
                     f"tile_logits has {int(tile_logits.numel())} elements, expected at least "
@@ -2234,7 +2511,9 @@ def run_extend_logits_kernel(
         q_bytes = q_fp8.contiguous().view(torch.uint8)
         q_bytes_kernel = q_bytes
         _pad_k = _prefill_block_k if _use_prefill else _BLOCK_K
-        k_quant_padded, k_scale_padded = _pad_kv_rows(k_quant=k_quant, k_scale=k_scale, pad_block_k=_pad_k)
+        k_quant_padded, k_scale_padded = _pad_kv_rows(
+            k_quant=k_quant, k_scale=k_scale, pad_block_k=_pad_k
+        )
         k_quant_bytes = k_quant_padded.contiguous().view(torch.uint8)
         q_u32 = _view_last_dim_as_u32(q_bytes)
         weights_kernel = weights.contiguous()
@@ -2251,12 +2530,16 @@ def run_extend_logits_kernel(
         if workspace_k_tma_prefill_desc_ptrs is not None:
             k_tma_desc_ptrs = workspace_k_tma_prefill_desc_ptrs
         else:
-            _, k_tma_desc_ptrs = _get_cached_extend_k_tma_descriptor_prefill512(k_quant_bytes)
+            _, k_tma_desc_ptrs = _get_cached_extend_k_tma_descriptor_prefill512(
+                k_quant_bytes
+            )
     elif _use_prefill:
         if workspace_k_tma_prefill_desc_ptrs is not None:
             k_tma_desc_ptrs = workspace_k_tma_prefill_desc_ptrs
         else:
-            _, k_tma_desc_ptrs = _get_cached_extend_k_tma_descriptor_prefill(k_quant_bytes)
+            _, k_tma_desc_ptrs = _get_cached_extend_k_tma_descriptor_prefill(
+                k_quant_bytes
+            )
     else:
         if workspace_k_tma_desc_ptrs is not None:
             k_tma_desc_ptrs = workspace_k_tma_desc_ptrs
@@ -2276,7 +2559,9 @@ def run_extend_logits_kernel(
     if tile_logits is not None and _tiled_output:
         tile_logits_kernel = tile_logits
     else:
-        tile_logits_kernel = torch.empty((1, 1), dtype=torch.float32, device=q_fp8.device)
+        tile_logits_kernel = torch.empty(
+            (1, 1), dtype=torch.float32, device=q_fp8.device
+        )
 
     if _use_prefill:
         write_invalid_logits = 0 if preinitialize_invalid_logits else 1
@@ -2320,20 +2605,53 @@ def run_extend_logits_kernel(
     if _use_prefill:
         _prefill_cache_variant = (
             "prefill512_h32"
-            if _prefill_block_k == _PREFILL512_BLOCK_K and int(q_fp8.shape[1]) == _PREFILL512_H32_WEIGHT_COLS
-            else ("prefill512" if _prefill_block_k == _PREFILL512_BLOCK_K else "prefill")
+            if _prefill_block_k == _PREFILL512_BLOCK_K
+            and int(q_fp8.shape[1]) == _PREFILL512_H32_WEIGHT_COLS
+            else (
+                "prefill512" if _prefill_block_k == _PREFILL512_BLOCK_K else "prefill"
+            )
         )
         cache_key = (
-            _tensor_meta_key(_cp.get("extend_q_u32", q_u32)),
-            _tensor_meta_key(_cp.get("extend_q_bytes", q_bytes_kernel)),
-            _tensor_meta_key(_cp.get("extend_weights", weights_kernel)),
-            _tensor_meta_key(_cp.get("extend_k_quant", k_quant_bytes)),
-            _tensor_meta_key(k_tma_desc_ptrs),
-            _tensor_meta_key(_cp.get("extend_k_scale", k_scale_kernel)),
-            _tensor_meta_key(_cp.get("extend_k_start", k_start_kernel)),
-            _tensor_meta_key(_cp.get("extend_k_end", k_end_kernel)),
-            _tensor_meta_key(_cp.get("extend_logits", out_kernel)),
-            _tensor_meta_key(_cp.get("extend_tile_logits", tile_logits_kernel)),
+            _tensor_compile_key(
+                "extend_q_u32", _cp.get("extend_q_u32", q_u32), dynamic_dims=(0,)
+            ),
+            _tensor_compile_key(
+                "extend_q_bytes",
+                _cp.get("extend_q_bytes", q_bytes_kernel),
+                dynamic_dims=(0,),
+            ),
+            _tensor_compile_key(
+                "extend_weights",
+                _cp.get("extend_weights", weights_kernel),
+                dynamic_dims=(0,),
+            ),
+            _tensor_compile_key(
+                "extend_k_quant",
+                _cp.get("extend_k_quant", k_quant_bytes),
+                dynamic_dims=(0,),
+            ),
+            _tensor_compile_key("k_tma_desc_ptrs", k_tma_desc_ptrs),
+            _tensor_compile_key(
+                "extend_k_scale",
+                _cp.get("extend_k_scale", k_scale_kernel),
+                dynamic_dims=(0,),
+            ),
+            _tensor_compile_key(
+                "extend_k_start",
+                _cp.get("extend_k_start", k_start_kernel),
+                dynamic_dims=(0,),
+            ),
+            _tensor_compile_key(
+                "extend_k_end", _cp.get("extend_k_end", k_end_kernel), dynamic_dims=(0,)
+            ),
+            _tensor_compile_key(
+                "extend_logits", _cp.get("extend_logits", out_kernel), dynamic_dims=(0,)
+            ),
+            _flat_tensor_compile_key(
+                "extend_tile_logits",
+                _cp.get("extend_tile_logits", tile_logits_kernel),
+                dynamic=True,
+            ),
             (
                 _prefill_cache_variant,
                 _tiled_output,
@@ -2341,20 +2659,44 @@ def run_extend_logits_kernel(
         )
     else:
         cache_key = (
-            _tensor_meta_key(_cp.get("extend_q_u32", q_u32)),
-            _tensor_meta_key(_cp.get("extend_weights", weights_kernel)),
-            _tensor_meta_key(_cp.get("extend_k_quant", k_quant_bytes)),
-            _tensor_meta_key(k_tma_desc_ptrs),
-            _tensor_meta_key(_cp.get("extend_k_scale", k_scale_kernel)),
-            _tensor_meta_key(_cp.get("extend_k_start", k_start_kernel)),
-            _tensor_meta_key(_cp.get("extend_k_end", k_end_kernel)),
-            _tensor_meta_key(_cp.get("extend_logits", out_kernel)),
-            _tensor_meta_key(tile_logits_kernel),
+            _tensor_compile_key(
+                "extend_q_u32", _cp.get("extend_q_u32", q_u32), dynamic_dims=(0,)
+            ),
+            _tensor_compile_key(
+                "extend_weights",
+                _cp.get("extend_weights", weights_kernel),
+                dynamic_dims=(0,),
+            ),
+            _tensor_compile_key(
+                "extend_k_quant",
+                _cp.get("extend_k_quant", k_quant_bytes),
+                dynamic_dims=(0,),
+            ),
+            _tensor_compile_key("k_tma_desc_ptrs", k_tma_desc_ptrs),
+            _tensor_compile_key(
+                "extend_k_scale",
+                _cp.get("extend_k_scale", k_scale_kernel),
+                dynamic_dims=(0,),
+            ),
+            _tensor_compile_key(
+                "extend_k_start",
+                _cp.get("extend_k_start", k_start_kernel),
+                dynamic_dims=(0,),
+            ),
+            _tensor_compile_key(
+                "extend_k_end", _cp.get("extend_k_end", k_end_kernel), dynamic_dims=(0,)
+            ),
+            _tensor_compile_key(
+                "extend_logits", _cp.get("extend_logits", out_kernel), dynamic_dims=(0,)
+            ),
+            _flat_tensor_compile_key(
+                "extend_tile_logits", tile_logits_kernel, dynamic=True
+            ),
             ("decode", _tiled_output),
         )
     compile_spec = KernelCompileSpec.from_key(
         "attention.indexer.extend_logits",
-        1,
+        2,
         cache_key,
     )
     b12x_launch(

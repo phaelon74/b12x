@@ -106,6 +106,82 @@ def test_tp_moe_scratch_plan_can_skip_route_scratch() -> None:
     assert plan.scratch_specs()[0].name == "tp_moe.scratch"
 
 
+def test_w4a16_scratch_plan_uses_route_pack_capacity_buckets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 120)
+
+    base_caps = dict(
+        device="cpu",
+        weight_E=256,
+        k=4096,
+        n=7168,
+        num_topk=8,
+        dtype=torch.bfloat16,
+        route_num_experts=0,
+        quant_mode="w4a16",
+    )
+    plan_4080 = plan_tp_moe_scratch(
+        TPMoEScratchCaps(max_tokens=4080, core_token_counts=(4080,), **base_caps)
+    )
+    plan_4096 = plan_tp_moe_scratch(
+        TPMoEScratchCaps(max_tokens=4096, core_token_counts=(4096,), **base_caps)
+    )
+    plan_topk6 = plan_tp_moe_scratch(
+        TPMoEScratchCaps(
+            max_tokens=4080,
+            core_token_counts=(4080,),
+            **{**base_caps, "num_topk": 6},
+        )
+    )
+
+    assert plan_4080.layout.core_token_counts[0] == 4096
+    assert plan_4096.layout.core_token_counts[0] == 4096
+    assert plan_topk6.layout.core_token_counts[0] == 4096
+    assert 4080 not in plan_4080.layout.core_token_counts
+    assert 4080 not in plan_topk6.layout.core_token_counts
+    assert plan_4080.shapes_and_dtypes() == plan_4096.shapes_and_dtypes()
+
+
+def test_w4a16_topk6_bucket_materializes_with_planned_scratch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _fake_w4a16_prewarm(workspace, *, token_counts, **_kwargs) -> None:
+        workspace.planned_fused_moe_launches = {
+            ("packed", "e4m3_k16", int(token_count)): object()
+            for token_count in token_counts
+        }
+        workspace.planned_topk_sum_launches = {
+            int(token_count): object() for token_count in token_counts
+        }
+
+    monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 120)
+    monkeypatch.setattr(
+        tp_moe_impl,
+        "_prewarm_w4a16_planned_launches",
+        _fake_w4a16_prewarm,
+    )
+    plan = plan_tp_moe_scratch(
+        TPMoEScratchCaps(
+            device="cpu",
+            max_tokens=15,
+            weight_E=8,
+            k=128,
+            n=64,
+            num_topk=6,
+            dtype=torch.bfloat16,
+            core_token_counts=(15,),
+            route_num_experts=0,
+            quant_mode="w4a16",
+        )
+    )
+    scratch = _scratch_for_plan(plan)
+
+    pool = plan.make_workspace_pool(scratch=scratch)
+
+    assert pool.workspaces
+
+
 def test_tp_moe_scratch_plan_materializes_caller_owned_scratch_pool() -> None:
     plan = plan_tp_moe_scratch(_caps())
     scratch = _scratch_for_plan(plan)

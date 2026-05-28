@@ -16,7 +16,12 @@ from cutlass.cute.runtime import from_dlpack
 from b12x.attention._cute import copy as cute_copy
 from b12x.attention._cute import pipeline as cute_pipeline
 from b12x.attention._cute import ops as attention_ops
-from b12x.cute.compiler import KernelCompileSpec, launch as b12x_launch
+from b12x.cute.compiler import (
+    DimKey,
+    KernelCompileSpec,
+    TensorKey,
+    launch as b12x_launch,
+)
 from b12x.cute.fp4 import get_sm_version
 from b12x.cute.fp4 import (
     frag_layout_swizzle_16b_to_8b,
@@ -306,6 +311,20 @@ def _tensor_meta_key(
         str(tensor.dtype),
         (tensor.device.type, tensor.device.index),
     )
+
+
+def _tensor_compile_key(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    dynamic_dims: tuple[int, ...] = (),
+) -> TensorKey:
+    dynamic_dim_set = set(dynamic_dims)
+    dims = tuple(
+        DimKey.dynamic() if idx in dynamic_dim_set else DimKey.exact(int(dim))
+        for idx, dim in enumerate(tensor.shape)
+    )
+    return TensorKey.from_tensor(name, tensor, dims=dims)
 
 
 def _contract_key_tensor(
@@ -1859,20 +1878,36 @@ def run_paged_logits_kernel(
     )
     common_cache_key = (
         q_fp8.shape[1],
-        _tensor_meta_key(_contract_key_tensor(_cp, "q_bytes", q_bytes)),
-        _tensor_meta_key(_contract_key_tensor(_cp, "weights", weights_kernel)),
+        _tensor_compile_key(
+            "q_bytes",
+            _contract_key_tensor(_cp, "q_bytes", q_bytes),
+            dynamic_dims=(0,),
+        ),
+        _tensor_compile_key(
+            "weights",
+            _contract_key_tensor(_cp, "weights", weights_kernel),
+            dynamic_dims=(0,),
+        ),
         _tensor_meta_key(k_quant_bytes),
         _tensor_meta_key(k_tma_desc_ptrs),
         _tensor_meta_key(use_scalar_k_load_tensor),
         _tensor_meta_key(k_scales),
-        _tensor_meta_key(
-            _contract_key_tensor(_cp, "real_page_table", real_page_table_kernel)
+        _tensor_compile_key(
+            "real_page_table",
+            _contract_key_tensor(_cp, "real_page_table", real_page_table_kernel),
+            dynamic_dims=(0,),
         ),
-        _tensor_meta_key(
-            _contract_key_tensor(_cp, "seqlens_per_query", seqlens_per_query_kernel)
+        _tensor_compile_key(
+            "seqlens_per_query",
+            _contract_key_tensor(_cp, "seqlens_per_query", seqlens_per_query_kernel),
+            dynamic_dims=(0,),
         ),
         _tensor_meta_key(active_width_kernel),
-        _tensor_meta_key(_contract_key_tensor(_cp, "logits", logits)),
+        _tensor_compile_key(
+            "logits",
+            _contract_key_tensor(_cp, "logits", logits),
+            dynamic_dims=(0,),
+        ),
     )
     max_pages = int(real_page_table.shape[1])
     if schedule_metadata is not None and schedule_metadata_kernel is None:
@@ -1903,7 +1938,11 @@ def run_paged_logits_kernel(
             "schedule_single_row",
             _SCHEDULE_SINGLE_ROW_PARALLEL_CTAS,
             *common_cache_key,
-            _tensor_meta_key(schedule_metadata_kernel),
+            _tensor_compile_key(
+                "schedule_metadata",
+                schedule_metadata_kernel,
+                dynamic_dims=(0,),
+            ),
         )
     elif _should_use_schedule_multi_row_kernel(q_rows=rows, max_pages=max_pages):
         if schedule_metadata is None:
@@ -1923,7 +1962,11 @@ def run_paged_logits_kernel(
             "schedule_multi_row",
             _SCHEDULE_MULTI_ROW_PARALLEL_CTAS,
             *common_cache_key,
-            _tensor_meta_key(schedule_metadata_kernel),
+            _tensor_compile_key(
+                "schedule_metadata",
+                schedule_metadata_kernel,
+                dynamic_dims=(0,),
+            ),
         )
     else:
         persistent_ctas = _resolve_sparse_nsa_persistent_ctas(
@@ -1944,7 +1987,7 @@ def run_paged_logits_kernel(
         )
     compile_spec = KernelCompileSpec.from_key(
         "attention.indexer.paged_logits",
-        1,
+        2,
         cache_key,
     )
     b12x_launch(
@@ -2352,25 +2395,39 @@ def _run_paged_tiled_logits_kernel_common(
     )
     common_cache_key = (
         q_fp8.shape[1],
-        _tensor_meta_key(_contract_key_tensor(_cp, "q_bytes", q_bytes)),
-        _tensor_meta_key(_contract_key_tensor(_cp, "weights", weights_kernel)),
+        _tensor_compile_key(
+            "q_bytes",
+            _contract_key_tensor(_cp, "q_bytes", q_bytes),
+            dynamic_dims=(0,),
+        ),
+        _tensor_compile_key(
+            "weights",
+            _contract_key_tensor(_cp, "weights", weights_kernel),
+            dynamic_dims=(0,),
+        ),
         _tensor_meta_key(k_quant_bytes),
         _tensor_meta_key(k_tma_desc_ptrs),
         _tensor_meta_key(use_scalar_k_load_tensor),
         _tensor_meta_key(k_scales),
-        _tensor_meta_key(
-            _contract_key_tensor(_cp, "real_page_table", real_page_table_kernel)
+        _tensor_compile_key(
+            "real_page_table",
+            _contract_key_tensor(_cp, "real_page_table", real_page_table_kernel),
+            dynamic_dims=(0,),
         ),
-        _tensor_meta_key(
-            _contract_key_tensor(_cp, "seqlens_per_query", seqlens_per_query_kernel)
+        _tensor_compile_key(
+            "seqlens_per_query",
+            _contract_key_tensor(_cp, "seqlens_per_query", seqlens_per_query_kernel),
+            dynamic_dims=(0,),
         ),
         _tensor_meta_key(active_width_kernel),
-        _tensor_meta_key(
+        _tensor_compile_key(
+            "tile_logits",
             _contract_key_tensor(
                 _cp,
                 "tile_logits" if "tile_logits" in _cp else "logits",
                 logits,
-            )
+            ),
+            dynamic_dims=(0,),
         ),
     )
     workspace_persistent_ctas = (
@@ -2430,7 +2487,7 @@ def _run_paged_tiled_logits_kernel_common(
         )
     compile_spec = KernelCompileSpec.from_key(
         "attention.indexer.paged_tiled_logits",
-        1,
+        2,
         cache_key,
     )
     b12x_launch(

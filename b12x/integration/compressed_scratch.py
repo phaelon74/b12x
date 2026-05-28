@@ -473,14 +473,25 @@ def _normalize_q(q: torch.Tensor, *, scratch: object) -> torch.Tensor:
     return q.detach()
 
 
-def _normalize_i32_matrix(tensor: torch.Tensor, *, scratch: object, rows: int, name: str) -> torch.Tensor:
+def _is_row_shared_i32_matrix(tensor: torch.Tensor) -> bool:
+    return tensor.ndim == 2 and int(tensor.stride(0)) == 0 and int(tensor.stride(1)) == 1
+
+
+def _normalize_i32_matrix(
+    tensor: torch.Tensor,
+    *,
+    scratch: object,
+    rows: int,
+    name: str,
+    allow_row_shared: bool = False,
+) -> torch.Tensor:
     if tensor.ndim == 3 and tensor.shape[1] == 1:
         tensor = tensor[:, 0]
     if tensor.ndim != 2:
         raise ValueError(f"{name} must be rank-2 or [rows, 1, width], got {tuple(tensor.shape)}")
     if tensor.dtype != torch.int32:
         raise TypeError(f"{name} must have dtype torch.int32, got {tensor.dtype}")
-    if not tensor.is_contiguous():
+    if not tensor.is_contiguous() and not (allow_row_shared and _is_row_shared_i32_matrix(tensor)):
         raise ValueError(f"{name} must be contiguous")
     _validate_device(tensor, scratch=scratch, name=name)
     if int(tensor.shape[0]) != int(rows):
@@ -556,6 +567,7 @@ def build_compressed_mla_binding(
             scratch=scratch,
             rows=rows,
             name="indexed_page_table",
+            allow_row_shared=True,
         )
         if int(indexed_page_table.shape[1]) > int(scratch.max_page_table_width):
             raise ValueError(

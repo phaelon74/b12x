@@ -4190,7 +4190,7 @@ def pack_topk_routes_by_expert(
     _validate_expert_map(expert_map, exact_num_experts=int(num_experts))
     del stream
     return _pack_topk_routes_by_expert(
-        topk_ids.view(-1),
+        topk_ids,
         int(block_size),
         int(num_experts),
         expert_map=expert_map,

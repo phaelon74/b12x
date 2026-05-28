@@ -6,6 +6,11 @@ import triton
 import triton.language as tl
 import torch
 
+from b12x.moe.fused.w4a16.host import (
+    max_packed_route_slots,
+    route_pack_numel_capacity,
+)
+
 
 _COUNT_BLOCK_T = 256
 _SORT_BLOCK_T = 256
@@ -17,13 +22,6 @@ _SMALL_PREFIX_MAX_EXPERT_BLOCK_PRODUCT = 65536
 
 def _next_power_of_2(x: int) -> int:
     return 1 << (int(x) - 1).bit_length()
-
-
-def _max_packed_route_slots(numel: int, block_size: int, num_experts: int) -> int:
-    max_packed = int(numel) + int(num_experts) * (int(block_size) - 1)
-    if int(numel) < int(num_experts):
-        max_packed = min(int(numel) * int(block_size), max_packed)
-    return max_packed
 
 
 def _workspace_slice(
@@ -60,7 +58,7 @@ def _pack_topk_routes_post_prefix_kernel(
     packed_route_indices,
     block_expert_ids,
     expert_offsets,
-    NUMEL: tl.constexpr,
+    live_numel,
     BLOCK_SIZE: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
     MAX_PACKED_ROUTES: tl.constexpr,
@@ -71,7 +69,7 @@ def _pack_topk_routes_post_prefix_kernel(
     offsets = pid * BLOCK_T + tl.arange(0, BLOCK_T)
     tl.store(
         packed_route_indices + offsets,
-        NUMEL,
+        live_numel,
         mask=offsets < MAX_PACKED_ROUTES,
     )
 
@@ -94,7 +92,8 @@ def _pack_topk_routes_small_prefix_kernel(
     block_expert_ids,
     packed_route_count,
     expert_offsets,
-    NUMEL: tl.constexpr,
+    live_numel,
+    NUMEL_CAPACITY: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
     MAX_PACKED_ROUTES: tl.constexpr,
@@ -110,12 +109,12 @@ def _pack_topk_routes_small_prefix_kernel(
     counts = tl.zeros((BLOCK_E,), dtype=tl.int32)
 
     route_offsets = tl.arange(0, BLOCK_T)
-    for start in tl.range(0, NUMEL, BLOCK_T):
+    for start in tl.range(0, NUMEL_CAPACITY, BLOCK_T):
         offsets = start + route_offsets
-        raw_ids = tl.load(topk_ids + offsets, mask=offsets < NUMEL, other=-1).to(
+        raw_ids = tl.load(topk_ids + offsets, mask=offsets < live_numel, other=-1).to(
             tl.int32
         )
-        valid = (offsets < NUMEL) & (raw_ids >= 0) & (raw_ids < NUM_EXPERTS)
+        valid = (offsets < live_numel) & (raw_ids >= 0) & (raw_ids < NUM_EXPERTS)
         ids = raw_ids
         if HAS_EXPERT_MAP:
             safe_ids = tl.minimum(tl.maximum(raw_ids, 0), NUM_EXPERTS - 1)
@@ -140,7 +139,7 @@ def _pack_topk_routes_small_prefix_kernel(
     route_init_offsets = tl.arange(0, BLOCK_ROUTE_INIT)
     tl.store(
         packed_route_indices + route_init_offsets,
-        NUMEL,
+        live_numel,
         mask=route_init_offsets < MAX_PACKED_ROUTES,
     )
 
@@ -166,7 +165,8 @@ def _pack_topk_routes_prefix_kernel(
     expert_map,
     packed_route_count,
     expert_offsets,
-    NUMEL: tl.constexpr,
+    live_numel,
+    NUMEL_CAPACITY: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
     HAS_EXPERT_MAP: tl.constexpr,
@@ -178,12 +178,12 @@ def _pack_topk_routes_prefix_kernel(
     counts = tl.zeros((BLOCK_E,), dtype=tl.int32)
 
     route_offsets = tl.arange(0, BLOCK_T)
-    for start in tl.range(0, NUMEL, BLOCK_T):
+    for start in tl.range(0, NUMEL_CAPACITY, BLOCK_T):
         offsets = start + route_offsets
-        raw_ids = tl.load(topk_ids + offsets, mask=offsets < NUMEL, other=-1).to(
+        raw_ids = tl.load(topk_ids + offsets, mask=offsets < live_numel, other=-1).to(
             tl.int32
         )
-        valid = (offsets < NUMEL) & (raw_ids >= 0) & (raw_ids < NUM_EXPERTS)
+        valid = (offsets < live_numel) & (raw_ids >= 0) & (raw_ids < NUM_EXPERTS)
         ids = raw_ids
         if HAS_EXPERT_MAP:
             safe_ids = tl.minimum(tl.maximum(raw_ids, 0), NUM_EXPERTS - 1)
@@ -212,15 +212,17 @@ def _pack_topk_routes_sort_kernel(
     expert_map,
     packed_route_indices,
     expert_offsets,
-    NUMEL: tl.constexpr,
+    live_numel,
     NUM_EXPERTS: tl.constexpr,
     HAS_EXPERT_MAP: tl.constexpr,
     BLOCK_T: tl.constexpr,
 ):
     pid = tl.program_id(0)
     offsets = pid * BLOCK_T + tl.arange(0, BLOCK_T)
-    raw_ids = tl.load(topk_ids + offsets, mask=offsets < NUMEL, other=-1).to(tl.int32)
-    valid = (offsets < NUMEL) & (raw_ids >= 0) & (raw_ids < NUM_EXPERTS)
+    raw_ids = tl.load(topk_ids + offsets, mask=offsets < live_numel, other=-1).to(
+        tl.int32
+    )
+    valid = (offsets < live_numel) & (raw_ids >= 0) & (raw_ids < NUM_EXPERTS)
     ids = raw_ids
     if HAS_EXPERT_MAP:
         safe_ids = tl.minimum(tl.maximum(raw_ids, 0), NUM_EXPERTS - 1)
@@ -243,10 +245,30 @@ def pack_topk_routes_by_expert(
     expert_offsets: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     numel = int(topk_ids.numel())
-    max_packed_routes = _max_packed_route_slots(
-        numel, int(block_size), int(num_experts)
+    topk = int(topk_ids.shape[-1]) if topk_ids.ndim >= 2 else 1
+    numel_capacity = route_pack_numel_capacity(numel, topk=topk)
+    capacity_packed_routes = max_packed_route_slots(
+        numel_capacity, int(block_size), int(num_experts)
     )
-    max_route_blocks = (max_packed_routes + int(block_size) - 1) // int(block_size)
+    capacity_route_blocks = (
+        capacity_packed_routes + int(block_size) - 1
+    ) // int(block_size)
+    if packed_route_indices is not None and block_expert_ids is not None:
+        if (
+            int(packed_route_indices.numel()) < capacity_packed_routes
+            or int(block_expert_ids.numel()) < capacity_route_blocks
+        ):
+            numel_capacity = numel
+            capacity_packed_routes = max_packed_route_slots(
+                numel, int(block_size), int(num_experts)
+            )
+            capacity_route_blocks = (
+                capacity_packed_routes + int(block_size) - 1
+            ) // int(block_size)
+    max_packed_routes = capacity_packed_routes
+    max_route_blocks = capacity_route_blocks
+    max_packed_routes = max(max_packed_routes, 1)
+    max_route_blocks = max(max_route_blocks, 1)
 
     packed_route_indices = _workspace_slice(
         packed_route_indices,
@@ -305,7 +327,8 @@ def pack_topk_routes_by_expert(
             block_expert_ids,
             packed_route_count,
             expert_offsets,
-            NUMEL=numel,
+            numel,
+            NUMEL_CAPACITY=numel_capacity,
             BLOCK_SIZE=int(block_size),
             NUM_EXPERTS=int(num_experts),
             MAX_PACKED_ROUTES=max_packed_routes,
@@ -329,7 +352,8 @@ def pack_topk_routes_by_expert(
             expert_map_tensor,
             packed_route_count,
             expert_offsets,
-            NUMEL=numel,
+            numel,
+            NUMEL_CAPACITY=numel_capacity,
             BLOCK_SIZE=int(block_size),
             NUM_EXPERTS=int(num_experts),
             HAS_EXPERT_MAP=expert_map is not None,
@@ -341,7 +365,7 @@ def pack_topk_routes_by_expert(
             packed_route_indices,
             block_expert_ids,
             expert_offsets,
-            NUMEL=numel,
+            numel,
             BLOCK_SIZE=int(block_size),
             NUM_EXPERTS=int(num_experts),
             MAX_PACKED_ROUTES=max_packed_routes,
@@ -354,7 +378,7 @@ def pack_topk_routes_by_expert(
         expert_map_tensor,
         packed_route_indices,
         expert_offsets,
-        NUMEL=numel,
+        numel,
         NUM_EXPERTS=int(num_experts),
         HAS_EXPERT_MAP=expert_map is not None,
         BLOCK_T=_SORT_BLOCK_T,
