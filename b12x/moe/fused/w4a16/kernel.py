@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, replace
+from typing import NamedTuple
 
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass.cutlass_dsl import Int32, Uint32
+from cutlass.cutlass_dsl import Int32, Int64, Uint32
 
 from b12x.cute.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x.cute.fp4 import (
@@ -70,6 +72,7 @@ from b12x.moe.fused.w4a16.host import (
     validate_activation,
 )
 from b12x.cute.runtime_control import raise_if_kernel_resolution_frozen
+from b12x.moe.fused.micro import MoEMicroKernelBackend
 
 
 _ALLOWED_ROUTED_SIZES = _W4A16_ALLOWED_ROUTED_SIZES
@@ -77,7 +80,8 @@ _PACK_FACTOR = 8
 _STAGES = 4
 _DEVICE_MAX_REG_BYTES = 255 * 1024
 _DEFAULT_MAX_SHARED_MEM = 101_376
-_WEIGHT_LAYOUTS = {"packed"}
+_WEIGHT_LAYOUTS = {"packed", "modelopt"}
+_MODEL_OPT_W13_LAYOUTS = {"w13", "w31"}
 _SCALE_FORMATS = {
     "e4m3_k16": "e4m3_k16",
     "e8m0_k32": "e8m0_k32",
@@ -85,6 +89,7 @@ _SCALE_FORMATS = {
 _E8M0_K32_FP16_GLOBAL_COMPENSATION = float(2.0**7)
 _E8M0_K32_BF16_GLOBAL_COMPENSATION = float(2.0**119)
 _MAX_DIRECT_TOPK_ROUTE_M = 6
+_W4A16_SMALL_M_DIRECT_MAX_M = 8
 
 
 def _m_specialization_key(size_m: int) -> int:
@@ -334,6 +339,7 @@ class W4A16GemmCompileResult:
     blocks_per_sm: int
     weight_layout: str = "packed"
     scale_format: str = "e4m3_k16"
+    w13_layout: str = "w13"
 
 
 @dataclass(frozen=True)
@@ -375,6 +381,7 @@ class W4A16FusedMoeCompileResult:
     max_m_blocks: int
     blocks_per_sm: int
     weight_layout: str = "packed"
+    w13_layout: str = "w13"
     direct_topk_routes: bool = False
     scale_format: str = "e4m3_k16"
 
@@ -383,6 +390,75 @@ class W4A16FusedMoeCompileResult:
 class _W4A16GemmLaunch:
     kernel: W4A16GemmCompileResult
     c_tmp: torch.Tensor
+
+
+class _W4A16SmallMDirectLaunch(NamedTuple):
+    compiled: object
+    grid_x: int
+    m: int
+    hidden_size: int
+    intermediate_size: int
+    num_experts: int
+    topk: int
+    activation: str
+    fast_math: bool
+    topk_ids_dtype: torch.dtype
+
+
+class _W4A16SmallMDirectKernel(MoEMicroKernelBackend):
+    """Decode-sized W4A16 specialization using the native ModelOpt layout."""
+
+    _SUPPORTED_M = (1, 2, 4, 8)
+
+    @classmethod
+    def is_supported(
+        cls,
+        *,
+        m: int,
+        hidden_size: int,
+        intermediate_size: int,
+        topk: int,
+        num_experts: int,
+    ) -> bool:
+        return (
+            int(m) in cls._SUPPORTED_M
+            and int(m) <= _W4A16_SMALL_M_DIRECT_MAX_M
+            and int(hidden_size) > 0
+            and int(hidden_size) % 128 == 0
+            and int(intermediate_size) > 0
+            and int(intermediate_size) % 16 == 0
+            and 0 < int(topk) <= 32
+            and int(num_experts) > 0
+            and MoEMicroKernelBackend.is_supported(
+                int(m),
+                int(hidden_size),
+                int(intermediate_size),
+                int(topk),
+                int(num_experts),
+            )
+        )
+
+    def __init__(
+        self,
+        *,
+        activation: str,
+        fast_math: bool,
+        share_input_across_experts: bool,
+        share_expert_scales: bool,
+        single_token: bool,
+    ):
+        super().__init__(
+            sf_vec_size=16,
+            mma_tiler_mn=(64, 128),
+            output_tile_count_n=1,
+            fast_math=fast_math,
+            activation=activation,
+            share_input_across_experts=share_input_across_experts,
+            share_expert_scales=share_expert_scales,
+            single_token=single_token,
+            dynamic_down_scale=False,
+            w4a16_mode=True,
+        )
 
 
 class W4A16GemmKernel:
@@ -403,6 +479,8 @@ class W4A16GemmKernel:
         epilogue_activation: str | None = None,
         weight_layout: str = "packed",
         scale_format: str = "e4m3_k16",
+        w13_layout: str = "w13",
+        source_n_rotation: int = 0,
         single_token_route_fast_path: bool = False,
         direct_topk_routes: bool = False,
     ):
@@ -411,6 +489,12 @@ class W4A16GemmKernel:
         if weight_layout not in _WEIGHT_LAYOUTS:
             raise ValueError(f"unsupported W4A16 weight_layout {weight_layout!r}")
         scale_format = _normalize_scale_format(scale_format)
+        if weight_layout == "modelopt":
+            if w13_layout not in _MODEL_OPT_W13_LAYOUTS:
+                raise ValueError(f"unsupported W4A16 w13_layout {w13_layout!r}")
+        else:
+            w13_layout = "packed"
+            source_n_rotation = 0
         if epilogue_activation not in (None, "relu2"):
             raise ValueError(
                 "W4A16 GEMM epilogue activation currently supports only relu2"
@@ -448,6 +532,8 @@ class W4A16GemmKernel:
         self.weight_layout = weight_layout
         self.scale_format = scale_format
         self.scale_format_e8m0_k32 = scale_format == "e8m0_k32"
+        self.w13_layout = w13_layout
+        self.source_n_rotation = int(source_n_rotation)
         self.single_token_route_fast_path = bool(single_token_route_fast_path)
         self.direct_topk_routes = bool(direct_topk_routes)
         self.cta_m_blocks = int(_covering_count(moe_block_size, 16))
@@ -538,6 +624,8 @@ class W4A16GemmKernel:
             self.epilogue_relu2,
             self.weight_layout,
             self.scale_format,
+            self.w13_layout,
+            self.source_n_rotation,
             self.single_token_route_fast_path,
             self.direct_topk_routes,
             self.cta_m_blocks,
@@ -2002,14 +2090,22 @@ class W4A16GemmKernel:
         pipe: Int32,
         kk: Int32,
     ):
-        b_addr = self._int4_addr(
-            smem_base,
-            Int32(self.sh_b_off)
-            + pipe * Int32(self.b_sh_stage)
-            + Int32(self.b_sh_stride) * kk
-            + b_sh_rd,
-        )
-        q0, q1, q2, q3 = ld_shared_v4_u32(b_addr)
+        if cutlass.const_expr(self.weight_layout == "modelopt"):
+            q0, q1, q2, q3 = self._load_b_registers_modelopt_shared(
+                smem_base,
+                b_sh_rd,
+                pipe,
+                kk,
+            )
+        else:
+            b_addr = self._int4_addr(
+                smem_base,
+                Int32(self.sh_b_off)
+                + pipe * Int32(self.b_sh_stage)
+                + Int32(self.b_sh_stride) * kk
+                + b_sh_rd,
+            )
+            q0, q1, q2, q3 = ld_shared_v4_u32(b_addr)
 
         warp_id = tid // Int32(32)
         warp_row = warp_id // Int32(self.tb_n_warps)
@@ -2217,6 +2313,146 @@ class W4A16GemmKernel:
         acc[mb, jj, 1, 3] = d3
 
     @cute.jit
+    def _source_n_from_logical(self, logical_n: Int32) -> Int32:
+        source_n = logical_n
+        if cutlass.const_expr(self.source_n_rotation != 0):
+            source_n += Int32(self.source_n_rotation)
+            if source_n >= Int32(self.size_n):
+                source_n -= Int32(self.size_n)
+        return source_n
+
+    @cute.jit
+    def _stage_b_tile_modelopt_native(
+        self,
+        b_u8_flat: cute.Tensor,
+        smem_addr: Int32,
+        expert_idx: Int32,
+        output_n_tile: Int32,
+        tile_idx: Int32,
+        local_int4: Int32,
+    ):
+        chunks_per_row = Int32(self.tile_k // 32)
+        local_n = local_int4 // chunks_per_row
+        local_k_vec = local_int4 - local_n * chunks_per_row
+        logical_n = output_n_tile * Int32(self.tile_n) + local_n
+        source_n = self._source_n_from_logical(logical_n)
+        packed_cols = Int32(self.size_k // 2)
+        byte_offset = (
+            Int64(expert_idx) * Int64(self.size_n * (self.size_k // 2))
+            + Int64(source_n) * Int64(packed_cols)
+            + Int64(tile_idx * Int32(self.tile_k // 2))
+            + Int64(local_k_vec * Int32(16))
+        )
+        cp_async4_shared_global(
+            smem_addr,
+            get_ptr_as_int64(b_u8_flat, byte_offset),
+        )
+
+    @cute.jit
+    def _load_modelopt_shared_byte(
+        self,
+        smem_base: Int32,
+        pipe: Int32,
+        n_tile: Int32,
+        k_tile: Int32,
+        warp_id: Int32,
+        tc_col: Int32,
+        tc_row: Int32,
+        n_delta: cutlass.Constexpr[int],
+        k_delta: cutlass.Constexpr[int],
+    ) -> Uint32:
+        local_n = (
+            n_tile * Int32(64)
+            + warp_id * Int32(16)
+            + tc_col
+            + Int32(n_delta)
+        )
+        local_k = k_tile * Int32(16) + tc_row + Int32(k_delta)
+        byte_offset = local_n * Int32(self.tile_k // 2) + local_k // Int32(2)
+        word_byte_offset = byte_offset - (byte_offset & Int32(3))
+        word = ld_shared_u32(
+            smem_base
+            + Int32(self.sh_b_off * 16)
+            + pipe * Int32(self.b_sh_stage * 16)
+            + word_byte_offset
+        )
+        shift = Uint32((byte_offset - word_byte_offset) * Int32(8))
+        return (word >> shift) & Uint32(0xFF)
+
+    @cute.jit
+    def _pack_modelopt_byte_pair(
+        self,
+        word: Uint32,
+        q: Uint32,
+        low_shift: cutlass.Constexpr[int],
+        high_shift: cutlass.Constexpr[int],
+    ) -> Uint32:
+        low = q & Uint32(0xF)
+        high = (q >> Uint32(4)) & Uint32(0xF)
+        return word | (low << Uint32(low_shift)) | (high << Uint32(high_shift))
+
+    @cute.jit
+    def _load_modelopt_shared_packed_word_for_lane(
+        self,
+        smem_base: Int32,
+        pipe: Int32,
+        n_tile: Int32,
+        k_tile: Int32,
+        warp_id: Int32,
+        tc_col: Int32,
+        tc_row: Int32,
+    ) -> Uint32:
+        q0 = self._load_modelopt_shared_byte(
+            smem_base, pipe, n_tile, k_tile, warp_id, tc_col, tc_row, 0, 0
+        )
+        q1 = self._load_modelopt_shared_byte(
+            smem_base, pipe, n_tile, k_tile, warp_id, tc_col, tc_row, 0, 8
+        )
+        q2 = self._load_modelopt_shared_byte(
+            smem_base, pipe, n_tile, k_tile, warp_id, tc_col, tc_row, 8, 0
+        )
+        q3 = self._load_modelopt_shared_byte(
+            smem_base, pipe, n_tile, k_tile, warp_id, tc_col, tc_row, 8, 8
+        )
+        word = Uint32(0)
+        word = self._pack_modelopt_byte_pair(word, q0, 0, 16)
+        word = self._pack_modelopt_byte_pair(word, q1, 4, 20)
+        word = self._pack_modelopt_byte_pair(word, q2, 8, 24)
+        word = self._pack_modelopt_byte_pair(word, q3, 12, 28)
+        return word
+
+    @cute.jit
+    def _load_b_registers_modelopt_shared(
+        self,
+        smem_base: Int32,
+        b_sh_rd: Int32,
+        pipe: Int32,
+        kk: Int32,
+    ):
+        packed_word_index = (Int32(self.b_sh_stride) * kk + b_sh_rd) * Int32(4)
+        words_per_k_tile = Int32((self.tile_n // 64) * 128)
+        k_tile = packed_word_index // words_per_k_tile
+        pos_in_k_tile = packed_word_index - k_tile * words_per_k_tile
+        n_tile = pos_in_k_tile // Int32(128)
+        pos = pos_in_k_tile - n_tile * Int32(128)
+        th_id = pos // Int32(4)
+        tc_col = th_id // Int32(4)
+        tc_row = (th_id - tc_col * Int32(4)) * Int32(2)
+        q0 = self._load_modelopt_shared_packed_word_for_lane(
+            smem_base, pipe, n_tile, k_tile, Int32(0), tc_col, tc_row
+        )
+        q1 = self._load_modelopt_shared_packed_word_for_lane(
+            smem_base, pipe, n_tile, k_tile, Int32(1), tc_col, tc_row
+        )
+        q2 = self._load_modelopt_shared_packed_word_for_lane(
+            smem_base, pipe, n_tile, k_tile, Int32(2), tc_col, tc_row
+        )
+        q3 = self._load_modelopt_shared_packed_word_for_lane(
+            smem_base, pipe, n_tile, k_tile, Int32(3), tc_col, tc_row
+        )
+        return q0, q1, q2, q3
+
+    @cute.jit
     def _stage_k_tile_async(
         self,
         a_bf16_flat: cute.Tensor,
@@ -2278,10 +2514,20 @@ class W4A16GemmKernel:
                 + Int32(i * self.cta_threads)
                 + tid,
             )
-            cp_async4_shared_global(
-                b_dst,
-                get_ptr_as_int64(b_i32_flat, b_src_int4 * Int32(4)),
-            )
+            if cutlass.const_expr(self.weight_layout == "packed"):
+                cp_async4_shared_global(
+                    b_dst,
+                    get_ptr_as_int64(b_i32_flat, b_src_int4 * Int32(4)),
+                )
+            else:
+                self._stage_b_tile_modelopt_native(
+                    b_i32_flat,
+                    b_dst,
+                    expert_idx,
+                    output_n_tile,
+                    tile_idx,
+                    Int32(i * self.cta_threads) + tid,
+                )
 
         if tid < Int32(self.s_sh_stage):
             s_src_int4 = (
@@ -2857,6 +3103,7 @@ class W4A16FusedMoeKernel:
         swiglu_limit: float | None = None,
         weight_layout: str = "packed",
         scale_format: str = "e4m3_k16",
+        w13_layout: str = "w13",
         direct_topk_routes: bool = False,
     ):
         is_gated = validate_activation(activation)
@@ -2866,6 +3113,11 @@ class W4A16FusedMoeKernel:
         if weight_layout not in _WEIGHT_LAYOUTS:
             raise ValueError(f"unsupported W4A16 weight_layout {weight_layout!r}")
         scale_format = _normalize_scale_format(scale_format)
+        if weight_layout == "modelopt":
+            if w13_layout not in _MODEL_OPT_W13_LAYOUTS:
+                raise ValueError(f"unsupported W4A16 w13_layout {w13_layout!r}")
+        else:
+            w13_layout = "packed"
         fc1_cols = int(intermediate_size) * (2 if is_gated else 1)
         routed_rows = int(size_m) * int(top_k)
         self.size_m = int(size_m)
@@ -2880,12 +3132,22 @@ class W4A16FusedMoeKernel:
         self.swiglu_limit = 0.0 if swiglu_limit is None else swiglu_limit
         self.weight_layout = weight_layout
         self.scale_format = scale_format
+        self.w13_layout = w13_layout
         self.apply_router_weight_on_input = bool(apply_router_weight_on_input)
         self.zero_fc2_output = bool(zero_fc2_output)
         self.element_dtype = element_dtype
         self.is_fp16 = element_dtype == "fp16"
         self.fast_math = bool(fast_math)
         self.direct_topk_routes = bool(direct_topk_routes)
+        fc1_source_n_rotation = (
+            int(intermediate_size)
+            if (
+                weight_layout == "modelopt"
+                and w13_layout == "w13"
+                and is_gated
+            )
+            else 0
+        )
         self.fc1 = W4A16GemmKernel(
             size_m=size_m,
             size_n=fc1_cols,
@@ -2901,6 +3163,8 @@ class W4A16FusedMoeKernel:
             epilogue_activation=None if is_gated else "relu2",
             weight_layout=weight_layout,
             scale_format=scale_format,
+            w13_layout=w13_layout,
+            source_n_rotation=fc1_source_n_rotation,
             single_token_route_fast_path=size_m == 1
             and not self.direct_topk_routes,
             direct_topk_routes=self.direct_topk_routes,
@@ -2919,6 +3183,7 @@ class W4A16FusedMoeKernel:
             element_dtype=element_dtype,
             weight_layout=weight_layout,
             scale_format=scale_format,
+            w13_layout=w13_layout,
             single_token_route_fast_path=size_m == 1
             and not self.direct_topk_routes,
             direct_topk_routes=self.direct_topk_routes,
@@ -3422,6 +3687,7 @@ _CACHE: dict[tuple, W4A16GemmCompileResult] = {}
 _FUSED_CACHE: dict[tuple, W4A16FusedMoeCompileResult] = {}
 _ACTIVATION_CACHE: dict[tuple, W4A16ActivationCompileResult] = {}
 _SUM_CACHE: dict[tuple, W4A16TopKSumCompileResult] = {}
+_SMALL_M_DIRECT_CACHE: dict[tuple, _W4A16SmallMDirectLaunch] = {}
 
 
 def _normalize_element_dtype(dtype: torch.dtype) -> str:
@@ -3468,6 +3734,137 @@ def _cutlass_element_dtype(element_dtype: str):
     if element_dtype == "fp16":
         return cutlass.Float16
     raise ValueError(f"unsupported element_dtype {element_dtype!r}")
+
+
+def _small_m_direct_supported(
+    *,
+    m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    activation: str,
+    apply_router_weight_on_input: bool,
+    swiglu_limit: float | None,
+    element_dtype: str,
+    weight_layout: str,
+    w13_layout: str,
+    expert_map: torch.Tensor | None = None,
+) -> bool:
+    if os.environ.get("B12X_W4A16_SMALL_M_DIRECT", "1") == "0":
+        return False
+    if activation not in {"silu", "relu2"}:
+        return False
+    return (
+        element_dtype == "bf16"
+        and weight_layout == "modelopt"
+        and w13_layout == "w13"
+        and not bool(apply_router_weight_on_input)
+        and swiglu_limit is None
+        and expert_map is None
+        and _W4A16SmallMDirectKernel.is_supported(
+            m=m,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            topk=topk,
+            num_experts=num_experts,
+        )
+    )
+
+
+def _compile_w4a16_small_m_direct(
+    *,
+    m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    activation: str,
+    fast_math: bool,
+    topk_ids_dtype: torch.dtype,
+    device: torch.device | None,
+) -> _W4A16SmallMDirectLaunch:
+    if topk_ids_dtype not in (torch.int32, torch.int64):
+        raise TypeError("small-M W4A16 direct path requires int32/int64 topk_ids")
+    cache_key = (
+        "w4a16_small_m_direct",
+        None if device is None else int(device.index or 0),
+        int(m),
+        int(hidden_size),
+        int(intermediate_size),
+        int(num_experts),
+        int(topk),
+        activation,
+        bool(fast_math),
+        topk_ids_dtype,
+    )
+    cached = _SMALL_M_DIRECT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    kernel = _W4A16SmallMDirectKernel(
+        activation=activation,
+        fast_math=bool(fast_math),
+        share_input_across_experts=(int(m) == 1),
+        share_expert_scales=True,
+        single_token=(int(m) == 1),
+    )
+    kernel.configure(
+        int(m),
+        int(hidden_size),
+        int(intermediate_size),
+        int(topk),
+        int(num_experts),
+        device=device,
+    )
+
+    def dummy(dt):
+        return make_ptr(dt, 16, cute.AddressSpace.gmem, assumed_align=16)
+
+    ids_dtype = cutlass.Int32 if topk_ids_dtype == torch.int32 else cutlass.Int64
+    barrier_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32,
+        (1,),
+        assumed_align=4,
+    )
+    raise_if_kernel_resolution_frozen(
+        "cute.compile", target=kernel, cache_key=cache_key
+    )
+    compiled = cute.compile(
+        kernel,
+        dummy(cutlass.BFloat16),
+        dummy(cutlass.Uint8),
+        dummy(cutlass.Uint8),
+        dummy(cutlass.Float32),
+        dummy(cutlass.Float32),
+        dummy(cutlass.Float32),
+        dummy(cutlass.Uint32),
+        dummy(cutlass.Uint8),
+        dummy(cutlass.Uint8),
+        dummy(cutlass.Float32),
+        dummy(ids_dtype),
+        dummy(cutlass.Float32),
+        dummy(cutlass.BFloat16),
+        barrier_fake,
+        barrier_fake,
+        Int32(m),
+        Int32(kernel.grid_x),
+        current_cuda_stream(),
+    )
+    launch = _W4A16SmallMDirectLaunch(
+        compiled=compiled,
+        grid_x=int(kernel.grid_x),
+        m=int(m),
+        hidden_size=int(hidden_size),
+        intermediate_size=int(intermediate_size),
+        num_experts=int(num_experts),
+        topk=int(topk),
+        activation=activation,
+        fast_math=bool(fast_math),
+        topk_ids_dtype=topk_ids_dtype,
+    )
+    _SMALL_M_DIRECT_CACHE[cache_key] = launch
+    return launch
 
 
 def compile_w4a16_gemm(
@@ -3653,6 +4050,7 @@ def compile_w4a16_fused_moe(
     swiglu_limit: float | None = None,
     weight_layout: str = "packed",
     scale_format: str = "e4m3_k16",
+    w13_layout: str = "w13",
     direct_topk_routes: bool = False,
 ) -> W4A16FusedMoeCompileResult:
     scale_format = _normalize_scale_format(scale_format)
@@ -3664,6 +4062,11 @@ def compile_w4a16_fused_moe(
         raise ValueError("swiglu_limit requires a gated W4A16 activation")
     if weight_layout not in _WEIGHT_LAYOUTS:
         raise ValueError(f"unsupported W4A16 weight_layout {weight_layout!r}")
+    if weight_layout == "modelopt":
+        if w13_layout not in _MODEL_OPT_W13_LAYOUTS:
+            raise ValueError(f"unsupported W4A16 w13_layout {w13_layout!r}")
+    else:
+        w13_layout = "packed"
     direct_topk_routes = bool(direct_topk_routes)
     if direct_topk_routes and (
         int(size_m) > _MAX_DIRECT_TOPK_ROUTE_M
@@ -3744,6 +4147,7 @@ def compile_w4a16_fused_moe(
         swiglu_limit=swiglu_limit,
         weight_layout=weight_layout,
         scale_format=scale_format,
+        w13_layout=w13_layout,
         direct_topk_routes=direct_topk_routes,
     )
     cache_key = (
@@ -3760,6 +4164,32 @@ def compile_w4a16_fused_moe(
             blocks_per_sm=kernel.blocks_per_sm,
         )
 
+    if _small_m_direct_supported(
+        m=size_m,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        topk=top_k,
+        activation=activation,
+        apply_router_weight_on_input=bool(apply_router_weight_on_input),
+        swiglu_limit=swiglu_limit,
+        element_dtype=element_dtype,
+        weight_layout=weight_layout,
+        w13_layout=w13_layout,
+    ):
+        for ids_dtype in (torch.int32, torch.int64):
+            _compile_w4a16_small_m_direct(
+                m=size_m,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                num_experts=num_experts,
+                topk=top_k,
+                activation=activation,
+                fast_math=fast_math,
+                topk_ids_dtype=ids_dtype,
+                device=torch.device("cuda", device) if device is not None else None,
+            )
+
     compile_size_m = _fake_m_for_specialization(size_m)
     compile_routed_rows = int(compile_size_m) * int(top_k)
     compile_route_blocks = compile_routed_rows if direct_topk_routes else 1
@@ -3770,16 +4200,28 @@ def compile_w4a16_fused_moe(
         else compile_route_slots
     )
     a_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    w13_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (num_experts * (hidden_size // 16) * (fc1_cols // 16 * 32),),
-        assumed_align=16,
-    )
-    w2_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (num_experts * (intermediate_size // 16) * (hidden_size // 16 * 32),),
-        assumed_align=16,
-    )
+    if weight_layout == "modelopt":
+        w13_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Uint8,
+            (num_experts * fc1_cols * (hidden_size // 2),),
+            assumed_align=16,
+        )
+        w2_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Uint8,
+            (num_experts * hidden_size * (intermediate_size // 2),),
+            assumed_align=16,
+        )
+    else:
+        w13_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (num_experts * (hidden_size // 16) * (fc1_cols // 16 * 32),),
+            assumed_align=16,
+        )
+        w2_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (num_experts * (intermediate_size // 16) * (hidden_size // 16 * 32),),
+            assumed_align=16,
+        )
     fc1_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
         (compile_routed_rows * fc1_cols,),
@@ -3923,6 +4365,7 @@ def compile_w4a16_fused_moe(
         max_m_blocks=max_m_blocks,
         blocks_per_sm=kernel.blocks_per_sm,
         weight_layout=weight_layout,
+        w13_layout=w13_layout,
         direct_topk_routes=kernel.direct_topk_routes,
         scale_format=scale_format,
     )
@@ -3935,6 +4378,7 @@ def clear_w4a16_kernel_cache() -> None:
     _FUSED_CACHE.clear()
     _ACTIVATION_CACHE.clear()
     _SUM_CACHE.clear()
+    _SMALL_M_DIRECT_CACHE.clear()
 
 
 def compile_w4a16_activation(
@@ -4241,6 +4685,16 @@ def run_w4a16_moe(
     if weight_layout not in _WEIGHT_LAYOUTS:
         raise ValueError(f"unsupported W4A16 weight_layout {weight_layout!r}")
     scale_format = _normalize_scale_format(getattr(prepared, "scale_format", "e4m3_k16"))
+    w13_layout = getattr(
+        prepared,
+        "w13_layout",
+        "w13" if weight_layout == "modelopt" else "packed",
+    )
+    if weight_layout == "modelopt":
+        if w13_layout not in _MODEL_OPT_W13_LAYOUTS:
+            raise ValueError(f"unsupported W4A16 w13_layout {w13_layout!r}")
+    else:
+        w13_layout = "packed"
     if topk_weights.dtype != torch.float32:
         raise TypeError("topk_weights must be torch.float32")
     _validate_topk_ids(topk_ids, require_cuda=False, require_contiguous=False)
@@ -4276,6 +4730,92 @@ def run_w4a16_moe(
         raise ValueError(f"unsupported W4A16 moe_block_size={block_size_m}")
 
     stream = current_cuda_stream() if stream is None else stream
+    if _small_m_direct_supported(
+        m=m,
+        hidden_size=hidden_size,
+        intermediate_size=int(prepared.intermediate_size),
+        num_experts=int(prepared.num_experts),
+        topk=topk,
+        activation=activation,
+        apply_router_weight_on_input=bool(apply_router_weight_on_input),
+        swiglu_limit=swiglu_limit,
+        element_dtype=element_dtype,
+        weight_layout=weight_layout,
+        w13_layout=w13_layout,
+        expert_map=expert_map,
+    ):
+        if topk_ids.dtype not in (torch.int32, torch.int64):
+            raise TypeError("W4A16 small-M direct path requires int32/int64 topk_ids")
+        if not topk_ids.is_cuda:
+            raise ValueError("W4A16 small-M direct path requires CUDA topk_ids")
+        if not intermediate_cache2.is_contiguous() or not output.is_contiguous():
+            raise ValueError(
+                "W4A16 small-M direct path requires contiguous intermediate_cache2 and output"
+            )
+        if intermediate_cache2.dtype != a_input.dtype:
+            raise TypeError(f"intermediate_cache2 must be {a_input.dtype}")
+        if int(prepared.workspace.numel()) < 2:
+            raise ValueError("prepared W4A16 workspace is too small for small-M direct")
+        intermediate_size = int(prepared.intermediate_size)
+        fc2_n_chunks = ((intermediate_size // 2) + 127) // 128
+        inter_u32_per_m = fc2_n_chunks * 128 * topk
+        inter_u32 = intermediate_cache2.view(-1).view(torch.uint32)
+        if int(inter_u32.numel()) < m * inter_u32_per_m:
+            raise ValueError(
+                "intermediate_cache2 is smaller than the W4A16 small-M direct scratch "
+                f"requirement: have_u32={int(inter_u32.numel())}, "
+                f"need_u32={m * inter_u32_per_m}"
+            )
+        direct_launch = _compile_w4a16_small_m_direct(
+            m=m,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=int(prepared.num_experts),
+            topk=topk,
+            activation=activation,
+            fast_math=bool(fast_math),
+            topk_ids_dtype=topk_ids.dtype,
+            device=a_input.device,
+        )
+        micro_w13_scale = getattr(prepared, "micro_w13_scale", None)
+        micro_w2_scale = getattr(prepared, "micro_w2_scale", None)
+        micro_w13_global = getattr(prepared, "micro_w13_global_scale", None)
+        micro_w2_global = getattr(prepared, "micro_w2_global_scale", None)
+        if (
+            micro_w13_scale is None
+            or micro_w2_scale is None
+            or micro_w13_global is None
+            or micro_w2_global is None
+        ):
+            raise RuntimeError(
+                "W4A16 small-M direct path requires native ModelOpt micro scale metadata"
+            )
+        barrier_count = prepared.workspace[-2:-1]
+        barrier_epoch = prepared.workspace[-1:]
+        barrier_count.zero_()
+        barrier_epoch.zero_()
+        MoEMicroKernelBackend.launch(
+            direct_launch.compiled,
+            x=a_input,
+            w1_fp4=prepared.w13.view(torch.uint8),
+            w1_blockscale=micro_w13_scale,
+            w1_alphas=micro_w13_global,
+            a1_gscale=micro_w13_global,
+            a2_gscale=micro_w2_global,
+            inter_fp32=inter_u32[: m * inter_u32_per_m],
+            w2_fp4=prepared.w2.view(torch.uint8),
+            w2_blockscale=micro_w2_scale,
+            w2_alphas=micro_w2_global,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            out=output,
+            barrier_count=barrier_count,
+            barrier_epoch=barrier_epoch,
+            m=m,
+            grid_x=direct_launch.grid_x,
+        )
+        return output
+
     direct_topk_eligible = (
         m <= _MAX_DIRECT_TOPK_ROUTE_M
         and weight_layout == "packed"
@@ -4405,6 +4945,7 @@ def run_w4a16_moe(
             swiglu_limit=swiglu_limit,
             weight_layout=weight_layout,
             scale_format=scale_format,
+            w13_layout=w13_layout,
             direct_topk_routes=use_direct_topk_routes,
         )
     else:
@@ -4426,6 +4967,7 @@ def run_w4a16_moe(
             swiglu_limit,
             weight_layout,
             scale_format,
+            w13_layout,
             bool(use_direct_topk_routes),
             block_size_m,
         )
@@ -4442,6 +4984,13 @@ def run_w4a16_moe(
             fused_launch.swiglu_limit,
             getattr(fused_launch, "weight_layout", "packed"),
             getattr(fused_launch, "scale_format", "e4m3_k16"),
+            getattr(
+                fused_launch,
+                "w13_layout",
+                "w13"
+                if getattr(fused_launch, "weight_layout", "packed") == "modelopt"
+                else "packed",
+            ),
             bool(getattr(fused_launch, "direct_topk_routes", False)),
             int(fused_launch.moe_block_size),
         )
@@ -4489,8 +5038,12 @@ def run_w4a16_moe(
         device=a_input.device,
         scratch=fc2_c_tmp,
     )
-    w13_arg = prepared.w13.view(torch.int32).view(-1)
-    w2_arg = prepared.w2.view(torch.int32).view(-1)
+    if weight_layout == "modelopt":
+        w13_arg = prepared.w13.view(torch.uint8).view(-1)
+        w2_arg = prepared.w2.view(torch.uint8).view(-1)
+    else:
+        w13_arg = prepared.w13.view(torch.int32).view(-1)
+        w2_arg = prepared.w2.view(torch.int32).view(-1)
     fused.compiled(
         make_ptr(
             _cutlass_element_dtype(element_dtype),

@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from b12x.cute.fp4 import swizzle_block_scale
+import b12x.integration.tp_moe as tp_moe
 from b12x.integration.tp_moe import (
     allocate_tp_moe_workspace_pool,
     b12x_moe_fp4,
@@ -681,6 +682,61 @@ def test_integration_modelopt_nvfp4_preparation_uses_raw_weight_global_scales(
     torch.testing.assert_close(prepared.w1_runtime_alphas, w13_alphas / a1_gscale)
     torch.testing.assert_close(prepared.w2_runtime_alphas, w2_alphas / a2_gscale)
     assert actual.weight_layout == "packed"
+    assert actual.source_format == "modelopt_nvfp4"
+    for name in (
+        "w13",
+        "w13_scale",
+        "w13_global_scale",
+        "w2",
+        "w2_scale",
+        "w2_global_scale",
+    ):
+        assert torch.equal(getattr(actual, name), getattr(expected, name)), name
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_modelopt_nvfp4_gate_up_source_does_not_rotate_gated_w13_twice() -> None:
+    torch.manual_seed(20260524)
+    experts, hidden_size, intermediate_size = 3, 128, 128
+    w13, w13_blockscale, w2, w2_blockscale = _make_case(
+        experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation="silu",
+    )
+    w13_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
+        torch.float32
+    )
+    w2_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
+        torch.float32
+    )
+
+    half = intermediate_size
+    b12x_w13 = torch.cat([w13[:, half:], w13[:, :half]], dim=1).contiguous()
+    b12x_w13_blockscale = torch.cat(
+        [w13_blockscale[:, half:], w13_blockscale[:, :half]], dim=1
+    ).contiguous()
+
+    expected = prepare_w4a16_weights(
+        w13,
+        w13_blockscale,
+        w13_global_scale,
+        w2,
+        w2_blockscale,
+        w2_global_scale,
+        activation="silu",
+    )
+    actual = prepare_w4a16_weights(
+        b12x_w13,
+        b12x_w13_blockscale,
+        w13_global_scale,
+        w2,
+        w2_blockscale,
+        w2_global_scale,
+        activation="silu",
+        w13_layout="gate_up",
+    )
+
     assert actual.source_format == "modelopt_nvfp4"
     for name in (
         "w13",

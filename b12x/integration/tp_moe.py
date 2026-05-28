@@ -76,6 +76,10 @@ _W4A16_SCALE_FORMATS = {
 _W13_LAYOUTS = {
     "w13": "w13",
     "w31": "w31",
+    # Accept the physical FC1-half spellings as aliases; "up_gate" needs the
+    # in-place W13 row rotation ("w13"), "gate_up" is already kernel-native.
+    "up_gate": "w13",
+    "gate_up": "w31",
 }
 
 
@@ -751,8 +755,8 @@ def _normalize_w13_layout(w13_layout: str) -> str:
         return _W13_LAYOUTS[w13_layout.lower()]
     except KeyError as exc:
         raise ValueError(
-            "w13_layout must be one of 'w13' or 'w31', "
-            f"got {w13_layout!r}"
+            "w13_layout must be one of 'w13'/'w31' (or the 'up_gate'/'gate_up' "
+            f"aliases), got {w13_layout!r}"
         ) from exc
 
 
