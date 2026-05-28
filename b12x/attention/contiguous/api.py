@@ -14,7 +14,7 @@ from cutlass import Int32
 from b12x.attention.contiguous.forward import ContiguousAttentionForwardKernel
 from b12x.cute.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x.cute.utils import current_cuda_stream, make_ptr
-from b12x.scratch import B12XScratchBufferSpec, scratch_buffer_spec, scratch_tensor
+from b12x.cute.scratch import B12XScratchBufferSpec, scratch_buffer_spec, scratch_tensor
 
 
 _ARENA_ALIGN_BYTES = 1024

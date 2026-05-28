@@ -21,7 +21,7 @@ from b12x.cute.fp4 import (
 )
 from b12x.cute.compiler import KernelCompileSpec, launch as b12x_launch
 from b12x.cute.utils import current_cuda_stream
-from b12x.scratch import B12XScratchBufferSpec, scratch_buffer_spec, scratch_tensor
+from b12x.cute.scratch import B12XScratchBufferSpec, scratch_buffer_spec, scratch_tensor
 
 from .tiled_topk import (
     _convert_to_uint32,

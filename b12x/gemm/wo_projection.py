@@ -15,7 +15,7 @@ from b12x.attention.workspace import (
     _wo_mxfp8_scale_physical_shape,
 )
 from b12x.gemm.dense import dense_gemm
-from b12x.scratch import B12XScratchBufferSpec, scratch_buffer_spec, scratch_tensor
+from b12x.cute.scratch import B12XScratchBufferSpec, scratch_buffer_spec, scratch_tensor
 
 FP8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
 MXFP8_SCALE_VEC_SIZE = 32

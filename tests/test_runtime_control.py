@@ -5,7 +5,7 @@ import cutlass.cute as cute
 
 import b12x
 import b12x.cute.compiler as cute_compiler
-import b12x.runtime_control as runtime_control
+import b12x.cute.runtime_control as runtime_control
 from b12x.cute.compiler import KernelCompileSpec
 
 

@@ -25,7 +25,7 @@ from b12x.gemm.wo_projection import (
     empty_mxfp8_rows_for_dense_gemm,
     pack_fp8_block_scaled_weight_mxfp8,
 )
-from b12x.scratch import B12XScratchBufferSpec, scratch_buffer_spec, scratch_tensor
+from b12x.cute.scratch import B12XScratchBufferSpec, scratch_buffer_spec, scratch_tensor
 
 logger = logging.getLogger(__name__)
 _B12X_TIMING = os.getenv("B12X_TIMING", "0") == "1" or os.getenv(

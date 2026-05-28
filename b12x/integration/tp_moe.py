@@ -43,8 +43,8 @@ from b12x.moe.fused.micro import (
     _direct_k_segments_supported,
 )
 from b12x.moe.tuning import lookup_max_active_clusters
-from b12x.runtime_control import raise_if_kernel_resolution_frozen
-from b12x.scratch import B12XScratchBufferSpec, scratch_buffer_spec, scratch_tensor
+from b12x.cute.runtime_control import raise_if_kernel_resolution_frozen
+from b12x.cute.scratch import B12XScratchBufferSpec, scratch_buffer_spec, scratch_tensor
 
 logger = logging.getLogger(__name__)
 _B12X_TIMING = os.getenv("B12X_TIMING", "0") == "1" or os.getenv(

@@ -1,6 +1,6 @@
 """Integration re-export for shared caller-owned scratch plan helpers."""
 
-from b12x.scratch import (
+from b12x.cute.scratch import (
     B12XScratchBufferSpec,
     scratch_buffer_spec,
     scratch_tensor,

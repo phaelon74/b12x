@@ -1,7 +1,7 @@
 """Public b12x package surface."""
 
 from .cute.runtime_patches import apply_cutlass_runtime_patches
-from .runtime_control import (
+from .cute.runtime_control import (
     KernelResolutionFrozenError,
     compilation_frozen,
     freeze_compilation,

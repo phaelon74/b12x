@@ -1266,7 +1266,7 @@ def compile(
 
     with _MEMORY_CACHE_LOCK:
         _COMPILE_MISSES += 1
-    from b12x.runtime_control import raise_if_kernel_resolution_frozen
+    from b12x.cute.runtime_control import raise_if_kernel_resolution_frozen
 
     raise_if_kernel_resolution_frozen(
         "cute.compile",
