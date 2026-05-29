@@ -753,16 +753,33 @@ def _w4a16_scale_format_for_source(source_format: str) -> str:
     return "e8m0_k32" if source_format == "fp4_e8m0_k32" else "e4m3_k16"
 
 
-def _w4a16_weight_layout_for_source(source_format: str) -> str:
-    """W4A16 weight layout implied by the FP4 source format.
+_W4A16_E8M0_MICRO_ENV = "B12X_W4A16_E8M0_MICRO"
 
-    E8M0 K/32 weights stay native (``modelopt``) so a single copy serves both
-    the small-M micro decode kernel and the med/large-M main GEMM; NVFP4 sources
-    are repacked (``packed``). Must mirror ``_get_w4a16_packed_weights`` so the
-    plan-time launch and the runtime ``prepared.weight_layout`` agree.
+
+def _w4a16_e8m0_micro_enabled() -> bool:
+    """Opt-in: route E8M0 W4A16 small M through the micro decode kernel.
+
+    Default off keeps E8M0 in the packed main-GEMM path (the prior, well-tuned
+    behavior with no prefill regression). When ``B12X_W4A16_E8M0_MICRO`` is set,
+    E8M0 weights are kept native (``modelopt``) so small M routes to micro and
+    med/large M to the main GEMM from a single copy.
+    """
+    return _env_flag(_W4A16_E8M0_MICRO_ENV, default=False)
+
+
+def _w4a16_weight_layout_for_source(source_format: str) -> str:
+    """W4A16 weight layout implied by the FP4 source format (+ micro opt-in).
+
+    With the micro opt-in set, E8M0 K/32 weights stay native (``modelopt``) so a
+    single copy serves both the small-M micro decode kernel and the med/large-M
+    main GEMM. Otherwise (and for NVFP4 sources) weights are repacked
+    (``packed``). Must mirror ``_get_w4a16_packed_weights`` so the plan-time
+    launch and the runtime ``prepared.weight_layout`` agree.
     """
     source_format = _normalize_fp4_source_format(source_format)
-    return "modelopt" if source_format == "fp4_e8m0_k32" else "packed"
+    if source_format == "fp4_e8m0_k32" and _w4a16_e8m0_micro_enabled():
+        return "modelopt"
+    return "packed"
 
 
 _W4A16_WEIGHT_LAYOUTS = {"packed", "modelopt"}
@@ -1943,11 +1960,12 @@ def _get_w4a16_packed_weights(
     cached = _W4A16_PACKED_WEIGHT_CACHE.get(key)
     if cached is not None:
         return cached
-    if source_format == "fp4_e8m0_k32":
-        # Native (weight_layout="modelopt") single-copy object so small-M decode
-        # routes to the micro kernel and med/large M to the main W4A16 GEMM. The
-        # E8M0 scale grid is byte-identical to the packed path (both pack via
-        # _pack_e8m0_k32_scales), so this only changes the weight layout.
+    if source_format == "fp4_e8m0_k32" and _w4a16_e8m0_micro_enabled():
+        # Opt-in (B12X_W4A16_E8M0_MICRO): native weight_layout="modelopt"
+        # single-copy object so small-M decode routes to the micro kernel and
+        # med/large M to the main W4A16 GEMM. The E8M0 scale grid is
+        # byte-identical to the packed path (both pack via _pack_e8m0_k32_scales),
+        # so this only changes the weight layout. Default off keeps E8M0 packed.
         prepared = prepare_w4a16_e8m0_native_weights(
             w1_fp4,
             w1_blockscale,
