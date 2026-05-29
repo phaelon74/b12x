@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import torch
+import cutlass.cute as cute
 
-from b12x.attention.paged.api import _get_cached_plane_tma_descs, _run_cached_host_launcher
+import b12x.cute.compiler as cute_compiler
+from b12x.attention.paged.api import _get_cached_plane_tma_descs
+from b12x.cute.compiler import KernelCompileSpec
 
 
 class _WorkspaceStub:
@@ -74,44 +77,56 @@ def test_plane_tma_descriptor_cache_keeps_distinct_layer_bindings() -> None:
     ) == (k_desc_2, v_desc_2, k_ptrs_2, v_ptrs_2)
 
 
-def test_cached_host_launcher_warms_compile_cache_during_capture(monkeypatch) -> None:
+def test_explicit_compile_spec_warms_compile_cache_during_capture(monkeypatch) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setenv("B12X_CUTE_COMPILE_DISK_CACHE", "0")
+    monkeypatch.delenv("B12X_CUTE_COMPILE_MEMORY_CACHE", raising=False)
+    cute_compiler.clear_compile_cache()
 
     class _Compiled:
         def __init__(self) -> None:
-            self.generate_calls = 0
-            self.run_calls = 0
+            self.calls = 0
 
-        def generate_execution_args(self, *args):
-            self.generate_calls += 1
-            return args, None
+        def __call__(self, *args):
+            self.calls += 1
+            assert args == ("arg",)
 
-        def run_compiled_program(self, exe_args) -> None:
-            self.run_calls += 1
-            assert exe_args == ("arg",)
+    def fake_compile(kernel, *args, **kwargs):
+        kernel.compile_calls += 1
+        assert args == ("compile-arg",)
+        assert kwargs == {}
+        return kernel.compiled
+
+    monkeypatch.setattr(cute, "compile", fake_compile)
 
     class _Kernel:
         def __init__(self) -> None:
-            self.compile_only_calls = 0
-            self.raw_launch_calls = 0
+            self.compile_calls = 0
             self.compiled = _Compiled()
 
-        def __call__(self, *args, compile_only: bool = False):
-            if compile_only:
-                self.compile_only_calls += 1
-                assert args == ("arg",)
-                return self.compiled
-            self.raw_launch_calls += 1
+        def __call__(self, *args):
             assert args == ("arg",)
             return None
 
     kernel = _Kernel()
-    cache_key = ("shape-only",)
+    compile_spec = KernelCompileSpec.from_fields(
+        "test.paged.launch",
+        1,
+        ("shape", "shape-only"),
+    )
 
-    _run_cached_host_launcher(kernel, cache_key, ("arg",))
-    _run_cached_host_launcher(kernel, cache_key, ("arg",))
+    cute_compiler.launch(
+        kernel,
+        compile_spec=compile_spec,
+        compile_args=("compile-arg",),
+        runtime_args=("arg",),
+    )
+    cute_compiler.launch(
+        kernel,
+        compile_spec=compile_spec,
+        compile_args=("different-compile-arg",),
+        runtime_args=("arg",),
+    )
 
-    assert kernel.compile_only_calls == 1
-    assert kernel.raw_launch_calls == 2
-    assert kernel.compiled.generate_calls == 0
-    assert kernel.compiled.run_calls == 0
+    assert kernel.compile_calls == 1
+    assert kernel.compiled.calls == 2

@@ -138,10 +138,11 @@ def test_sparse_moe_fp4_accepts_precomputed_router_logits() -> None:
         activation="silu",
         quant_mode="nvfp4",
         source_format="modelopt_nvfp4",
+        w13_layout="w13",
     ):
         del a1_gscale, w1_fp4, w1_blockscale, w1_alphas
         del a2_gscale, w2_fp4, w2_blockscale, w2_alphas
-        del input_scales_static, fast_math, activation, quant_mode, source_format
+        del input_scales_static, fast_math, activation, quant_mode, source_format, w13_layout
         captured["a"] = a
         captured["topk_weights"] = topk_weights
         captured["topk_ids"] = topk_ids
@@ -195,6 +196,7 @@ def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
         activation="silu",
         quant_mode="nvfp4",
         source_format="modelopt_nvfp4",
+        w13_layout="w13",
     ):
         del args
         captured["workspace"] = workspace
@@ -204,6 +206,7 @@ def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
         captured["activation"] = activation
         captured["quant_mode"] = quant_mode
         captured["source_format"] = source_format
+        captured["w13_layout"] = w13_layout
         if output is None:
             return torch.ones_like(hidden_states)
         output.fill_(1.0)
@@ -232,6 +235,7 @@ def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
         "activation": "silu",
         "quant_mode": "w4a16",
         "source_format": "compressed_tensors",
+        "w13_layout": "w13",
     }
 
 
@@ -370,9 +374,10 @@ def test_sparse_moe_fp4_env_defaults_to_w4a16(monkeypatch) -> None:
         activation="silu",
         quant_mode=None,
         source_format="modelopt_nvfp4",
+        w13_layout="w13",
     ):
         del args, workspace, output
-        del input_scales_static, fast_math, activation, source_format
+        del input_scales_static, fast_math, activation, source_format, w13_layout
         captured.append(quant_mode)
         return torch.ones_like(hidden_states)
 

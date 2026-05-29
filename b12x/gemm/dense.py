@@ -29,6 +29,7 @@
 # This file is ported from the CUTLASS dense block-scaled GEMM example
 # and adapted for the current Blackwell GeForce target.
 
+from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Type
 
 import cuda.bindings.driver as cuda
@@ -40,12 +41,16 @@ import cutlass.utils.blackwell_helpers as sm120_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 import cutlass.utils.hopper_helpers as sm90_utils
 import functools
+import logging
+import os
+import time
 import torch
 from cutlass import Int32
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.nvgpu.warp.mma import Field as WarpField
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 
+from b12x.cute.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x.cute.utils import (
     current_cuda_stream,
     cutlass_to_torch_dtype,
@@ -56,7 +61,18 @@ from b12x.cute.utils import (
     sm120_make_smem_layout_sfa,
     sm120_make_smem_layout_sfb,
 )
-from b12x.runtime_control import raise_if_kernel_resolution_frozen
+from b12x.cute.runtime_control import raise_if_kernel_resolution_frozen
+
+logger = logging.getLogger(__name__)
+_B12X_TIMING = os.getenv("B12X_TIMING", "0") == "1" or os.getenv(
+    "VLLM_B12X_TIMING", "0"
+) == "1"
+_B12X_TIMING_THRESHOLD_MS = float(
+    os.getenv(
+        "B12X_TIMING_THRESHOLD_MS",
+        os.getenv("VLLM_B12X_TIMING_THRESHOLD_MS", "0"),
+    )
+)
 
 
 # @dsl_user_op on PersistentTileSchedulerParams.__init__ can rename attributes
@@ -81,6 +97,58 @@ def _patched_extract(self):
 
 
 utils.PersistentTileSchedulerParams.__extract_mlir_values__ = _patched_extract
+
+
+@dataclass(frozen=True)
+class _DenseGemmPolicy:
+    single_work_tile_per_cta: bool
+    direct_one_m_tile_scheduler: bool
+    use_m1_non_tma: bool
+
+
+def _max_active_clusters_for(
+    cluster_shape_mn: Tuple[int, int],
+    sm_count: int,
+) -> int:
+    cluster_size = cluster_shape_mn[0] * cluster_shape_mn[1]
+    # For the default single-cluster launch, occupancy is bounded only by
+    # the SM count. Avoid the CUTLASS hardware-info probe here because it
+    # can fail on some driver/runtime combinations with INVALID_HANDLE
+    # while providing no additional information for cluster_size == 1.
+    return (
+        sm_count
+        if cluster_size == 1
+        else min(get_max_active_clusters(cluster_size), sm_count)
+    )
+
+
+def _dense_gemm_policy_for(
+    *,
+    m: int,
+    n: int,
+    l: int,
+    ab_dtype: Type[cutlass.Numeric],
+    mma_tiler_mn: Tuple[int, int],
+    cluster_shape_mn: Tuple[int, int],
+    sm_count: int,
+) -> _DenseGemmPolicy:
+    max_active_clusters = _max_active_clusters_for(cluster_shape_mn, sm_count)
+    tile_m, tile_n = mma_tiler_mn
+    one_work_tile_per_cta = (
+        ((m + tile_m - 1) // tile_m)
+        * ((n + tile_n - 1) // tile_n)
+        * l
+        <= max_active_clusters
+    )
+    direct_one_m_tile_scheduler = (
+        one_work_tile_per_cta and m < 16 and m <= tile_m and l == 1
+    )
+    use_m1_non_tma = ab_dtype == cutlass.Float8E4M3FN and m == 1
+    return _DenseGemmPolicy(
+        single_work_tile_per_cta=direct_one_m_tile_scheduler,
+        direct_one_m_tile_scheduler=direct_one_m_tile_scheduler,
+        use_m1_non_tma=use_m1_non_tma,
+    )
 
 
 class DenseGemmKernel:
@@ -1461,7 +1529,6 @@ class DenseGemmKernel:
         c_dtype,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
-        m: int,
         n: int,
         k: int,
         l: int,
@@ -1509,7 +1576,6 @@ class DenseGemmKernel:
 class _DenseGemmLaunch:
     def __init__(
         self,
-        m: int,
         n: int,
         k: int,
         l: int,
@@ -1525,10 +1591,10 @@ class _DenseGemmLaunch:
         tile_k: int,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
+        policy: _DenseGemmPolicy,
         sm_count: int,
         sm_version: str,
     ):
-        self._m = m
         self._n = n
         self._k = k
         self._l = l
@@ -1544,9 +1610,7 @@ class _DenseGemmLaunch:
         self._tile_k = tile_k
         self._mma_tiler_mn = mma_tiler_mn
         self._cluster_shape_mn = cluster_shape_mn
-
-        if sm_version != "sm_120":
-            raise ValueError(f"dense_gemm launch only supports sm_120, got {sm_version}")
+        self._policy = policy
 
         if not DenseGemmKernel.can_implement(
             ab_dtype,
@@ -1555,7 +1619,6 @@ class _DenseGemmLaunch:
             c_dtype,
             mma_tiler_mn,
             cluster_shape_mn,
-            m,
             n,
             k,
             l,
@@ -1566,19 +1629,12 @@ class _DenseGemmLaunch:
             raise TypeError(
                 "dense_gemm launch is unsupported with "
                 f"{ab_dtype}, {sf_dtype}, {sf_vec_size}, {c_dtype}, "
-                f"{mma_tiler_mn}, {cluster_shape_mn}, {m}, {n}, {k}, {l}, "
+                f"{mma_tiler_mn}, {cluster_shape_mn}, {n}, {k}, {l}, "
                 f"{a_major}, {b_major}, {c_major}"
             )
 
-        cluster_size = self._cluster_shape_mn[0] * self._cluster_shape_mn[1]
-        # For the default single-cluster launch, occupancy is bounded only by
-        # the SM count. Avoid the CUTLASS hardware-info probe here because it
-        # can fail on some driver/runtime combinations with INVALID_HANDLE
-        # while providing no additional information for cluster_size == 1.
-        self._max_active_clusters = (
-            sm_count
-            if cluster_size == 1
-            else min(get_max_active_clusters(cluster_size), sm_count)
+        self._max_active_clusters = _max_active_clusters_for(
+            self._cluster_shape_mn, sm_count
         )
 
     @cute.jit
@@ -1590,12 +1646,13 @@ class _DenseGemmLaunch:
         sfb_ptr: cute.Pointer,
         c_ptr: cute.Pointer,
         alpha_ptr: cute.Pointer,
+        m: cutlass.Int32,
         current_stream: cuda.CUstream,
     ):
         a_tensor = cute.make_tensor(
             a_ptr,
             layout=cute.make_ordered_layout(
-                (self._m, self._k, self._l),
+                (m, self._k, self._l),
                 order=(0, 1, 2) if self._a_major == "m" else (1, 0, 2),
             ),
         )
@@ -1609,7 +1666,7 @@ class _DenseGemmLaunch:
         c_tensor = cute.make_tensor(
             c_ptr,
             layout=cute.make_ordered_layout(
-                (self._m, self._n, self._l),
+                (m, self._n, self._l),
                 order=(0, 1, 2) if self._c_major == "m" else (1, 0, 2),
             ),
         )
@@ -1619,35 +1676,21 @@ class _DenseGemmLaunch:
         )
         sfa_tensor = cute.make_tensor(sfa_ptr, layout=cute.make_layout((1,)))
         sfb_tensor = cute.make_tensor(sfb_ptr, layout=cute.make_layout((1,)))
-        tile_m, tile_n = self._mma_tiler_mn
-        single_work_tile_per_cta = (
-            ((self._m + tile_m - 1) // tile_m)
-            * ((self._n + tile_n - 1) // tile_n)
-            * self._l
-            <= self._max_active_clusters
-        )
-        direct_one_m_tile_scheduler = (
-            single_work_tile_per_cta
-            and self._m < 16
-            and self._m <= tile_m
-            and self._l == 1
-        )
-
-        m1_fp8 = self._ab_dtype == cutlass.Float8E4M3FN and self._m == 1
+        policy = self._policy
         DenseGemmKernel(
             sf_vec_size=self._sf_vec_size,
             mma_tiler_mn=self._mma_tiler_mn,
             cluster_shape_mn=self._cluster_shape_mn,
             mma_k=self._mma_k,
             tile_k=self._tile_k,
-            single_work_tile_per_cta=single_work_tile_per_cta,
-            direct_one_m_tile_scheduler=direct_one_m_tile_scheduler,
+            single_work_tile_per_cta=policy.single_work_tile_per_cta,
+            direct_one_m_tile_scheduler=policy.direct_one_m_tile_scheduler,
             # The M=1 FP8 shape uses a 128-row MMA/TMA tile. In this lowering,
             # the narrow A/SFA/C tensor-map paths illegal-instruction instead
             # of relying on OOB handling, so keep them as explicit direct paths.
-            use_m1_non_tma_a=m1_fp8,
-            use_m1_non_tma_c=m1_fp8,
-            use_m1_non_tma_sfa=m1_fp8,
+            use_m1_non_tma_a=policy.use_m1_non_tma,
+            use_m1_non_tma_c=policy.use_m1_non_tma,
+            use_m1_non_tma_sfa=policy.use_m1_non_tma,
         )(
             a_tensor,
             b_tensor,
@@ -1662,7 +1705,6 @@ class _DenseGemmLaunch:
 
 @functools.cache
 def _get_compiled_dense_gemm(
-    m: int,
     n: int,
     k: int,
     l: int,
@@ -1678,6 +1720,7 @@ def _get_compiled_dense_gemm(
     tile_k: int,
     mma_tiler_mn: Tuple[int, int],
     cluster_shape_mn: Tuple[int, int],
+    policy: _DenseGemmPolicy,
     sm_count: int,
     sm_version: str,
 ) -> Callable:
@@ -1728,7 +1771,6 @@ def _get_compiled_dense_gemm(
         ]
 
     launch = _DenseGemmLaunch(
-        m=m,
         n=n,
         k=k,
         l=l,
@@ -1744,34 +1786,38 @@ def _get_compiled_dense_gemm(
         tile_k=tile_k,
         mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=cluster_shape_mn,
+        policy=policy,
         sm_count=sm_count,
         sm_version=sm_version,
+    )
+    compile_key = (
+        n,
+        k,
+        l,
+        ab_dtype,
+        sf_dtype,
+        c_dtype,
+        alpha_dtype,
+        sf_vec_size,
+        mma_k,
+        tile_k,
+        mma_tiler_mn,
+        cluster_shape_mn,
+        policy,
+        sm_count,
+        sm_version,
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile",
         target=launch,
-        cache_key=(
-            m,
-            n,
-            k,
-            l,
-            ab_dtype,
-            sf_dtype,
-            c_dtype,
-            alpha_dtype,
-            sf_vec_size,
-            mma_k,
-            tile_k,
-            mma_tiler_mn,
-            cluster_shape_mn,
-            sm_count,
-            sm_version,
-        ),
+        cache_key=compile_key,
     )
-    compiled_kernel = cute.compile(
+    compiled_kernel = b12x_compile(
         launch,
         *_make_runtime_pointers(None),
+        1,
         current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key("gemm.dense", 1, compile_key),
     )
 
     def tensor_api(
@@ -1782,6 +1828,7 @@ def _get_compiled_dense_gemm(
         c_tensor_gpu: Optional[torch.Tensor] = None,
         alpha_tensor_gpu: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        m = a_tensor_gpu.shape[0]
         if c_tensor_gpu is None:
             c_tensor_gpu = torch.empty(
                 (m, n, l),
@@ -1807,6 +1854,7 @@ def _get_compiled_dense_gemm(
                     alpha_tensor_gpu,
                 ]
             ),
+            m,
             current_cuda_stream(),
         )
         return c_tensor_gpu
@@ -1822,23 +1870,19 @@ def _select_default_mma_tiler_mn(
     is_mxfp8: bool,
 ) -> Tuple[int, int]:
     coarse_tile = (128, 128)
+    if is_mxfp8 and n > 1536:
+        # Keep the true single-token decode specialization, but do not let
+        # ordinary live prefill tails choose compile-time-only small-M tiles.
+        # vLLM warms attention with large prefill shapes and then passes the
+        # live token count at launch; prefix-cache continuations can otherwise
+        # hit first-use compiles for m=16/32/128 during serving.
+        if m == 1:
+            return (16, 128)
+        return coarse_tile
+
     coarse_tiles = ((m + coarse_tile[0] - 1) // coarse_tile[0]) * (
         (n + coarse_tile[1] - 1) // coarse_tile[1]
     )
-    if is_mxfp8 and n > 1536 and m == 2:
-        return (16, 64)
-    if is_mxfp8 and n > 1536 and m == 32:
-        return (16, 64)
-    if is_mxfp8 and n > 1536 and m == 16:
-        return (16, 128)
-    if is_mxfp8 and n > 1536 and m == 1:
-        return (16, 128)
-    if is_mxfp8 and n > 1536 and m == 128:
-        return (32, 128)
-    if is_mxfp8 and n > 1536 and 1 < m <= 64:
-        return (32, 64)
-    if is_mxfp8 and n > 1536 and m <= 128:
-        return (64, 64)
     # The coarse CTA-count heuristic misses exact-small-M, wide-N cases: a wide
     # N dimension can generate plenty of CTAs even while each 128-row M tile is
     # mostly empty. Keep using the narrower 64x128 tile while the 128x128 plan
@@ -1896,6 +1940,9 @@ def dense_gemm(
 
     if sm_count is None:
         sm_count = get_num_sm(a_torch.device)
+    ab_cutlass_dtype = get_cutlass_dtype(ab_dtype)
+    sf_cutlass_dtype = get_cutlass_dtype(sf_dtype)
+    c_cutlass_dtype = get_cutlass_dtype(c_dtype)
     if mma_tiler_mn is None:
         mma_tiler_mn = _select_default_mma_tiler_mn(
             m,
@@ -1905,27 +1952,41 @@ def dense_gemm(
         )
     if alpha_dtype is None:
         alpha_dtype = "float32" if alpha is None else str(alpha.dtype).split(".")[-1]
-
-    return _get_compiled_dense_gemm(
+    alpha_cutlass_dtype = get_cutlass_dtype(alpha_dtype)
+    policy = _dense_gemm_policy_for(
         m=m,
+        n=n,
+        l=l,
+        ab_dtype=ab_cutlass_dtype,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        sm_count=sm_count,
+    )
+
+    t0 = time.perf_counter() if _B12X_TIMING else 0.0
+    cache_before = _get_compiled_dense_gemm.cache_info() if _B12X_TIMING else None
+    compiled = _get_compiled_dense_gemm(
         n=n,
         k=k,
         l=l,
         a_major="k",
         b_major="k",
         c_major="n",
-        ab_dtype=get_cutlass_dtype(ab_dtype),
-        sf_dtype=get_cutlass_dtype(sf_dtype),
-        c_dtype=get_cutlass_dtype(c_dtype),
-        alpha_dtype=get_cutlass_dtype(alpha_dtype),
+        ab_dtype=ab_cutlass_dtype,
+        sf_dtype=sf_cutlass_dtype,
+        c_dtype=c_cutlass_dtype,
+        alpha_dtype=alpha_cutlass_dtype,
         sf_vec_size=sf_vec_size,
         mma_k=mma_k,
         tile_k=tile_k,
         mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=cluster_shape_mn,
+        policy=policy,
         sm_count=sm_count,
         sm_version="sm_120",
-    )(
+    )
+    t_compiled = time.perf_counter() if _B12X_TIMING else 0.0
+    result = compiled(
         a_tensor_gpu=a_torch,
         b_tensor_gpu=b_torch,
         sfa_tensor_gpu=sfa_torch,
@@ -1933,3 +1994,30 @@ def dense_gemm(
         c_tensor_gpu=out,
         alpha_tensor_gpu=alpha,
     )
+    if _B12X_TIMING:
+        t_launch = time.perf_counter()
+        cache_after = _get_compiled_dense_gemm.cache_info()
+        assert cache_before is not None
+        compile_ms = (t_compiled - t0) * 1000.0
+        launch_ms = (t_launch - t_compiled) * 1000.0
+        total_ms = (t_launch - t0) * 1000.0
+        if total_ms >= _B12X_TIMING_THRESHOLD_MS:
+            logger.warning(
+                "b12x_dense_gemm timing m=%d n=%d k=%d l=%d ab=%s sf=%s c=%s "
+                "tile=%s cache_hit=%s compile_or_lookup=%.3fms "
+                "launch_enqueue=%.3fms total=%.3fms cache=%s",
+                m,
+                n,
+                k,
+                l,
+                ab_dtype,
+                sf_dtype,
+                c_dtype,
+                mma_tiler_mn,
+                cache_after.hits > cache_before.hits,
+                compile_ms,
+                launch_ms,
+                total_ms,
+                cache_after,
+            )
+    return result

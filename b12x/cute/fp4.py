@@ -1994,6 +1994,160 @@ def packed_dequant_e4m3x4_to_half2x2(
 
 
 @dsl_user_op
+def packed_dequant_e8m0x4_to_bfloat2x2(
+    packed: Uint32, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32]:
+    """E8M0 compute-scale dequant for one packed 4-value BF16 fragment.
+
+    The W4A16 FP4 unpack path represents E2M1 values scaled by 2^-126.  Match
+    the existing NVFP4 split by materializing E8M0 scales multiplied by 2^7 in
+    the MMA input and applying the remaining compensation in the kernel
+    epilogue.
+    """
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Uint32(packed).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .pred p;
+            .reg .u32 b0, b1, b2, b3;
+            .reg .u32 h0, h1, h2, h3;
+            .reg .u32 t0, t1;
+
+            and.b32 b0, $2, 0x000000ff;
+            shr.u32 b1, $2, 8;
+            and.b32 b1, b1, 0x000000ff;
+            shr.u32 b2, $2, 16;
+            and.b32 b2, b2, 0x000000ff;
+            shr.u32 b3, $2, 24;
+
+            add.u32 h0, b0, 7;
+            add.u32 h1, b1, 7;
+            add.u32 h2, b2, 7;
+            add.u32 h3, b3, 7;
+            shl.b32 h0, h0, 7;
+            shl.b32 h1, h1, 7;
+            shl.b32 h2, h2, 7;
+            shl.b32 h3, h3, 7;
+
+            setp.ge.u32 p, b0, 248;
+            selp.b32 h0, 0x00007f80, h0, p;
+            setp.ge.u32 p, b1, 248;
+            selp.b32 h1, 0x00007f80, h1, p;
+            setp.ge.u32 p, b2, 248;
+            selp.b32 h2, 0x00007f80, h2, p;
+            setp.ge.u32 p, b3, 248;
+            selp.b32 h3, 0x00007f80, h3, p;
+
+            setp.eq.u32 p, b0, 255;
+            selp.b32 h0, 0x00007fc0, h0, p;
+            setp.eq.u32 p, b1, 255;
+            selp.b32 h1, 0x00007fc0, h1, p;
+            setp.eq.u32 p, b2, 255;
+            selp.b32 h2, 0x00007fc0, h2, p;
+            setp.eq.u32 p, b3, 255;
+            selp.b32 h3, 0x00007fc0, h3, p;
+
+            shl.b32 t0, h2, 16;
+            or.b32 $0, h0, t0;
+            shl.b32 t1, h3, 16;
+            or.b32 $1, h1, t1;
+        }
+        """,
+        "=r,=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    lo = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    hi = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    return Uint32(lo), Uint32(hi)
+
+
+@dsl_user_op
+def packed_dequant_e8m0x4_to_half2x2(
+    packed: Uint32, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32]:
+    """E8M0 compute-scale dequant for one packed 4-value FP16 fragment."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Uint32(packed).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .pred p0, p1, p2, p3;
+            .reg .u32 b0, b1, b2, b3;
+            .reg .s32 e0, e1, e2, e3;
+            .reg .f32 ef0, ef1, ef2, ef3;
+            .reg .f32 f0, f1, f2, f3;
+            .reg .b16 h0, h1, h2, h3;
+
+            and.b32 b0, $2, 0x000000ff;
+            shr.u32 b1, $2, 8;
+            and.b32 b1, b1, 0x000000ff;
+            shr.u32 b2, $2, 16;
+            and.b32 b2, b2, 0x000000ff;
+            shr.u32 b3, $2, 24;
+
+            setp.eq.u32 p0, b0, 0;
+            setp.eq.u32 p1, b1, 0;
+            setp.eq.u32 p2, b2, 0;
+            setp.eq.u32 p3, b3, 0;
+
+            cvt.s32.u32 e0, b0;
+            cvt.s32.u32 e1, b1;
+            cvt.s32.u32 e2, b2;
+            cvt.s32.u32 e3, b3;
+            sub.s32 e0, e0, 120;
+            sub.s32 e1, e1, 120;
+            sub.s32 e2, e2, 120;
+            sub.s32 e3, e3, 120;
+
+            cvt.rn.f32.s32 ef0, e0;
+            cvt.rn.f32.s32 ef1, e1;
+            cvt.rn.f32.s32 ef2, e2;
+            cvt.rn.f32.s32 ef3, e3;
+            ex2.approx.f32 f0, ef0;
+            ex2.approx.f32 f1, ef1;
+            ex2.approx.f32 f2, ef2;
+            ex2.approx.f32 f3, ef3;
+            selp.f32 f0, 0f00000000, f0, p0;
+            selp.f32 f1, 0f00000000, f1, p1;
+            selp.f32 f2, 0f00000000, f2, p2;
+            selp.f32 f3, 0f00000000, f3, p3;
+
+            cvt.rn.f16.f32 h0, f0;
+            cvt.rn.f16.f32 h1, f1;
+            cvt.rn.f16.f32 h2, f2;
+            cvt.rn.f16.f32 h3, f3;
+
+            setp.eq.u32 p0, b0, 255;
+            setp.eq.u32 p1, b1, 255;
+            setp.eq.u32 p2, b2, 255;
+            setp.eq.u32 p3, b3, 255;
+            selp.b16 h0, 0x7e00, h0, p0;
+            selp.b16 h1, 0x7e00, h1, p1;
+            selp.b16 h2, 0x7e00, h2, p2;
+            selp.b16 h3, 0x7e00, h3, p3;
+
+            mov.b32 $0, {h0, h2};
+            mov.b32 $1, {h1, h3};
+        }
+        """,
+        "=r,=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    lo = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    hi = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    return Uint32(lo), Uint32(hi)
+
+
+@dsl_user_op
 def bf16_mma_m16n8k16_f32(
     d0: Float32,
     d1: Float32,
@@ -2814,6 +2968,104 @@ def cvt_e4m3_to_f32_via_f16(
             loc=loc,
             ip=ip,
         )
+    )
+
+
+@dsl_user_op
+def cvt_e8m0_to_f32(e8m0_val: Uint32, *, loc=None, ip=None) -> Float32:
+    """Convert a single E8M0 scale byte to its true f32 value 2**(byte-127).
+
+    Byte 0 maps to 0.0. Unlike packed_dequant_e8m0x4_* (which fold a 2**7 bias
+    into the MMA input), this returns the unbiased scale so callers can apply it
+    directly in an f32 accumulator.
+    """
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Uint32(e8m0_val).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .pred p0;
+                .reg .u32 b0;
+                .reg .s32 e0;
+                .reg .f32 ef0;
+                and.b32 b0, $1, 0x000000ff;
+                setp.eq.u32 p0, b0, 0;
+                cvt.s32.u32 e0, b0;
+                sub.s32 e0, e0, 127;
+                cvt.rn.f32.s32 ef0, e0;
+                ex2.approx.f32 $0, ef0;
+                selp.f32 $0, 0f00000000, $0, p0;
+            }
+            """,
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def cvt_e8m0x4_to_f32x4(
+    packed: Uint32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32, Float32, Float32]:
+    """Decode 4 E8M0 scale bytes (packed u32) to 4 x true f32 (2**(byte-127))."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [Uint32(packed).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .pred p0, p1, p2, p3;
+            .reg .u32 b0, b1, b2, b3;
+            .reg .s32 e0, e1, e2, e3;
+            .reg .f32 ef0, ef1, ef2, ef3;
+            and.b32 b0, $4, 0x000000ff;
+            shr.u32 b1, $4, 8;
+            and.b32 b1, b1, 0x000000ff;
+            shr.u32 b2, $4, 16;
+            and.b32 b2, b2, 0x000000ff;
+            shr.u32 b3, $4, 24;
+            setp.eq.u32 p0, b0, 0;
+            setp.eq.u32 p1, b1, 0;
+            setp.eq.u32 p2, b2, 0;
+            setp.eq.u32 p3, b3, 0;
+            cvt.s32.u32 e0, b0;
+            cvt.s32.u32 e1, b1;
+            cvt.s32.u32 e2, b2;
+            cvt.s32.u32 e3, b3;
+            sub.s32 e0, e0, 127;
+            sub.s32 e1, e1, 127;
+            sub.s32 e2, e2, 127;
+            sub.s32 e3, e3, 127;
+            cvt.rn.f32.s32 ef0, e0;
+            cvt.rn.f32.s32 ef1, e1;
+            cvt.rn.f32.s32 ef2, e2;
+            cvt.rn.f32.s32 ef3, e3;
+            ex2.approx.f32 $0, ef0;
+            ex2.approx.f32 $1, ef1;
+            ex2.approx.f32 $2, ef2;
+            ex2.approx.f32 $3, ef3;
+            selp.f32 $0, 0f00000000, $0, p0;
+            selp.f32 $1, 0f00000000, $1, p1;
+            selp.f32 $2, 0f00000000, $2, p2;
+            selp.f32 $3, 0f00000000, $3, p3;
+        }
+        """,
+        "=f,=f,=f,=f,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Float32(llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip)),
     )
 
 

@@ -12,8 +12,9 @@ from cutlass.base_dsl.dsl import BaseDSL
 from cutlass.base_dsl.jit_executor import ExecutionArgs
 from cutlass.cute.nvgpu.warp import mma
 
-import b12x.cute.runtime_patches as runtime_patches
-from b12x.cute.runtime_patches import (
+import b12x.cute.compiler as cute_compiler
+from b12x.cute.compiler import (
+    KernelCompileSpec,
     _build_compile_disk_cache_key,
     _compile_disk_cache_payload,
     _structural_cache_key,
@@ -91,6 +92,93 @@ def test_compile_disk_cache_key_ignores_pointer_address_and_stream_value() -> No
     assert key_a == key_b
 
 
+def test_explicit_compile_spec_ignores_full_compile_signature() -> None:
+    fake_a = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (4, 8), assumed_align=4)
+    fake_b = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (8, 8), assumed_align=4)
+    spec = KernelCompileSpec.from_fields(
+        "test.explicit",
+        1,
+        ("shape_bucket", "small"),
+    )
+
+    compile_callable = cute.compile
+
+    key_a = _build_compile_disk_cache_key(
+        compile_callable,
+        test_explicit_compile_spec_ignores_full_compile_signature,
+        (fake_a, 1),
+        {},
+        compile_spec=spec,
+    )
+    key_b = _build_compile_disk_cache_key(
+        compile_callable,
+        test_explicit_compile_spec_ignores_full_compile_signature,
+        (fake_b, 2),
+        {},
+        compile_spec=spec,
+    )
+
+    assert key_a == key_b
+
+
+def test_explicit_compile_spec_includes_compile_kwargs() -> None:
+    fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (4, 8), assumed_align=4)
+    spec = KernelCompileSpec.from_fields(
+        "test.explicit",
+        1,
+        ("shape_bucket", "small"),
+    )
+
+    compile_callable = cute.compile
+
+    key_a = _build_compile_disk_cache_key(
+        compile_callable,
+        test_explicit_compile_spec_includes_compile_kwargs,
+        (fake,),
+        {"options": "a"},
+        compile_spec=spec,
+    )
+    key_b = _build_compile_disk_cache_key(
+        compile_callable,
+        test_explicit_compile_spec_includes_compile_kwargs,
+        (fake,),
+        {"options": "b"},
+        compile_spec=spec,
+    )
+
+    assert key_a != key_b
+
+
+def test_explicit_compile_spec_changes_cache_key_when_policy_changes() -> None:
+    fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (4, 8), assumed_align=4)
+    compile_callable = cute.compile
+
+    key_a = _build_compile_disk_cache_key(
+        compile_callable,
+        test_explicit_compile_spec_changes_cache_key_when_policy_changes,
+        (fake,),
+        {},
+        compile_spec=KernelCompileSpec.from_fields(
+            "test.explicit",
+            1,
+            ("shape_bucket", "small"),
+        ),
+    )
+    key_b = _build_compile_disk_cache_key(
+        compile_callable,
+        test_explicit_compile_spec_changes_cache_key_when_policy_changes,
+        (fake,),
+        {},
+        compile_spec=KernelCompileSpec.from_fields(
+            "test.explicit",
+            1,
+            ("shape_bucket", "large"),
+        ),
+    )
+
+    assert key_a != key_b
+
+
 def test_compile_miss_log_includes_target_attrs_and_arg_shapes(
     capsys, monkeypatch
 ) -> None:
@@ -109,7 +197,7 @@ def test_compile_miss_log_includes_target_attrs_and_arg_shapes(
 
     fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (4, 8), assumed_align=4)
 
-    runtime_patches._log_cute_compile_miss(
+    cute_compiler._log_cute_compile_miss(
         FakeKernel(),
         (fake, 7),
         {},
@@ -140,7 +228,7 @@ def test_compile_miss_log_can_include_python_stack(capsys, monkeypatch) -> None:
             pass
 
     def call_logger() -> None:
-        runtime_patches._log_cute_compile_miss(
+        cute_compiler._log_cute_compile_miss(
             FakeKernel(),
             (),
             {},
@@ -186,7 +274,7 @@ def test_compile_disk_cache_key_changes_with_toolchain_key(monkeypatch) -> None:
     compile_callable = cute.compile
 
     monkeypatch.setattr(
-        runtime_patches,
+        cute_compiler,
         "_runtime_toolchain_key",
         lambda: (("cutlass_dsl", "4.5.0"),),
     )
@@ -198,7 +286,7 @@ def test_compile_disk_cache_key_changes_with_toolchain_key(monkeypatch) -> None:
     )
 
     monkeypatch.setattr(
-        runtime_patches,
+        cute_compiler,
         "_runtime_toolchain_key",
         lambda: (("cutlass_dsl", "4.5.1"),),
     )
@@ -210,6 +298,95 @@ def test_compile_disk_cache_key_changes_with_toolchain_key(monkeypatch) -> None:
     )
 
     assert key_a != key_b
+
+
+def test_b12x_compile_uses_memory_cache_when_disk_disabled(monkeypatch) -> None:
+    monkeypatch.setenv("B12X_CUTE_COMPILE_DISK_CACHE", "0")
+    monkeypatch.delenv("B12X_CUTE_COMPILE_MEMORY_CACHE", raising=False)
+    cute_compiler.clear_compile_cache()
+
+    calls = []
+
+    def fake_compile(func, *args, **kwargs):
+        calls.append((func, args, kwargs))
+        return object()
+
+    class FakeKernel:
+        def __call__(self) -> None:
+            pass
+
+    monkeypatch.setattr(cute, "compile", fake_compile)
+    kernel = FakeKernel()
+
+    compiled_a = cute_compiler.compile(kernel, 1, mode=True)
+    compiled_b = cute_compiler.compile(kernel, 1, mode=True)
+
+    assert compiled_a is compiled_b
+    assert len(calls) == 1
+    info = cute_compiler.compile_cache_info()
+    assert info["memory_cache_hits"] == 1
+    assert info["compile_misses"] == 1
+
+
+def test_b12x_compile_can_disable_memory_cache(monkeypatch) -> None:
+    monkeypatch.setenv("B12X_CUTE_COMPILE_DISK_CACHE", "0")
+    monkeypatch.setenv("B12X_CUTE_COMPILE_MEMORY_CACHE", "0")
+    cute_compiler.clear_compile_cache()
+
+    calls = []
+
+    def fake_compile(func, *args, **kwargs):
+        compiled = object()
+        calls.append(compiled)
+        return compiled
+
+    class FakeKernel:
+        def __call__(self) -> None:
+            pass
+
+    monkeypatch.setattr(cute, "compile", fake_compile)
+    kernel = FakeKernel()
+
+    compiled_a = cute_compiler.compile(kernel, 1)
+    compiled_b = cute_compiler.compile(kernel, 1)
+
+    assert compiled_a is not compiled_b
+    assert len(calls) == 2
+    assert cute_compiler.compile_cache_info()["memory_cache_size"] == 0
+
+
+def test_b12x_compile_disk_hit_populates_memory_cache(monkeypatch) -> None:
+    monkeypatch.delenv("B12X_CUTE_COMPILE_DISK_CACHE", raising=False)
+    monkeypatch.delenv("B12X_CUTE_COMPILE_MEMORY_CACHE", raising=False)
+    cute_compiler.clear_compile_cache()
+
+    compiled = object()
+    load_keys = []
+
+    def fake_load(cache_key):
+        load_keys.append(cache_key)
+        return compiled
+
+    def fail_compile(*args, **kwargs):
+        raise AssertionError("disk hit should not call cutlass compile")
+
+    class FakeKernel:
+        def __call__(self) -> None:
+            pass
+
+    monkeypatch.setattr(cute_compiler, "_load_cute_compile_from_disk", fake_load)
+    monkeypatch.setattr(cute, "compile", fail_compile)
+    kernel = FakeKernel()
+
+    compiled_a = cute_compiler.compile(kernel, 1)
+    compiled_b = cute_compiler.compile(kernel, 1)
+
+    assert compiled_a is compiled
+    assert compiled_b is compiled
+    assert len(load_keys) == 1
+    info = cute_compiler.compile_cache_info()
+    assert info["disk_cache_hits"] == 1
+    assert info["memory_cache_hits"] == 1
 
 
 def test_structural_cache_key_handles_symbolic_fake_compact_tensor_dims() -> None:

@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
+from dataclasses import dataclass
 from functools import lru_cache
 import os
-import warnings
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -17,6 +16,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.cute.runtime import from_dlpack
 
 from b12x.attention._cute import ops as attention_ops
+from b12x.cute.compiler import KernelCompileSpec, launch as b12x_launch
 from b12x.cute.fp4 import (
     bf16_mma_m16n16k16_f32,
     bfloat2_habs2,
@@ -44,7 +44,6 @@ from b12x.cute.fp4 import (
     st_shared_v4_u32,
     ue8m0_to_output_scale,
 )
-from b12x.runtime_control import raise_if_kernel_resolution_frozen
 from b12x.cute.utils import current_cuda_stream
 
 from .reference import _MLA_GROUP_SIZE, _MLA_NOPE_DIM, _MLA_PACKED_DIM, _MLA_ROPE_DIM
@@ -109,9 +108,55 @@ _MLA_SHARED_SCALE_STAGE_ELEMS = max(
     _MLA_SCALE_STAGE_ELEMS,
     _COMPRESSED_MLA_SCALE_STAGE_ELEMS,
 )
-_EAGER_HOST_LAUNCHER_CACHE_SIZE = int(
-    os.getenv("B12X_EAGER_HOST_LAUNCHER_CACHE_SIZE", "512")
-)
+def _raise_binding_extras(api_name: str, extras: list[str]) -> None:
+    raise ValueError(
+        f"{api_name} binding owns runtime tensors, workspace, and kernel options; "
+        f"do not also pass {', '.join(extras)}"
+    )
+
+
+def _require_bound_arg(value, *, api_name: str, name: str):
+    if value is None:
+        raise TypeError(f"{api_name} requires {name} or binding")
+    return value
+
+
+@dataclass(frozen=True, kw_only=True)
+class SparseMLAKernelBinding:
+    q_all: torch.Tensor
+    kv_cache: torch.Tensor
+    page_table_1: torch.Tensor
+    active_token_counts: torch.Tensor
+    sm_scale: float | torch.Tensor
+    output: torch.Tensor
+    workspace: object | None = None
+    identity_page_table: bool = False
+
+    def run(self) -> None:
+        run_sparse_mla_kernel(binding=self)
+
+
+def build_sparse_mla_kernel_binding(
+    *,
+    q_all: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table_1: torch.Tensor,
+    active_token_counts: torch.Tensor,
+    sm_scale: float | torch.Tensor,
+    output: torch.Tensor,
+    workspace: object | None = None,
+    identity_page_table: bool = False,
+) -> SparseMLAKernelBinding:
+    return SparseMLAKernelBinding(
+        q_all=q_all,
+        kv_cache=kv_cache,
+        page_table_1=page_table_1,
+        active_token_counts=active_token_counts,
+        sm_scale=sm_scale,
+        output=output,
+        workspace=workspace,
+        identity_page_table=bool(identity_page_table),
+    )
 
 
 def _torch_to_cutlass_dtype(dtype: torch.dtype) -> type[cutlass.Numeric]:
@@ -155,21 +200,6 @@ def _tensor_meta_key(
     )
 
 
-def _launcher_cache_lookup(
-    kernel: object,
-    cache_key: tuple[object, ...],
-):
-    cache = getattr(kernel, "_eager_host_launchers", None)
-    if cache is None:
-        cache = OrderedDict()
-        setattr(kernel, "_eager_host_launchers", cache)
-        return cache, None
-    compiled = cache.get(cache_key)
-    if compiled is not None:
-        cache.move_to_end(cache_key)
-    return cache, compiled
-
-
 def _workspace_contract_kv_tensors(
     workspace: object | None,
     kv_cache: torch.Tensor,
@@ -183,32 +213,6 @@ def _workspace_contract_kv_tensors(
         getattr(workspace, "_contract_kv_rows", None),
         getattr(workspace, "_contract_kv_scales", None),
     )
-
-
-def _run_cached_host_launcher(
-    kernel: object,
-    cache_key: tuple[object, ...],
-    args: tuple[object, ...],
-) -> None:
-    cache, compiled = _launcher_cache_lookup(kernel, cache_key)
-    if compiled is None:
-        raise_if_kernel_resolution_frozen(
-            "eager host launcher compile",
-            target=kernel,
-            cache_key=cache_key,
-        )
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message="Cache is disabled as user wants to compile only.",
-                category=UserWarning,
-            )
-            compiled = kernel(*args, compile_only=True)
-        cache[cache_key] = compiled
-        if len(cache) > _EAGER_HOST_LAUNCHER_CACHE_SIZE:
-            cache.popitem(last=False)
-    exe_args, _ = compiled.generate_execution_args(*args)
-    compiled.run_compiled_program(exe_args)
 
 
 @cute.jit
@@ -2607,6 +2611,56 @@ def _store_output_group(
 
 
 @cute.jit
+def _store_output_group_with_sink(
+    out_tensor: cute.Tensor,
+    o_frag: cute.Tensor,
+    m_frag: cute.Tensor,
+    d_frag: cute.Tensor,
+    attn_sink: cute.Tensor,
+    out_row_idx: Int32,
+    head_tile_start: Int32,
+    group_idx: Int32,
+    lane: Int32,
+):
+    lane_group = lane // Int32(4)
+    lane_pair_base = Int32(2) * (lane % Int32(4))
+    for row_slot in cutlass.range_constexpr(2):
+        head_local = lane_group + Int32(8) * row_slot
+        head_idx = head_tile_start + head_local
+        if head_idx < Int32(out_tensor.shape[1]):
+            reg_base = row_slot * 2
+            row_m = Float32(m_frag[0, row_slot])
+            sink_m = Float32(attn_sink[head_idx] * attention_ops.LOG2_E)
+            new_m = attention_ops.fmax(row_m, sink_m)
+            prev_scale = (
+                Float32(0.0)
+                if row_m == -Float32.inf
+                else _exp2_approx_ftz_f32(row_m - new_m)
+            )
+            sink_scale = _exp2_approx_ftz_f32(sink_m - new_m)
+            denom = Float32(d_frag[0, row_slot] * prev_scale + sink_scale)
+            out_scale = (
+                Float32(0.0)
+                if denom == Float32(0.0)
+                else Float32(prev_scale) / denom
+            )
+            for mma_d in cutlass.range_constexpr(_MLA_VO_NUM_MMA_D):
+                dim_base = group_idx * Int32(_MLA_GROUP_SIZE) + mma_d * Int32(16) + lane_pair_base
+                out_tensor[out_row_idx, head_idx, dim_base + Int32(0)] = Float32(
+                    o_frag[0, mma_d, reg_base + 0] * out_scale
+                ).to(out_tensor.element_type)
+                out_tensor[out_row_idx, head_idx, dim_base + Int32(1)] = Float32(
+                    o_frag[0, mma_d, reg_base + 1] * out_scale
+                ).to(out_tensor.element_type)
+                out_tensor[out_row_idx, head_idx, dim_base + Int32(8)] = Float32(
+                    o_frag[0, mma_d, reg_base + 4] * out_scale
+                ).to(out_tensor.element_type)
+                out_tensor[out_row_idx, head_idx, dim_base + Int32(9)] = Float32(
+                    o_frag[0, mma_d, reg_base + 5] * out_scale
+                ).to(out_tensor.element_type)
+
+
+@cute.jit
 def _store_output_group_chunked(
     out_tensor: cute.Tensor,
     o_frag: cute.Tensor,
@@ -3520,6 +3574,66 @@ def _store_output_groups(
 
 
 @cute.jit
+def _store_output_groups_with_sink(
+    out_tensor: cute.Tensor,
+    o_frag0: cute.Tensor,
+    o_frag1: cute.Tensor,
+    o_frag2: cute.Tensor,
+    o_frag3: cute.Tensor,
+    m_frag: cute.Tensor,
+    d_frag: cute.Tensor,
+    attn_sink: cute.Tensor,
+    out_row_idx: Int32,
+    head_tile_start: Int32,
+    lane: Int32,
+):
+    _store_output_group_with_sink(
+        out_tensor,
+        o_frag0,
+        m_frag,
+        d_frag,
+        attn_sink,
+        out_row_idx,
+        head_tile_start,
+        Int32(0),
+        lane,
+    )
+    _store_output_group_with_sink(
+        out_tensor,
+        o_frag1,
+        m_frag,
+        d_frag,
+        attn_sink,
+        out_row_idx,
+        head_tile_start,
+        Int32(1),
+        lane,
+    )
+    _store_output_group_with_sink(
+        out_tensor,
+        o_frag2,
+        m_frag,
+        d_frag,
+        attn_sink,
+        out_row_idx,
+        head_tile_start,
+        Int32(2),
+        lane,
+    )
+    _store_output_group_with_sink(
+        out_tensor,
+        o_frag3,
+        m_frag,
+        d_frag,
+        attn_sink,
+        out_row_idx,
+        head_tile_start,
+        Int32(3),
+        lane,
+    )
+
+
+@cute.jit
 def _store_output_groups_chunked(
     out_tensor: cute.Tensor,
     o_frag0: cute.Tensor,
@@ -3598,6 +3712,8 @@ def _run_single_tile_compressed_mla_tile(
     out_row_idx: Int32,
     out_chunk_idx: Int32,
     lse_tensor: cute.Tensor | None,
+    attn_sink: cute.Tensor,
+    apply_attn_sink: cutlass.Constexpr[bool],
     swa_page_size: cutlass.Constexpr[int],
     swa_page_nbytes: cutlass.Constexpr[int],
     indexed_page_size: cutlass.Constexpr[int],
@@ -3701,7 +3817,20 @@ def _run_single_tile_compressed_mla_tile(
         4,
     )
     if cutlass.const_expr(lse_tensor is None):
-        _store_output_group(out_tensor, o_frag, d_frag, out_row_idx, head_tile_start, Int32(0), lane)
+        if cutlass.const_expr(apply_attn_sink):
+            _store_output_group_with_sink(
+                out_tensor,
+                o_frag,
+                m_frag,
+                d_frag,
+                attn_sink,
+                out_row_idx,
+                head_tile_start,
+                Int32(0),
+                lane,
+            )
+        else:
+            _store_output_group(out_tensor, o_frag, d_frag, out_row_idx, head_tile_start, Int32(0), lane)
     else:
         _store_output_group_chunked(out_tensor, o_frag, d_frag, out_row_idx, out_chunk_idx, head_tile_start, Int32(0), lane)
 
@@ -3748,7 +3877,20 @@ def _run_single_tile_compressed_mla_tile(
         4,
     )
     if cutlass.const_expr(lse_tensor is None):
-        _store_output_group(out_tensor, o_frag, d_frag, out_row_idx, head_tile_start, Int32(1), lane)
+        if cutlass.const_expr(apply_attn_sink):
+            _store_output_group_with_sink(
+                out_tensor,
+                o_frag,
+                m_frag,
+                d_frag,
+                attn_sink,
+                out_row_idx,
+                head_tile_start,
+                Int32(1),
+                lane,
+            )
+        else:
+            _store_output_group(out_tensor, o_frag, d_frag, out_row_idx, head_tile_start, Int32(1), lane)
     else:
         _store_output_group_chunked(out_tensor, o_frag, d_frag, out_row_idx, out_chunk_idx, head_tile_start, Int32(1), lane)
 
@@ -3795,7 +3937,20 @@ def _run_single_tile_compressed_mla_tile(
         4,
     )
     if cutlass.const_expr(lse_tensor is None):
-        _store_output_group(out_tensor, o_frag, d_frag, out_row_idx, head_tile_start, Int32(2), lane)
+        if cutlass.const_expr(apply_attn_sink):
+            _store_output_group_with_sink(
+                out_tensor,
+                o_frag,
+                m_frag,
+                d_frag,
+                attn_sink,
+                out_row_idx,
+                head_tile_start,
+                Int32(2),
+                lane,
+            )
+        else:
+            _store_output_group(out_tensor, o_frag, d_frag, out_row_idx, head_tile_start, Int32(2), lane)
     else:
         _store_output_group_chunked(out_tensor, o_frag, d_frag, out_row_idx, out_chunk_idx, head_tile_start, Int32(2), lane)
 
@@ -3839,7 +3994,20 @@ def _run_single_tile_compressed_mla_tile(
         indexed_page_nbytes,
     )
     if cutlass.const_expr(lse_tensor is None):
-        _store_output_group(out_tensor, o_frag, d_frag, out_row_idx, head_tile_start, Int32(3), lane)
+        if cutlass.const_expr(apply_attn_sink):
+            _store_output_group_with_sink(
+                out_tensor,
+                o_frag,
+                m_frag,
+                d_frag,
+                attn_sink,
+                out_row_idx,
+                head_tile_start,
+                Int32(3),
+                lane,
+            )
+        else:
+            _store_output_group(out_tensor, o_frag, d_frag, out_row_idx, head_tile_start, Int32(3), lane)
     else:
         _store_output_group_chunked(out_tensor, o_frag, d_frag, out_row_idx, out_chunk_idx, head_tile_start, Int32(3), lane)
         _store_partial_lse_chunked(
@@ -4142,6 +4310,8 @@ def _run_one_pass_compressed_mla_tile(
     out_row_idx: Int32,
     out_chunk_idx: Int32,
     lse_tensor: cute.Tensor | None,
+    attn_sink: cute.Tensor,
+    apply_attn_sink: cutlass.Constexpr[bool],
     swa_page_size: cutlass.Constexpr[int],
     swa_page_nbytes: cutlass.Constexpr[int],
     indexed_page_size: cutlass.Constexpr[int],
@@ -4267,17 +4437,32 @@ def _run_one_pass_compressed_mla_tile(
         token_base = tile_end
 
     if cutlass.const_expr(lse_tensor is None):
-        _store_output_groups(
-            out_tensor,
-            o_frag0,
-            o_frag1,
-            o_frag2,
-            o_frag3,
-            d_frag,
-            out_row_idx,
-            head_tile_start,
-            lane,
-        )
+        if cutlass.const_expr(apply_attn_sink):
+            _store_output_groups_with_sink(
+                out_tensor,
+                o_frag0,
+                o_frag1,
+                o_frag2,
+                o_frag3,
+                m_frag,
+                d_frag,
+                attn_sink,
+                out_row_idx,
+                head_tile_start,
+                lane,
+            )
+        else:
+            _store_output_groups(
+                out_tensor,
+                o_frag0,
+                o_frag1,
+                o_frag2,
+                o_frag3,
+                d_frag,
+                out_row_idx,
+                head_tile_start,
+                lane,
+            )
     else:
         _store_output_groups_chunked(
             out_tensor,
@@ -4453,15 +4638,58 @@ def supports_sparse_mla_kernel(
 
 def run_sparse_mla_kernel(
     *,
-    q_all: torch.Tensor,
-    kv_cache: torch.Tensor,
-    page_table_1: torch.Tensor,
-    active_token_counts: torch.Tensor,
-    sm_scale: float | torch.Tensor,
-    output: torch.Tensor,
+    q_all: torch.Tensor | None = None,
+    kv_cache: torch.Tensor | None = None,
+    page_table_1: torch.Tensor | None = None,
+    active_token_counts: torch.Tensor | None = None,
+    sm_scale: float | torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
     workspace: object | None = None,
-    identity_page_table: bool = False,
+    identity_page_table: bool | None = None,
+    binding: SparseMLAKernelBinding | None = None,
 ) -> None:
+    if binding is not None:
+        extras = [
+            name
+            for name, value in (
+                ("q_all", q_all),
+                ("kv_cache", kv_cache),
+                ("page_table_1", page_table_1),
+                ("active_token_counts", active_token_counts),
+                ("sm_scale", sm_scale),
+                ("output", output),
+                ("workspace", workspace),
+                ("identity_page_table", identity_page_table),
+            )
+            if value is not None
+        ]
+        if extras:
+            _raise_binding_extras("run_sparse_mla_kernel", extras)
+        q_all = binding.q_all
+        kv_cache = binding.kv_cache
+        page_table_1 = binding.page_table_1
+        active_token_counts = binding.active_token_counts
+        sm_scale = binding.sm_scale
+        output = binding.output
+        workspace = binding.workspace
+        identity_page_table = binding.identity_page_table
+
+    q_all = _require_bound_arg(q_all, api_name="run_sparse_mla_kernel", name="q_all")
+    kv_cache = _require_bound_arg(kv_cache, api_name="run_sparse_mla_kernel", name="kv_cache")
+    page_table_1 = _require_bound_arg(
+        page_table_1,
+        api_name="run_sparse_mla_kernel",
+        name="page_table_1",
+    )
+    active_token_counts = _require_bound_arg(
+        active_token_counts,
+        api_name="run_sparse_mla_kernel",
+        name="active_token_counts",
+    )
+    sm_scale = _require_bound_arg(sm_scale, api_name="run_sparse_mla_kernel", name="sm_scale")
+    output = _require_bound_arg(output, api_name="run_sparse_mla_kernel", name="output")
+    identity_page_table = False if identity_page_table is None else bool(identity_page_table)
+
     traits = select_sparse_mla_traits(
         q_all=q_all,
         kv_cache=kv_cache,
@@ -4524,4 +4752,26 @@ def run_sparse_mla_kernel(
         str(output.dtype),
         bool(identity_page_table),
     )
-    _run_cached_host_launcher(kernel, cache_key, args)
+    compile_spec = KernelCompileSpec.from_key(
+        "attention.mla.sparse",
+        1,
+        cache_key,
+        labels=(
+            "q",
+            "kv_rows",
+            "kv_scales",
+            "page_table",
+            "active_token_counts",
+            "output",
+            "traits",
+            "head_tiles",
+            "output_dtype",
+            "identity_page_table",
+        ),
+    )
+    b12x_launch(
+        kernel,
+        compile_spec=compile_spec,
+        compile_args=args,
+        runtime_args=args,
+    )

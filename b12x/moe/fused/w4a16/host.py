@@ -155,6 +155,17 @@ def max_packed_route_slots(numel: int, block_size: int, num_experts: int) -> int
     return max_packed_routes
 
 
+def route_pack_numel_capacity(numel: int, topk: int = 1) -> int:
+    topk = max(int(topk), 1)
+    tokens = (max(int(numel), 1) + topk - 1) // topk
+    return route_pack_token_capacity(tokens, topk) * topk
+
+
+def route_pack_token_capacity(tokens: int, topk: int) -> int:
+    del topk
+    return 1 << (max(int(tokens), 1) - 1).bit_length()
+
+
 def max_w4a16_route_capacity(routed_rows: int, num_experts: int) -> tuple[int, int]:
     route_slots = 0
     route_blocks = 0
@@ -297,6 +308,8 @@ __all__ = [
     "max_packed_route_slots",
     "plan_w4a16_buffers",
     "reorder_w13_to_gate_up",
+    "route_pack_numel_capacity",
+    "route_pack_token_capacity",
     "select_route_block_size_m",
     "unswizzle_block_scale",
     "unswizzle_expert_scales",

@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
+from dataclasses import dataclass
 from functools import lru_cache
 import os
-import warnings
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -17,6 +16,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.cute.runtime import from_dlpack
 
 from b12x.attention._cute import ops as attention_ops
+from b12x.cute.compiler import KernelCompileSpec, launch as b12x_launch
 from b12x.cute.fp4 import (
     bf16_mma_m16n16k16_f32,
     bfloat2_habs2,
@@ -42,7 +42,6 @@ from b12x.cute.fp4 import (
     st_shared_v4_u32,
     ue8m0_to_output_scale,
 )
-from b12x.runtime_control import raise_if_kernel_resolution_frozen
 from b12x.cute.utils import current_cuda_stream
 
 from .reference import _MLA_GROUP_SIZE, _MLA_NOPE_DIM, _MLA_PACKED_DIM, _MLA_ROPE_DIM
@@ -83,9 +82,52 @@ _MLA_ROPE_U32_OFFSET = _MLA_SCALE_U32_OFFSET + _MLA_SCALE_GROUPS
 _MLA_NUM_MMA_KV = 2
 _MLA_QK_NUM_MMA_D = 4
 _MLA_VO_NUM_MMA_D = _MLA_NOPE_GROUP_ELEMS // 16
-_EAGER_HOST_LAUNCHER_CACHE_SIZE = int(
-    os.getenv("B12X_EAGER_HOST_LAUNCHER_CACHE_SIZE", "512")
-)
+def _raise_binding_extras(api_name: str, extras: list[str]) -> None:
+    raise ValueError(
+        f"{api_name} binding owns runtime tensors, workspace, and kernel options; "
+        f"do not also pass {', '.join(extras)}"
+    )
+
+
+def _require_bound_arg(value, *, api_name: str, name: str):
+    if value is None:
+        raise TypeError(f"{api_name} requires {name} or binding")
+    return value
+
+
+@dataclass(frozen=True, kw_only=True)
+class SparseMLAOnePassKernelBinding:
+    q_all: torch.Tensor
+    kv_cache: torch.Tensor
+    page_table_1: torch.Tensor
+    active_token_counts: torch.Tensor
+    sm_scale: float | torch.Tensor
+    output: torch.Tensor
+    workspace: object | None = None
+
+    def run(self) -> None:
+        run_sparse_mla_kernel(binding=self)
+
+
+def build_sparse_mla_onepass_kernel_binding(
+    *,
+    q_all: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table_1: torch.Tensor,
+    active_token_counts: torch.Tensor,
+    sm_scale: float | torch.Tensor,
+    output: torch.Tensor,
+    workspace: object | None = None,
+) -> SparseMLAOnePassKernelBinding:
+    return SparseMLAOnePassKernelBinding(
+        q_all=q_all,
+        kv_cache=kv_cache,
+        page_table_1=page_table_1,
+        active_token_counts=active_token_counts,
+        sm_scale=sm_scale,
+        output=output,
+        workspace=workspace,
+    )
 
 
 def _torch_to_cutlass_dtype(dtype: torch.dtype) -> type[cutlass.Numeric]:
@@ -129,21 +171,6 @@ def _tensor_meta_key(
     )
 
 
-def _launcher_cache_lookup(
-    kernel: object,
-    cache_key: tuple[object, ...],
-):
-    cache = getattr(kernel, "_eager_host_launchers", None)
-    if cache is None:
-        cache = OrderedDict()
-        setattr(kernel, "_eager_host_launchers", cache)
-        return cache, None
-    compiled = cache.get(cache_key)
-    if compiled is not None:
-        cache.move_to_end(cache_key)
-    return cache, compiled
-
-
 def _workspace_contract_kv_tensors(
     workspace: object | None,
     kv_cache: torch.Tensor,
@@ -157,32 +184,6 @@ def _workspace_contract_kv_tensors(
         getattr(workspace, "_contract_kv_rows", None),
         getattr(workspace, "_contract_kv_scales", None),
     )
-
-
-def _run_cached_host_launcher(
-    kernel: object,
-    cache_key: tuple[object, ...],
-    args: tuple[object, ...],
-) -> None:
-    cache, compiled = _launcher_cache_lookup(kernel, cache_key)
-    if compiled is None:
-        raise_if_kernel_resolution_frozen(
-            "eager host launcher compile",
-            target=kernel,
-            cache_key=cache_key,
-        )
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message="Cache is disabled as user wants to compile only.",
-                category=UserWarning,
-            )
-            compiled = kernel(*args, compile_only=True)
-        cache[cache_key] = compiled
-        if len(cache) > _EAGER_HOST_LAUNCHER_CACHE_SIZE:
-            cache.popitem(last=False)
-    exe_args, _ = compiled.generate_execution_args(*args)
-    compiled.run_compiled_program(exe_args)
 
 
 @cute.jit
@@ -2210,14 +2211,54 @@ def supports_sparse_mla_kernel(
 
 def run_sparse_mla_kernel(
     *,
-    q_all: torch.Tensor,
-    kv_cache: torch.Tensor,
-    page_table_1: torch.Tensor,
-    active_token_counts: torch.Tensor,
-    sm_scale: float | torch.Tensor,
-    output: torch.Tensor,
+    q_all: torch.Tensor | None = None,
+    kv_cache: torch.Tensor | None = None,
+    page_table_1: torch.Tensor | None = None,
+    active_token_counts: torch.Tensor | None = None,
+    sm_scale: float | torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
     workspace: object | None = None,
+    binding: SparseMLAOnePassKernelBinding | None = None,
 ) -> None:
+    if binding is not None:
+        extras = [
+            name
+            for name, value in (
+                ("q_all", q_all),
+                ("kv_cache", kv_cache),
+                ("page_table_1", page_table_1),
+                ("active_token_counts", active_token_counts),
+                ("sm_scale", sm_scale),
+                ("output", output),
+                ("workspace", workspace),
+            )
+            if value is not None
+        ]
+        if extras:
+            _raise_binding_extras("run_sparse_mla_kernel", extras)
+        q_all = binding.q_all
+        kv_cache = binding.kv_cache
+        page_table_1 = binding.page_table_1
+        active_token_counts = binding.active_token_counts
+        sm_scale = binding.sm_scale
+        output = binding.output
+        workspace = binding.workspace
+
+    q_all = _require_bound_arg(q_all, api_name="run_sparse_mla_kernel", name="q_all")
+    kv_cache = _require_bound_arg(kv_cache, api_name="run_sparse_mla_kernel", name="kv_cache")
+    page_table_1 = _require_bound_arg(
+        page_table_1,
+        api_name="run_sparse_mla_kernel",
+        name="page_table_1",
+    )
+    active_token_counts = _require_bound_arg(
+        active_token_counts,
+        api_name="run_sparse_mla_kernel",
+        name="active_token_counts",
+    )
+    sm_scale = _require_bound_arg(sm_scale, api_name="run_sparse_mla_kernel", name="sm_scale")
+    output = _require_bound_arg(output, api_name="run_sparse_mla_kernel", name="output")
+
     traits = select_sparse_mla_traits(
         q_all=q_all,
         kv_cache=kv_cache,
@@ -2279,4 +2320,25 @@ def run_sparse_mla_kernel(
         head_tiles,
         str(output.dtype),
     )
-    _run_cached_host_launcher(kernel, cache_key, args)
+    compile_spec = KernelCompileSpec.from_key(
+        "attention.mla.onepass_sparse",
+        1,
+        cache_key,
+        labels=(
+            "q",
+            "kv_rows",
+            "kv_scales",
+            "page_table",
+            "active_token_counts",
+            "output",
+            "traits",
+            "head_tiles",
+            "output_dtype",
+        ),
+    )
+    b12x_launch(
+        kernel,
+        compile_spec=compile_spec,
+        compile_args=args,
+        runtime_args=args,
+    )

@@ -2,24 +2,26 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
+from dataclasses import dataclass
 from functools import lru_cache
-import os
-import warnings
 
-import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cuda.bindings.driver as cuda
 import torch
-from cutlass._mlir.dialects import llvm
 from cutlass import Float32, Int32, Uint32
-from cutlass.cutlass_dsl import Int64, dsl_user_op
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 
 from b12x.attention._cute import copy as cute_copy
 from b12x.attention._cute import pipeline as cute_pipeline
 from b12x.attention._cute import ops as attention_ops
+from b12x.cute.compiler import (
+    DimKey,
+    KernelCompileSpec,
+    TensorKey,
+    launch as b12x_launch,
+)
 from b12x.cute.fp4 import get_sm_version
 from b12x.cute.fp4 import (
     frag_layout_swizzle_16b_to_8b,
@@ -30,7 +32,6 @@ from b12x.cute.fp4 import (
     shared_ptr_to_u32,
     st_shared_v4_u32,
 )
-from b12x.runtime_control import raise_if_kernel_resolution_frozen
 from b12x.cute.utils import current_cuda_stream
 
 
@@ -50,15 +51,183 @@ _SCHEDULE_MULTI_ROW_MAX_Q_ROWS = 8
 _MAX_SUPPORTED_Q_HEADS = 64
 _PAGED_TILED_BLOCK_Q = 32
 _PAGED_TILED_BLOCK_K = 512
-_EAGER_HOST_LAUNCHER_CACHE_SIZE = int(
-    os.getenv("B12X_EAGER_HOST_LAUNCHER_CACHE_SIZE", "512")
-)
 _PAGED_Q_HEAD_TILE = 16
-_PAGED_K_TMA_DESC_CACHE_SIZE = 32
-_BLACKWELL_TMA_DESC_WORDS = 16
-_BLACKWELL_TMA_DESC_MIN_BACKING_BYTES = 128 * 1024
-_BLACKWELL_TMA_DESC_PATCH_WORD = 1
-_BLACKWELL_TMA_DESC_PATCH_CLEAR_MASK = 0xFFFFFFFFFFDFFFFF
+_BLACKWELL_TINY_STRIDED_TMA_MAX_BACKING_BYTES = 128 * 1024
+
+
+def _raise_binding_extras(api_name: str, extras: list[str]) -> None:
+    raise ValueError(
+        f"{api_name} binding owns runtime tensors, workspace, and kernel options; "
+        f"do not also pass {', '.join(extras)}"
+    )
+
+
+def _require_bound_arg(value, *, api_name: str, name: str):
+    if value is None:
+        raise TypeError(f"{api_name} requires {name} or binding")
+    return value
+
+
+@dataclass(frozen=True, kw_only=True)
+class IndexerPagedLogitsKernelBinding:
+    q_fp8: torch.Tensor
+    weights: torch.Tensor
+    index_k_cache: torch.Tensor
+    real_page_table: torch.Tensor
+    seqlens_per_query: torch.Tensor
+    schedule_metadata: torch.Tensor | None = None
+    active_width: torch.Tensor | None = None
+    contract_phantoms: dict[str, torch.Tensor] | None = None
+    workspace: object | None = None
+    page_size: int = _PAGE_SIZE
+    preinitialize_invalid_logits: bool = True
+
+    def run(self) -> torch.Tensor:
+        return run_paged_logits_kernel(binding=self)
+
+
+@dataclass(frozen=True, kw_only=True)
+class IndexerPagedTiledLogitsKernelBinding:
+    q_fp8: torch.Tensor
+    weights: torch.Tensor
+    index_k_cache: torch.Tensor
+    real_page_table: torch.Tensor
+    seqlens_per_query: torch.Tensor
+    active_width: torch.Tensor
+    tile_logits: torch.Tensor
+    contract_phantoms: dict[str, torch.Tensor] | None = None
+    workspace: object | None = None
+    page_size: int = _PAGE_SIZE
+    tile_block_q: int = _PAGED_TILED_BLOCK_Q
+    tile_block_k: int = _PAGED_TILED_BLOCK_K
+    preinitialize_tile_logits: bool = True
+
+    def run(self) -> torch.Tensor:
+        return run_paged_tiled_logits_kernel(binding=self)
+
+
+@dataclass(frozen=True, kw_only=True)
+class IndexerPagedWindowedTiledLogitsKernelBinding:
+    q_fp8: torch.Tensor
+    weights: torch.Tensor
+    index_k_cache: torch.Tensor
+    real_page_table: torch.Tensor
+    seqlens_per_query: torch.Tensor
+    active_width: torch.Tensor
+    tile_logits: torch.Tensor
+    source_page_offset: int
+    output_width_tokens: int
+    contract_phantoms: dict[str, torch.Tensor] | None = None
+    workspace: object | None = None
+    page_size: int = _PAGE_SIZE
+    tile_block_q: int = _PAGED_TILED_BLOCK_Q
+    tile_block_k: int = _PAGED_TILED_BLOCK_K
+    preinitialize_tile_logits: bool = True
+    stage_runtime_metadata: bool = True
+
+    def run(self) -> torch.Tensor:
+        return run_paged_windowed_tiled_logits_kernel(binding=self)
+
+
+def build_indexer_paged_logits_kernel_binding(
+    *,
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    real_page_table: torch.Tensor,
+    seqlens_per_query: torch.Tensor,
+    schedule_metadata: torch.Tensor | None = None,
+    active_width: torch.Tensor | None = None,
+    contract_phantoms: dict[str, torch.Tensor] | None = None,
+    workspace: object | None = None,
+    page_size: int = _PAGE_SIZE,
+    preinitialize_invalid_logits: bool = True,
+) -> IndexerPagedLogitsKernelBinding:
+    return IndexerPagedLogitsKernelBinding(
+        q_fp8=q_fp8,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        real_page_table=real_page_table,
+        seqlens_per_query=seqlens_per_query,
+        schedule_metadata=schedule_metadata,
+        active_width=active_width,
+        contract_phantoms=contract_phantoms,
+        workspace=workspace,
+        page_size=int(page_size),
+        preinitialize_invalid_logits=bool(preinitialize_invalid_logits),
+    )
+
+
+def build_indexer_paged_tiled_logits_kernel_binding(
+    *,
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    real_page_table: torch.Tensor,
+    seqlens_per_query: torch.Tensor,
+    active_width: torch.Tensor,
+    tile_logits: torch.Tensor,
+    contract_phantoms: dict[str, torch.Tensor] | None = None,
+    workspace: object | None = None,
+    page_size: int = _PAGE_SIZE,
+    tile_block_q: int = _PAGED_TILED_BLOCK_Q,
+    tile_block_k: int = _PAGED_TILED_BLOCK_K,
+    preinitialize_tile_logits: bool = True,
+) -> IndexerPagedTiledLogitsKernelBinding:
+    return IndexerPagedTiledLogitsKernelBinding(
+        q_fp8=q_fp8,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        real_page_table=real_page_table,
+        seqlens_per_query=seqlens_per_query,
+        active_width=active_width,
+        tile_logits=tile_logits,
+        contract_phantoms=contract_phantoms,
+        workspace=workspace,
+        page_size=int(page_size),
+        tile_block_q=int(tile_block_q),
+        tile_block_k=int(tile_block_k),
+        preinitialize_tile_logits=bool(preinitialize_tile_logits),
+    )
+
+
+def build_indexer_paged_windowed_tiled_logits_kernel_binding(
+    *,
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    real_page_table: torch.Tensor,
+    seqlens_per_query: torch.Tensor,
+    active_width: torch.Tensor,
+    tile_logits: torch.Tensor,
+    source_page_offset: int,
+    output_width_tokens: int,
+    contract_phantoms: dict[str, torch.Tensor] | None = None,
+    workspace: object | None = None,
+    page_size: int = _PAGE_SIZE,
+    tile_block_q: int = _PAGED_TILED_BLOCK_Q,
+    tile_block_k: int = _PAGED_TILED_BLOCK_K,
+    preinitialize_tile_logits: bool = True,
+    stage_runtime_metadata: bool = True,
+) -> IndexerPagedWindowedTiledLogitsKernelBinding:
+    return IndexerPagedWindowedTiledLogitsKernelBinding(
+        q_fp8=q_fp8,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        real_page_table=real_page_table,
+        seqlens_per_query=seqlens_per_query,
+        active_width=active_width,
+        tile_logits=tile_logits,
+        source_page_offset=int(source_page_offset),
+        output_width_tokens=int(output_width_tokens),
+        contract_phantoms=contract_phantoms,
+        workspace=workspace,
+        page_size=int(page_size),
+        tile_block_q=int(tile_block_q),
+        tile_block_k=int(tile_block_k),
+        preinitialize_tile_logits=bool(preinitialize_tile_logits),
+        stage_runtime_metadata=bool(stage_runtime_metadata),
+    )
 
 
 def _num_q_head_tiles(num_heads: int) -> int:
@@ -144,45 +313,33 @@ def _tensor_meta_key(
     )
 
 
-def _launcher_cache_lookup(
-    kernel: object,
-    cache_key: tuple[object, ...],
-):
-    cache = getattr(kernel, "_eager_host_launchers", None)
-    if cache is None:
-        cache = OrderedDict()
-        setattr(kernel, "_eager_host_launchers", cache)
-        return cache, None
-    compiled = cache.get(cache_key)
-    if compiled is not None:
-        cache.move_to_end(cache_key)
-    return cache, compiled
+def _tensor_compile_key(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    dynamic_dims: tuple[int, ...] = (),
+) -> TensorKey:
+    dynamic_dim_set = set(dynamic_dims)
+    dims = tuple(
+        DimKey.dynamic() if idx in dynamic_dim_set else DimKey.exact(int(dim))
+        for idx, dim in enumerate(tensor.shape)
+    )
+    return TensorKey.from_tensor(name, tensor, dims=dims)
 
 
-def _run_cached_host_launcher(
-    kernel: object,
-    cache_key: tuple[object, ...],
-    args: tuple[object, ...],
-) -> None:
-    cache, compiled = _launcher_cache_lookup(kernel, cache_key)
-    if compiled is None:
-        raise_if_kernel_resolution_frozen(
-            "eager host launcher compile",
-            target=kernel,
-            cache_key=cache_key,
-        )
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message="Cache is disabled as user wants to compile only.",
-                category=UserWarning,
-            )
-            compiled = kernel(*args, compile_only=True)
-        cache[cache_key] = compiled
-        if len(cache) > _EAGER_HOST_LAUNCHER_CACHE_SIZE:
-            cache.popitem(last=False)
-    exe_args, _ = compiled.generate_execution_args(*args)
-    compiled.run_compiled_program(exe_args)
+def _contract_key_tensor(
+    contract_phantoms: dict[str, torch.Tensor],
+    name: str,
+    actual: torch.Tensor,
+) -> torch.Tensor:
+    """Use fixed-capacity phantoms only when the compiled tensor shape is fixed."""
+
+    phantom = contract_phantoms.get(name)
+    if phantom is None:
+        return actual
+    if tuple(phantom.shape) != tuple(actual.shape):
+        return actual
+    return phantom
 
 
 def _assume_paged_k_tma_source_aligned(t: cute.Tensor):
@@ -239,87 +396,19 @@ def _is_dense_non_overlapping(tensor: torch.Tensor) -> bool:
     return True
 
 
-def _needs_paged_index_k_tma_descriptor_workaround(
+def _needs_paged_index_k_scalar_load(
     index_k_cache: torch.Tensor,
     k_quant_bytes: torch.Tensor,
 ) -> bool:
+    # Real serving caches are large enough for the normal TMA path. Tiny
+    # strided caches appear in fake/warmup runs and should still be valid, so
+    # load those pages cooperatively instead of depending on tiny strided TMA
+    # descriptor behavior.
     if get_sm_version(index_k_cache.device) // 10 != 12:
         return False
-    if _tensor_storage_nbytes(index_k_cache) >= _BLACKWELL_TMA_DESC_MIN_BACKING_BYTES:
+    if _tensor_storage_nbytes(index_k_cache) >= _BLACKWELL_TINY_STRIDED_TMA_MAX_BACKING_BYTES:
         return False
     return not _is_dense_non_overlapping(k_quant_bytes)
-
-
-def _encode_paged_index_k_tma_descriptor(
-    k_quant_bytes: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if k_quant_bytes.ndim != 3 or k_quant_bytes.shape[1:] != (_PAGE_SIZE, _INDEX_HEAD_DIM):
-        raise ValueError(
-            "k_quant_bytes must have shape "
-            f"(num_pages, {_PAGE_SIZE}, {_INDEX_HEAD_DIM}), got {tuple(k_quant_bytes.shape)}"
-        )
-    if k_quant_bytes.dtype != torch.uint8:
-        raise TypeError(f"k_quant_bytes must have dtype torch.uint8, got {k_quant_bytes.dtype}")
-
-    num_pages = int(k_quant_bytes.shape[0])
-    row_stride_bytes = int(k_quant_bytes.stride(1)) * k_quant_bytes.element_size()
-    page_stride_bytes = int(k_quant_bytes.stride(0)) * k_quant_bytes.element_size()
-    base_ptr = int(k_quant_bytes.data_ptr())
-    U64 = cuda.cuuint64_t
-    U32 = cuda.cuuint32_t
-
-    result, tensor_map = cuda.cuTensorMapEncodeTiled(
-        cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_UINT8,
-        3,
-        base_ptr,
-        [U64(_INDEX_HEAD_DIM), U64(_PAGE_SIZE), U64(num_pages)],
-        [U64(row_stride_bytes), U64(page_stride_bytes)],
-        [U32(_INDEX_HEAD_DIM), U32(_PAGE_SIZE), U32(1)],
-        [U32(1), U32(1), U32(1)],
-        cuda.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE,
-        cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_NONE,
-        cuda.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_NONE,
-        cuda.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
-    )
-    if result != cuda.CUresult.CUDA_SUCCESS:
-        raise RuntimeError(f"cuTensorMapEncodeTiled failed: {result}")
-
-    host_desc_words = [int(word) for word in tensor_map.opaque]
-    if len(host_desc_words) != _BLACKWELL_TMA_DESC_WORDS:
-        raise RuntimeError(
-            f"unexpected TMA descriptor size: expected {_BLACKWELL_TMA_DESC_WORDS} words, "
-            f"got {len(host_desc_words)}"
-        )
-    host_desc = torch.tensor(host_desc_words, dtype=torch.uint64)
-    host_desc[_BLACKWELL_TMA_DESC_PATCH_WORD] &= _BLACKWELL_TMA_DESC_PATCH_CLEAR_MASK
-    desc = host_desc.to(device=k_quant_bytes.device, non_blocking=False)
-    desc_ptrs = torch.tensor([int(desc.data_ptr())], dtype=torch.int64, device=k_quant_bytes.device)
-    return desc, desc_ptrs
-
-
-def _get_cached_paged_index_k_tma_descriptor(
-    k_quant_bytes: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    key = (
-        int(k_quant_bytes.data_ptr()),
-        tuple(k_quant_bytes.shape),
-        tuple(k_quant_bytes.stride()),
-        str(k_quant_bytes.dtype),
-        (k_quant_bytes.device.type, k_quant_bytes.device.index),
-    )
-    cache = getattr(_get_cached_paged_index_k_tma_descriptor, "_cache", None)
-    if cache is None:
-        cache = OrderedDict()
-        setattr(_get_cached_paged_index_k_tma_descriptor, "_cache", cache)
-    cached = cache.get(key)
-    if cached is not None:
-        cache.move_to_end(key)
-        return cached
-    desc = _encode_paged_index_k_tma_descriptor(k_quant_bytes)
-    cache[key] = desc
-    if len(cache) > _PAGED_K_TMA_DESC_CACHE_SIZE:
-        cache.popitem(last=False)
-    return desc
 
 
 @lru_cache(maxsize=16)
@@ -330,37 +419,6 @@ def _dummy_paged_index_k_tma_desc_ptrs(device_index: int) -> torch.Tensor:
 @lru_cache(maxsize=32)
 def _cached_int32_scalar(value: int, device_index: int) -> torch.Tensor:
     return torch.tensor([value], dtype=torch.int32, device=torch.device("cuda", device_index))
-
-
-@dsl_user_op
-def _cp_async_bulk_tensor_3d(
-    dst_smem_addr: Int32,
-    tensor_map_ptr: Int64,
-    coord0: Int32,
-    coord1: Int32,
-    coord2: Int32,
-    mbar_smem_addr: Int32,
-    *,
-    loc=None,
-    ip=None,
-):
-    llvm.inline_asm(
-        None,
-        [
-            Int32(dst_smem_addr).ir_value(loc=loc, ip=ip),
-            Int64(tensor_map_ptr).ir_value(loc=loc, ip=ip),
-            Int32(coord0).ir_value(loc=loc, ip=ip),
-            Int32(coord1).ir_value(loc=loc, ip=ip),
-            Int32(coord2).ir_value(loc=loc, ip=ip),
-            Int32(mbar_smem_addr).ir_value(loc=loc, ip=ip),
-        ],
-        "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes "
-        "[$0], [$1, {$2, $3, $4}], [$5];",
-        "r,l,r,r,r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
 
 
 @cute.jit
@@ -416,6 +474,22 @@ def _repack_k_page_to_permuted(
         )
         v0, v1, v2, v3 = ld_shared_v4_u32(src_addr)
         st_shared_v4_u32(dst_addr, v0, v1, v2, v3)
+        linear += Int32(_PAGED_THREADS_PER_CTA)
+
+
+@cute.jit
+def _load_index_k_page_scalar(
+    k_quant_bytes: cute.Tensor,
+    page_id: Int32,
+    s_k_page_stage: cute.Tensor,
+    lane_linear: Int32,
+):
+    linear = lane_linear
+    total = Int32(_PAGE_SIZE * _INDEX_HEAD_DIM)
+    while linear < total:
+        row = linear // Int32(_INDEX_HEAD_DIM)
+        col = linear - row * Int32(_INDEX_HEAD_DIM)
+        s_k_page_stage[row, col, Int32(0)] = k_quant_bytes[page_id, row, col]
         linear += Int32(_PAGED_THREADS_PER_CTA)
 
 
@@ -525,24 +599,11 @@ def _issue_index_k_tma_copy(
     mbar_ptr,
     expected_bytes,
     page_id,
-    dst_smem_addr,
-    tma_desc_ptr=None,
-    use_external_tma_desc=Int32(0),
 ):
     full_mbar_ptr = mbar_ptr + producer_state.index
     with cute.arch.elect_one():
         cute.arch.mbarrier_arrive_and_expect_tx(full_mbar_ptr, expected_bytes)
-    if use_external_tma_desc != Int32(0):
-        _cp_async_bulk_tensor_3d(
-            Int32(dst_smem_addr),
-            Int64(tma_desc_ptr),
-            Int32(0),
-            Int32(0),
-            page_id,
-            Int32(shared_ptr_to_u32(full_mbar_ptr)),
-        )
-    else:
-        load_tma(src_idx=page_id, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
+    load_tma(src_idx=page_id, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
 
 
 class SparseNSAPagedLogitsKernel:
@@ -591,7 +652,7 @@ class SparseNSAPagedLogitsKernel:
         weights: cute.Tensor,
         k_quant_bytes: cute.Tensor,
         k_tma_desc_ptrs: cute.Tensor,
-        use_patched_k_tma_desc: cute.Tensor,
+        use_scalar_k_load: cute.Tensor,
         k_scales: cute.Tensor,
         real_page_table: cute.Tensor,
         seqlens_per_query: cute.Tensor,
@@ -611,9 +672,10 @@ class SparseNSAPagedLogitsKernel:
         self.kernel(
             q_bytes,
             weights,
+            k_quant_bytes,
             tma_tensor_k,
             k_tma_desc_ptrs,
-            use_patched_k_tma_desc,
+            use_scalar_k_load,
             k_scales,
             real_page_table,
             seqlens_per_query,
@@ -638,9 +700,10 @@ class SparseNSAPagedLogitsKernel:
         self,
         q_bytes: cute.Tensor,
         weights: cute.Tensor,
+        k_quant_bytes: cute.Tensor,
         k_tma_tensor: cute.Tensor,
         k_tma_desc_ptrs: cute.Tensor,
-        use_patched_k_tma_desc: cute.Tensor,
+        use_scalar_k_load: cute.Tensor,
         k_scales: cute.Tensor,
         real_page_table: cute.Tensor,
         seqlens_per_query: cute.Tensor,
@@ -718,12 +781,11 @@ class SparseNSAPagedLogitsKernel:
             cute.local_tile(k_tma_tensor, (_PAGE_SIZE, _INDEX_HEAD_DIM), (0, 0, None)),
             s_k_page_stage,
         )
-        use_external_k_tma_desc = Int32(use_patched_k_tma_desc[Int32(0)])
-        k_tma_desc_ptr = Int64(k_tma_desc_ptrs[Int32(0)])
+        use_scalar_k_load_flag = Int32(use_scalar_k_load[Int32(0)])
         if cta_idx < total_work:
             if tx == 0:
                 cute.arch.mbarrier_init(mbar_ptr_k, Int32(1))
-            if warp_idx == Int32(0) and use_external_k_tma_desc == Int32(0):
+            if (warp_idx == Int32(0)) & (use_scalar_k_load_flag == Int32(0)):
                 cpasync.prefetch_descriptor(tma_atom_k)
 
             num_heads = Int32(self.num_heads_static)
@@ -756,28 +818,34 @@ class SparseNSAPagedLogitsKernel:
                 page_col = work_idx
                 source_page_col = source_offset_pages + page_col
                 page_base = page_col * Int32(_PAGE_SIZE)
-                if page_base < seq_len and source_page_col < Int32(real_page_table.shape[1]):
+                if (page_base < seq_len) & (source_page_col < Int32(real_page_table.shape[1])):
                     page_id = Int32(real_page_table[q_idx, source_page_col])
                     if page_id >= Int32(0):
-                        if warp_idx == Int32(0):
-                            _issue_index_k_tma_copy(
-                                load_k_tma,
-                                producer_state,
-                                mbar_ptr_k,
-                                Int32(_PAGE_SIZE * _INDEX_HEAD_DIM),
+                        if use_scalar_k_load_flag != Int32(0):
+                            _load_index_k_page_scalar(
+                                k_quant_bytes,
                                 page_id,
-                                k_page_base_addr,
-                                tma_desc_ptr=k_tma_desc_ptr,
-                                use_external_tma_desc=use_external_k_tma_desc,
+                                s_k_page_stage,
+                                tx,
                             )
+                        else:
+                            if warp_idx == Int32(0):
+                                _issue_index_k_tma_copy(
+                                    load_k_tma,
+                                    producer_state,
+                                    mbar_ptr_k,
+                                    Int32(_PAGE_SIZE * _INDEX_HEAD_DIM),
+                                    page_id,
+                                )
                         scale_idx = tx
                         while scale_idx < Int32(_PAGE_SIZE):
                             s_scale[scale_idx] = Float32(k_scales[page_id, scale_idx])
                             scale_idx += Int32(_PAGED_THREADS_PER_CTA)
-                        cute.arch.mbarrier_wait(
-                            mbar_ptr_k + consumer_state.index,
-                            phase=consumer_state.phase,
-                        )
+                        if use_scalar_k_load_flag == Int32(0):
+                            cute.arch.mbarrier_wait(
+                                mbar_ptr_k + consumer_state.index,
+                                phase=consumer_state.phase,
+                            )
                         cute.arch.sync_threads()
                         _repack_k_page_to_permuted(k_page_base_addr, k_page_perm_base_addr, tx)
                         cute.arch.sync_threads()
@@ -813,7 +881,7 @@ class SparseNSAPagedLogitsKernel:
                                     head_tile_slot,
                                 )
                             cute.arch.sync_threads()
-                            if head_tile_slot == Int32(0) and lane < Int32(_PAGED_TOKENS_PER_GROUP):
+                            if (head_tile_slot == Int32(0)) & (lane < Int32(_PAGED_TOKENS_PER_GROUP)):
                                 slot_idx = token_base + lane
                                 if slot_idx < valid_slots:
                                     logit = Float32(0.0)
@@ -869,7 +937,7 @@ class SparseNSAPagedWindowedTiledLogitsKernel(SparseNSAPagedLogitsKernel):
         weights: cute.Tensor,
         k_quant_bytes: cute.Tensor,
         k_tma_desc_ptrs: cute.Tensor,
-        use_patched_k_tma_desc: cute.Tensor,
+        use_scalar_k_load: cute.Tensor,
         k_scales: cute.Tensor,
         real_page_table: cute.Tensor,
         seqlens_per_query: cute.Tensor,
@@ -891,9 +959,10 @@ class SparseNSAPagedWindowedTiledLogitsKernel(SparseNSAPagedLogitsKernel):
         self.kernel(
             q_bytes,
             weights,
+            k_quant_bytes,
             tma_tensor_k,
             k_tma_desc_ptrs,
-            use_patched_k_tma_desc,
+            use_scalar_k_load,
             k_scales,
             real_page_table,
             seqlens_per_query,
@@ -975,7 +1044,7 @@ class SparseNSAScheduledSingleRowLogitsKernel:
         weights: cute.Tensor,
         k_quant_bytes: cute.Tensor,
         k_tma_desc_ptrs: cute.Tensor,
-        use_patched_k_tma_desc: cute.Tensor,
+        use_scalar_k_load: cute.Tensor,
         k_scales: cute.Tensor,
         real_page_table: cute.Tensor,
         seqlens_per_query: cute.Tensor,
@@ -996,9 +1065,10 @@ class SparseNSAScheduledSingleRowLogitsKernel:
         self.kernel(
             q_bytes,
             weights,
+            k_quant_bytes,
             tma_tensor_k,
             k_tma_desc_ptrs,
-            use_patched_k_tma_desc,
+            use_scalar_k_load,
             k_scales,
             real_page_table,
             seqlens_per_query,
@@ -1022,9 +1092,10 @@ class SparseNSAScheduledSingleRowLogitsKernel:
         self,
         q_bytes: cute.Tensor,
         weights: cute.Tensor,
+        k_quant_bytes: cute.Tensor,
         k_tma_tensor: cute.Tensor,
         k_tma_desc_ptrs: cute.Tensor,
-        use_patched_k_tma_desc: cute.Tensor,
+        use_scalar_k_load: cute.Tensor,
         k_scales: cute.Tensor,
         real_page_table: cute.Tensor,
         seqlens_per_query: cute.Tensor,
@@ -1090,17 +1161,16 @@ class SparseNSAScheduledSingleRowLogitsKernel:
             cute.local_tile(k_tma_tensor, (_PAGE_SIZE, _INDEX_HEAD_DIM), (0, 0, None)),
             s_k_page_stage,
         )
-        use_external_k_tma_desc = Int32(use_patched_k_tma_desc[Int32(0)])
-        k_tma_desc_ptr = Int64(k_tma_desc_ptrs[Int32(0)])
+        use_scalar_k_load_flag = Int32(use_scalar_k_load[Int32(0)])
 
         if (
-            start_q_idx == Int32(0)
-            and interval_page_start < interval_page_end
-            and cta_lane_idx < Int32(self.parallel_ctas)
+            (start_q_idx == Int32(0))
+            & (interval_page_start < interval_page_end)
+            & (cta_lane_idx < Int32(self.parallel_ctas))
         ):
             if tx == 0:
                 cute.arch.mbarrier_init(mbar_ptr_k, Int32(1))
-            if warp_idx == Int32(0) and use_external_k_tma_desc == Int32(0):
+            if (warp_idx == Int32(0)) & (use_scalar_k_load_flag == Int32(0)):
                 cpasync.prefetch_descriptor(tma_atom_k)
 
             num_heads = Int32(self.num_heads_static)
@@ -1134,25 +1204,31 @@ class SparseNSAScheduledSingleRowLogitsKernel:
                 if page_base < seq_len:
                     page_id = Int32(real_page_table[Int32(0), page_col])
                     if page_id >= Int32(0):
-                        if warp_idx == Int32(0):
-                            _issue_index_k_tma_copy(
-                                load_k_tma,
-                                producer_state,
-                                mbar_ptr_k,
-                                Int32(_PAGE_SIZE * _INDEX_HEAD_DIM),
+                        if use_scalar_k_load_flag != Int32(0):
+                            _load_index_k_page_scalar(
+                                k_quant_bytes,
                                 page_id,
-                                k_page_base_addr,
-                                tma_desc_ptr=k_tma_desc_ptr,
-                                use_external_tma_desc=use_external_k_tma_desc,
+                                s_k_page_stage,
+                                tx,
                             )
+                        else:
+                            if warp_idx == Int32(0):
+                                _issue_index_k_tma_copy(
+                                    load_k_tma,
+                                    producer_state,
+                                    mbar_ptr_k,
+                                    Int32(_PAGE_SIZE * _INDEX_HEAD_DIM),
+                                    page_id,
+                                )
                         scale_idx = tx
                         while scale_idx < Int32(_PAGE_SIZE):
                             s_scale[scale_idx] = Float32(k_scales[page_id, scale_idx])
                             scale_idx += Int32(_PAGED_THREADS_PER_CTA)
-                        cute.arch.mbarrier_wait(
-                            mbar_ptr_k + consumer_state.index,
-                            phase=consumer_state.phase,
-                        )
+                        if use_scalar_k_load_flag == Int32(0):
+                            cute.arch.mbarrier_wait(
+                                mbar_ptr_k + consumer_state.index,
+                                phase=consumer_state.phase,
+                            )
                         cute.arch.sync_threads()
                         _repack_k_page_to_permuted(k_page_base_addr, k_page_perm_base_addr, tx)
                         cute.arch.sync_threads()
@@ -1188,7 +1264,7 @@ class SparseNSAScheduledSingleRowLogitsKernel:
                                     head_tile_slot,
                                 )
                             cute.arch.sync_threads()
-                            if head_tile_slot == Int32(0) and lane < Int32(_PAGED_TOKENS_PER_GROUP):
+                            if (head_tile_slot == Int32(0)) & (lane < Int32(_PAGED_TOKENS_PER_GROUP)):
                                 slot_idx = token_base + lane
                                 if slot_idx < valid_slots:
                                     logit = Float32(0.0)
@@ -1242,7 +1318,7 @@ class SparseNSAScheduledMultiRowLogitsKernel:
         weights: cute.Tensor,
         k_quant_bytes: cute.Tensor,
         k_tma_desc_ptrs: cute.Tensor,
-        use_patched_k_tma_desc: cute.Tensor,
+        use_scalar_k_load: cute.Tensor,
         k_scales: cute.Tensor,
         real_page_table: cute.Tensor,
         seqlens_per_query: cute.Tensor,
@@ -1263,9 +1339,10 @@ class SparseNSAScheduledMultiRowLogitsKernel:
         self.kernel(
             q_bytes,
             weights,
+            k_quant_bytes,
             tma_tensor_k,
             k_tma_desc_ptrs,
-            use_patched_k_tma_desc,
+            use_scalar_k_load,
             k_scales,
             real_page_table,
             seqlens_per_query,
@@ -1289,9 +1366,10 @@ class SparseNSAScheduledMultiRowLogitsKernel:
         self,
         q_bytes: cute.Tensor,
         weights: cute.Tensor,
+        k_quant_bytes: cute.Tensor,
         k_tma_tensor: cute.Tensor,
         k_tma_desc_ptrs: cute.Tensor,
-        use_patched_k_tma_desc: cute.Tensor,
+        use_scalar_k_load: cute.Tensor,
         k_scales: cute.Tensor,
         real_page_table: cute.Tensor,
         seqlens_per_query: cute.Tensor,
@@ -1347,13 +1425,14 @@ class SparseNSAScheduledMultiRowLogitsKernel:
             cute.local_tile(k_tma_tensor, (_PAGE_SIZE, _INDEX_HEAD_DIM), (0, 0, None)),
             s_k_page_stage,
         )
-        use_external_k_tma_desc = Int32(use_patched_k_tma_desc[Int32(0)])
-        k_tma_desc_ptr = Int64(k_tma_desc_ptrs[Int32(0)])
+        use_scalar_k_load_flag = Int32(use_scalar_k_load[Int32(0)])
 
-        if interval_idx < total_schedule_intervals and cta_lane_idx < Int32(self.parallel_ctas):
+        if (interval_idx < total_schedule_intervals) & (
+            cta_lane_idx < Int32(self.parallel_ctas)
+        ):
             if tx == 0:
                 cute.arch.mbarrier_init(mbar_ptr_k, Int32(1))
-            if warp_idx == Int32(0) and use_external_k_tma_desc == Int32(0):
+            if (warp_idx == Int32(0)) & (use_scalar_k_load_flag == Int32(0)):
                 cpasync.prefetch_descriptor(tma_atom_k)
 
             num_heads = Int32(self.num_heads_static)
@@ -1364,9 +1443,9 @@ class SparseNSAScheduledMultiRowLogitsKernel:
             current_q_idx = start_q_idx
             current_split_idx = start_split_idx
 
-            while current_q_idx < q_rows and (
-                current_q_idx < end_q_idx
-                or (current_q_idx == end_q_idx and end_split_idx > Int32(0))
+            while (current_q_idx < q_rows) & (
+                (current_q_idx < end_q_idx)
+                | ((current_q_idx == end_q_idx) & (end_split_idx > Int32(0)))
             ):
                 seq_len = Int32(seqlens_per_query[current_q_idx])
                 if seq_len > live_width:
@@ -1414,25 +1493,31 @@ class SparseNSAScheduledMultiRowLogitsKernel:
                         if page_base < seq_len:
                             page_id = Int32(real_page_table[current_q_idx, page_col])
                             if page_id >= Int32(0):
-                                if warp_idx == Int32(0):
-                                    _issue_index_k_tma_copy(
-                                        load_k_tma,
-                                        producer_state,
-                                        mbar_ptr_k,
-                                        Int32(_PAGE_SIZE * _INDEX_HEAD_DIM),
+                                if use_scalar_k_load_flag != Int32(0):
+                                    _load_index_k_page_scalar(
+                                        k_quant_bytes,
                                         page_id,
-                                        k_page_base_addr,
-                                        tma_desc_ptr=k_tma_desc_ptr,
-                                        use_external_tma_desc=use_external_k_tma_desc,
+                                        s_k_page_stage,
+                                        tx,
                                     )
+                                else:
+                                    if warp_idx == Int32(0):
+                                        _issue_index_k_tma_copy(
+                                            load_k_tma,
+                                            producer_state,
+                                            mbar_ptr_k,
+                                            Int32(_PAGE_SIZE * _INDEX_HEAD_DIM),
+                                            page_id,
+                                        )
                                 scale_idx = tx
                                 while scale_idx < Int32(_PAGE_SIZE):
                                     s_scale[scale_idx] = Float32(k_scales[page_id, scale_idx])
                                     scale_idx += Int32(_PAGED_THREADS_PER_CTA)
-                                cute.arch.mbarrier_wait(
-                                    mbar_ptr_k + consumer_state.index,
-                                    phase=consumer_state.phase,
-                                )
+                                if use_scalar_k_load_flag == Int32(0):
+                                    cute.arch.mbarrier_wait(
+                                        mbar_ptr_k + consumer_state.index,
+                                        phase=consumer_state.phase,
+                                    )
                                 cute.arch.sync_threads()
                                 _repack_k_page_to_permuted(k_page_base_addr, k_page_perm_base_addr, tx)
                                 cute.arch.sync_threads()
@@ -1582,9 +1667,6 @@ def clear_indexer_kernel_cache() -> None:
     _build_sparse_nsa_paged_tiled_kernel.cache_clear()
     _build_sparse_nsa_schedule_single_row_kernel.cache_clear()
     _build_sparse_nsa_schedule_multi_row_kernel.cache_clear()
-    cache = getattr(_get_cached_paged_index_k_tma_descriptor, "_cache", None)
-    if cache is not None:
-        cache.clear()
 
 
 def supports_paged_logits_kernel(
@@ -1640,18 +1722,73 @@ def supports_paged_logits_kernel(
 
 def run_paged_logits_kernel(
     *,
-    q_fp8: torch.Tensor,
-    weights: torch.Tensor,
-    index_k_cache: torch.Tensor,
-    real_page_table: torch.Tensor,
-    seqlens_per_query: torch.Tensor,
-    schedule_metadata: torch.Tensor | None,
+    q_fp8: torch.Tensor | None = None,
+    weights: torch.Tensor | None = None,
+    index_k_cache: torch.Tensor | None = None,
+    real_page_table: torch.Tensor | None = None,
+    seqlens_per_query: torch.Tensor | None = None,
+    schedule_metadata: torch.Tensor | None = None,
     active_width: torch.Tensor | None = None,
-    page_size: int = _PAGE_SIZE,
+    page_size: int | None = None,
     contract_phantoms: dict[str, torch.Tensor] | None = None,
     workspace=None,
-    preinitialize_invalid_logits: bool = True,
+    preinitialize_invalid_logits: bool | None = None,
+    binding: IndexerPagedLogitsKernelBinding | None = None,
 ) -> torch.Tensor:
+    if binding is not None:
+        extras = [
+            name
+            for name, value in (
+                ("q_fp8", q_fp8),
+                ("weights", weights),
+                ("index_k_cache", index_k_cache),
+                ("real_page_table", real_page_table),
+                ("seqlens_per_query", seqlens_per_query),
+                ("schedule_metadata", schedule_metadata),
+                ("active_width", active_width),
+                ("page_size", page_size),
+                ("contract_phantoms", contract_phantoms),
+                ("workspace", workspace),
+                ("preinitialize_invalid_logits", preinitialize_invalid_logits),
+            )
+            if value is not None
+        ]
+        if extras:
+            _raise_binding_extras("run_paged_logits_kernel", extras)
+        q_fp8 = binding.q_fp8
+        weights = binding.weights
+        index_k_cache = binding.index_k_cache
+        real_page_table = binding.real_page_table
+        seqlens_per_query = binding.seqlens_per_query
+        schedule_metadata = binding.schedule_metadata
+        active_width = binding.active_width
+        page_size = binding.page_size
+        contract_phantoms = binding.contract_phantoms
+        workspace = binding.workspace
+        preinitialize_invalid_logits = binding.preinitialize_invalid_logits
+
+    q_fp8 = _require_bound_arg(q_fp8, api_name="run_paged_logits_kernel", name="q_fp8")
+    weights = _require_bound_arg(weights, api_name="run_paged_logits_kernel", name="weights")
+    index_k_cache = _require_bound_arg(
+        index_k_cache,
+        api_name="run_paged_logits_kernel",
+        name="index_k_cache",
+    )
+    real_page_table = _require_bound_arg(
+        real_page_table,
+        api_name="run_paged_logits_kernel",
+        name="real_page_table",
+    )
+    seqlens_per_query = _require_bound_arg(
+        seqlens_per_query,
+        api_name="run_paged_logits_kernel",
+        name="seqlens_per_query",
+    )
+    page_size = _PAGE_SIZE if page_size is None else int(page_size)
+    preinitialize_invalid_logits = (
+        True if preinitialize_invalid_logits is None else bool(preinitialize_invalid_logits)
+    )
+
     if not supports_paged_logits_kernel(
         q_fp8=q_fp8,
         weights=weights,
@@ -1680,17 +1817,14 @@ def run_paged_logits_kernel(
         )
 
     k_quant_bytes, k_scales = _split_index_k_cache_runtime_views(index_k_cache)
-    use_patched_k_tma_desc = _needs_paged_index_k_tma_descriptor_workaround(
+    use_scalar_k_load = _needs_paged_index_k_scalar_load(
         index_k_cache,
         k_quant_bytes,
     )
     device_index = q_fp8.device.index or 0
-    if use_patched_k_tma_desc:
-        _, k_tma_desc_ptrs = _get_cached_paged_index_k_tma_descriptor(k_quant_bytes)
-    else:
-        k_tma_desc_ptrs = _dummy_paged_index_k_tma_desc_ptrs(device_index)
-    use_patched_k_tma_desc_tensor = _cached_int32_scalar(
-        int(use_patched_k_tma_desc),
+    k_tma_desc_ptrs = _dummy_paged_index_k_tma_desc_ptrs(device_index)
+    use_scalar_k_load_tensor = _cached_int32_scalar(
+        int(use_scalar_k_load),
         device_index,
     )
     if workspace is not None:
@@ -1737,23 +1871,43 @@ def run_paged_logits_kernel(
         _to_kernel_tensor(weights_kernel, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(k_quant_bytes, cutlass.Uint8),
         _to_kernel_tensor(k_tma_desc_ptrs, cutlass.Int64, assumed_align=8),
-        _to_kernel_tensor(use_patched_k_tma_desc_tensor, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(use_scalar_k_load_tensor, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(k_scales, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(real_page_table_kernel, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(seqlens_per_query_kernel, cutlass.Int32, assumed_align=4),
     )
     common_cache_key = (
         q_fp8.shape[1],
-        _tensor_meta_key(_cp.get("q_bytes", q_bytes)),
-        _tensor_meta_key(_cp.get("weights", weights_kernel)),
+        _tensor_compile_key(
+            "q_bytes",
+            _contract_key_tensor(_cp, "q_bytes", q_bytes),
+            dynamic_dims=(0,),
+        ),
+        _tensor_compile_key(
+            "weights",
+            _contract_key_tensor(_cp, "weights", weights_kernel),
+            dynamic_dims=(0,),
+        ),
         _tensor_meta_key(k_quant_bytes),
         _tensor_meta_key(k_tma_desc_ptrs),
-        _tensor_meta_key(use_patched_k_tma_desc_tensor),
+        _tensor_meta_key(use_scalar_k_load_tensor),
         _tensor_meta_key(k_scales),
-        _tensor_meta_key(_cp.get("real_page_table", real_page_table_kernel)),
-        _tensor_meta_key(_cp.get("seqlens_per_query", seqlens_per_query_kernel)),
+        _tensor_compile_key(
+            "real_page_table",
+            _contract_key_tensor(_cp, "real_page_table", real_page_table_kernel),
+            dynamic_dims=(0,),
+        ),
+        _tensor_compile_key(
+            "seqlens_per_query",
+            _contract_key_tensor(_cp, "seqlens_per_query", seqlens_per_query_kernel),
+            dynamic_dims=(0,),
+        ),
         _tensor_meta_key(active_width_kernel),
-        _tensor_meta_key(_cp.get("logits", logits)),
+        _tensor_compile_key(
+            "logits",
+            _contract_key_tensor(_cp, "logits", logits),
+            dynamic_dims=(0,),
+        ),
     )
     max_pages = int(real_page_table.shape[1])
     if schedule_metadata is not None and schedule_metadata_kernel is None:
@@ -1784,7 +1938,11 @@ def run_paged_logits_kernel(
             "schedule_single_row",
             _SCHEDULE_SINGLE_ROW_PARALLEL_CTAS,
             *common_cache_key,
-            _tensor_meta_key(schedule_metadata_kernel),
+            _tensor_compile_key(
+                "schedule_metadata",
+                schedule_metadata_kernel,
+                dynamic_dims=(0,),
+            ),
         )
     elif _should_use_schedule_multi_row_kernel(q_rows=rows, max_pages=max_pages):
         if schedule_metadata is None:
@@ -1804,7 +1962,11 @@ def run_paged_logits_kernel(
             "schedule_multi_row",
             _SCHEDULE_MULTI_ROW_PARALLEL_CTAS,
             *common_cache_key,
-            _tensor_meta_key(schedule_metadata_kernel),
+            _tensor_compile_key(
+                "schedule_metadata",
+                schedule_metadata_kernel,
+                dynamic_dims=(0,),
+            ),
         )
     else:
         persistent_ctas = _resolve_sparse_nsa_persistent_ctas(
@@ -1823,26 +1985,107 @@ def run_paged_logits_kernel(
             persistent_ctas,
             *common_cache_key,
         )
-    _run_cached_host_launcher(kernel, cache_key, args)
+    compile_spec = KernelCompileSpec.from_key(
+        "attention.indexer.paged_logits",
+        2,
+        cache_key,
+    )
+    b12x_launch(
+        kernel,
+        compile_spec=compile_spec,
+        compile_args=args,
+        runtime_args=args,
+    )
     return logits_view
 
 
 def run_paged_tiled_logits_kernel(
     *,
-    q_fp8: torch.Tensor,
-    weights: torch.Tensor,
-    index_k_cache: torch.Tensor,
-    real_page_table: torch.Tensor,
-    seqlens_per_query: torch.Tensor,
-    active_width: torch.Tensor,
-    tile_logits: torch.Tensor,
-    page_size: int = _PAGE_SIZE,
-    tile_block_q: int = _PAGED_TILED_BLOCK_Q,
-    tile_block_k: int = _PAGED_TILED_BLOCK_K,
+    q_fp8: torch.Tensor | None = None,
+    weights: torch.Tensor | None = None,
+    index_k_cache: torch.Tensor | None = None,
+    real_page_table: torch.Tensor | None = None,
+    seqlens_per_query: torch.Tensor | None = None,
+    active_width: torch.Tensor | None = None,
+    tile_logits: torch.Tensor | None = None,
+    page_size: int | None = None,
+    tile_block_q: int | None = None,
+    tile_block_k: int | None = None,
     contract_phantoms: dict[str, torch.Tensor] | None = None,
     workspace=None,
-    preinitialize_tile_logits: bool = True,
+    preinitialize_tile_logits: bool | None = None,
+    binding: IndexerPagedTiledLogitsKernelBinding | None = None,
 ) -> torch.Tensor:
+    if binding is not None:
+        extras = [
+            name
+            for name, value in (
+                ("q_fp8", q_fp8),
+                ("weights", weights),
+                ("index_k_cache", index_k_cache),
+                ("real_page_table", real_page_table),
+                ("seqlens_per_query", seqlens_per_query),
+                ("active_width", active_width),
+                ("tile_logits", tile_logits),
+                ("page_size", page_size),
+                ("tile_block_q", tile_block_q),
+                ("tile_block_k", tile_block_k),
+                ("contract_phantoms", contract_phantoms),
+                ("workspace", workspace),
+                ("preinitialize_tile_logits", preinitialize_tile_logits),
+            )
+            if value is not None
+        ]
+        if extras:
+            _raise_binding_extras("run_paged_tiled_logits_kernel", extras)
+        q_fp8 = binding.q_fp8
+        weights = binding.weights
+        index_k_cache = binding.index_k_cache
+        real_page_table = binding.real_page_table
+        seqlens_per_query = binding.seqlens_per_query
+        active_width = binding.active_width
+        tile_logits = binding.tile_logits
+        page_size = binding.page_size
+        tile_block_q = binding.tile_block_q
+        tile_block_k = binding.tile_block_k
+        contract_phantoms = binding.contract_phantoms
+        workspace = binding.workspace
+        preinitialize_tile_logits = binding.preinitialize_tile_logits
+
+    q_fp8 = _require_bound_arg(q_fp8, api_name="run_paged_tiled_logits_kernel", name="q_fp8")
+    weights = _require_bound_arg(weights, api_name="run_paged_tiled_logits_kernel", name="weights")
+    index_k_cache = _require_bound_arg(
+        index_k_cache,
+        api_name="run_paged_tiled_logits_kernel",
+        name="index_k_cache",
+    )
+    real_page_table = _require_bound_arg(
+        real_page_table,
+        api_name="run_paged_tiled_logits_kernel",
+        name="real_page_table",
+    )
+    seqlens_per_query = _require_bound_arg(
+        seqlens_per_query,
+        api_name="run_paged_tiled_logits_kernel",
+        name="seqlens_per_query",
+    )
+    active_width = _require_bound_arg(
+        active_width,
+        api_name="run_paged_tiled_logits_kernel",
+        name="active_width",
+    )
+    tile_logits = _require_bound_arg(
+        tile_logits,
+        api_name="run_paged_tiled_logits_kernel",
+        name="tile_logits",
+    )
+    page_size = _PAGE_SIZE if page_size is None else int(page_size)
+    tile_block_q = _PAGED_TILED_BLOCK_Q if tile_block_q is None else int(tile_block_q)
+    tile_block_k = _PAGED_TILED_BLOCK_K if tile_block_k is None else int(tile_block_k)
+    preinitialize_tile_logits = (
+        True if preinitialize_tile_logits is None else bool(preinitialize_tile_logits)
+    )
+
     return _run_paged_tiled_logits_kernel_common(
         q_fp8=q_fp8,
         weights=weights,
@@ -1865,23 +2108,121 @@ def run_paged_tiled_logits_kernel(
 
 def run_paged_windowed_tiled_logits_kernel(
     *,
-    q_fp8: torch.Tensor,
-    weights: torch.Tensor,
-    index_k_cache: torch.Tensor,
-    real_page_table: torch.Tensor,
-    seqlens_per_query: torch.Tensor,
-    active_width: torch.Tensor,
-    tile_logits: torch.Tensor,
-    source_page_offset: int,
-    output_width_tokens: int,
-    page_size: int = _PAGE_SIZE,
-    tile_block_q: int = _PAGED_TILED_BLOCK_Q,
-    tile_block_k: int = _PAGED_TILED_BLOCK_K,
+    q_fp8: torch.Tensor | None = None,
+    weights: torch.Tensor | None = None,
+    index_k_cache: torch.Tensor | None = None,
+    real_page_table: torch.Tensor | None = None,
+    seqlens_per_query: torch.Tensor | None = None,
+    active_width: torch.Tensor | None = None,
+    tile_logits: torch.Tensor | None = None,
+    source_page_offset: int | None = None,
+    output_width_tokens: int | None = None,
+    page_size: int | None = None,
+    tile_block_q: int | None = None,
+    tile_block_k: int | None = None,
     contract_phantoms: dict[str, torch.Tensor] | None = None,
     workspace=None,
-    preinitialize_tile_logits: bool = True,
-    stage_runtime_metadata: bool = True,
+    preinitialize_tile_logits: bool | None = None,
+    stage_runtime_metadata: bool | None = None,
+    binding: IndexerPagedWindowedTiledLogitsKernelBinding | None = None,
 ) -> torch.Tensor:
+    if binding is not None:
+        extras = [
+            name
+            for name, value in (
+                ("q_fp8", q_fp8),
+                ("weights", weights),
+                ("index_k_cache", index_k_cache),
+                ("real_page_table", real_page_table),
+                ("seqlens_per_query", seqlens_per_query),
+                ("active_width", active_width),
+                ("tile_logits", tile_logits),
+                ("source_page_offset", source_page_offset),
+                ("output_width_tokens", output_width_tokens),
+                ("page_size", page_size),
+                ("tile_block_q", tile_block_q),
+                ("tile_block_k", tile_block_k),
+                ("contract_phantoms", contract_phantoms),
+                ("workspace", workspace),
+                ("preinitialize_tile_logits", preinitialize_tile_logits),
+                ("stage_runtime_metadata", stage_runtime_metadata),
+            )
+            if value is not None
+        ]
+        if extras:
+            _raise_binding_extras("run_paged_windowed_tiled_logits_kernel", extras)
+        q_fp8 = binding.q_fp8
+        weights = binding.weights
+        index_k_cache = binding.index_k_cache
+        real_page_table = binding.real_page_table
+        seqlens_per_query = binding.seqlens_per_query
+        active_width = binding.active_width
+        tile_logits = binding.tile_logits
+        source_page_offset = binding.source_page_offset
+        output_width_tokens = binding.output_width_tokens
+        page_size = binding.page_size
+        tile_block_q = binding.tile_block_q
+        tile_block_k = binding.tile_block_k
+        contract_phantoms = binding.contract_phantoms
+        workspace = binding.workspace
+        preinitialize_tile_logits = binding.preinitialize_tile_logits
+        stage_runtime_metadata = binding.stage_runtime_metadata
+
+    q_fp8 = _require_bound_arg(
+        q_fp8,
+        api_name="run_paged_windowed_tiled_logits_kernel",
+        name="q_fp8",
+    )
+    weights = _require_bound_arg(
+        weights,
+        api_name="run_paged_windowed_tiled_logits_kernel",
+        name="weights",
+    )
+    index_k_cache = _require_bound_arg(
+        index_k_cache,
+        api_name="run_paged_windowed_tiled_logits_kernel",
+        name="index_k_cache",
+    )
+    real_page_table = _require_bound_arg(
+        real_page_table,
+        api_name="run_paged_windowed_tiled_logits_kernel",
+        name="real_page_table",
+    )
+    seqlens_per_query = _require_bound_arg(
+        seqlens_per_query,
+        api_name="run_paged_windowed_tiled_logits_kernel",
+        name="seqlens_per_query",
+    )
+    active_width = _require_bound_arg(
+        active_width,
+        api_name="run_paged_windowed_tiled_logits_kernel",
+        name="active_width",
+    )
+    tile_logits = _require_bound_arg(
+        tile_logits,
+        api_name="run_paged_windowed_tiled_logits_kernel",
+        name="tile_logits",
+    )
+    source_page_offset = _require_bound_arg(
+        source_page_offset,
+        api_name="run_paged_windowed_tiled_logits_kernel",
+        name="source_page_offset",
+    )
+    output_width_tokens = _require_bound_arg(
+        output_width_tokens,
+        api_name="run_paged_windowed_tiled_logits_kernel",
+        name="output_width_tokens",
+    )
+    page_size = _PAGE_SIZE if page_size is None else int(page_size)
+    tile_block_q = _PAGED_TILED_BLOCK_Q if tile_block_q is None else int(tile_block_q)
+    tile_block_k = _PAGED_TILED_BLOCK_K if tile_block_k is None else int(tile_block_k)
+    preinitialize_tile_logits = (
+        True if preinitialize_tile_logits is None else bool(preinitialize_tile_logits)
+    )
+    stage_runtime_metadata = (
+        True if stage_runtime_metadata is None else bool(stage_runtime_metadata)
+    )
+
     return _run_paged_tiled_logits_kernel_common(
         q_fp8=q_fp8,
         weights=weights,
@@ -1986,17 +2327,14 @@ def _run_paged_tiled_logits_kernel_common(
         )
 
     k_quant_bytes, k_scales = _split_index_k_cache_runtime_views(index_k_cache)
-    use_patched_k_tma_desc = _needs_paged_index_k_tma_descriptor_workaround(
+    use_scalar_k_load = _needs_paged_index_k_scalar_load(
         index_k_cache,
         k_quant_bytes,
     )
     device_index = q_fp8.device.index or 0
-    if use_patched_k_tma_desc:
-        _, k_tma_desc_ptrs = _get_cached_paged_index_k_tma_descriptor(k_quant_bytes)
-    else:
-        k_tma_desc_ptrs = _dummy_paged_index_k_tma_desc_ptrs(device_index)
-    use_patched_k_tma_desc_tensor = _cached_int32_scalar(
-        int(use_patched_k_tma_desc),
+    k_tma_desc_ptrs = _dummy_paged_index_k_tma_desc_ptrs(device_index)
+    use_scalar_k_load_tensor = _cached_int32_scalar(
+        int(use_scalar_k_load),
         device_index,
     )
     if workspace is not None and stage_runtime_metadata:
@@ -2050,23 +2388,47 @@ def _run_paged_tiled_logits_kernel_common(
         _to_kernel_tensor(weights_kernel, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(k_quant_bytes, cutlass.Uint8),
         _to_kernel_tensor(k_tma_desc_ptrs, cutlass.Int64, assumed_align=8),
-        _to_kernel_tensor(use_patched_k_tma_desc_tensor, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(use_scalar_k_load_tensor, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(k_scales, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(real_page_table_kernel, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(seqlens_per_query_kernel, cutlass.Int32, assumed_align=4),
     )
     common_cache_key = (
         q_fp8.shape[1],
-        _tensor_meta_key(_cp.get("q_bytes", q_bytes)),
-        _tensor_meta_key(_cp.get("weights", weights_kernel)),
+        _tensor_compile_key(
+            "q_bytes",
+            _contract_key_tensor(_cp, "q_bytes", q_bytes),
+            dynamic_dims=(0,),
+        ),
+        _tensor_compile_key(
+            "weights",
+            _contract_key_tensor(_cp, "weights", weights_kernel),
+            dynamic_dims=(0,),
+        ),
         _tensor_meta_key(k_quant_bytes),
         _tensor_meta_key(k_tma_desc_ptrs),
-        _tensor_meta_key(use_patched_k_tma_desc_tensor),
+        _tensor_meta_key(use_scalar_k_load_tensor),
         _tensor_meta_key(k_scales),
-        _tensor_meta_key(_cp.get("real_page_table", real_page_table_kernel)),
-        _tensor_meta_key(_cp.get("seqlens_per_query", seqlens_per_query_kernel)),
+        _tensor_compile_key(
+            "real_page_table",
+            _contract_key_tensor(_cp, "real_page_table", real_page_table_kernel),
+            dynamic_dims=(0,),
+        ),
+        _tensor_compile_key(
+            "seqlens_per_query",
+            _contract_key_tensor(_cp, "seqlens_per_query", seqlens_per_query_kernel),
+            dynamic_dims=(0,),
+        ),
         _tensor_meta_key(active_width_kernel),
-        _tensor_meta_key(_cp.get("tile_logits", _cp.get("logits", logits))),
+        _tensor_compile_key(
+            "tile_logits",
+            _contract_key_tensor(
+                _cp,
+                "tile_logits" if "tile_logits" in _cp else "logits",
+                logits,
+            ),
+            dynamic_dims=(0,),
+        ),
     )
     workspace_persistent_ctas = (
         workspace.get_paged_indexer_persistent_ctas()
@@ -2123,7 +2485,17 @@ def _run_paged_tiled_logits_kernel_common(
             int(tile_block_k),
             *common_cache_key,
         )
-    _run_cached_host_launcher(kernel, cache_key, args)
+    compile_spec = KernelCompileSpec.from_key(
+        "attention.indexer.paged_tiled_logits",
+        2,
+        cache_key,
+    )
+    b12x_launch(
+        kernel,
+        compile_spec=compile_spec,
+        compile_args=args,
+        runtime_args=args,
+    )
     logits_view._b12x_num_q_tiles = num_q_tiles
     logits_view._b12x_num_k_tiles = num_k_tiles
     logits_view._b12x_block_q = int(tile_block_q)

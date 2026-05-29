@@ -17,9 +17,16 @@ _ARENA_ALIGN_BYTES = 1024
 _MHC_MULT = 4
 _MHC_PARTIALS = 25
 _MHC_DEFAULT_SPLIT_K = 64
+_WO_MXFP8_SCALE_VEC_SIZE = 32
+_WO_MXFP8_SCALE_ROW_TILE = 128
+_WO_MXFP8_SCALE_K_TILE = 4
 _SPLIT_CHUNK_LADDER = (8, 16, 32, 64, 128, 256, 512, 1024)
 _SPLIT_MAX_CHUNKS = 256
 _SPLIT_MAX_WIDTH = _SPLIT_CHUNK_LADDER[-1] * _SPLIT_MAX_CHUNKS
+
+
+class B12XIndexerTopKPositionBufferUnavailable(RuntimeError):
+    """Raised when an arena does not reserve reusable top-k merge positions."""
 
 
 @dataclass(frozen=True)
@@ -310,10 +317,17 @@ class B12XAttentionArenaCaps:
     max_chunks_per_row: int = 64
     reserve_extend_indexer_logits: bool = True
     reserve_paged_indexer_logits: bool = True
+    reserve_compressed_mla_staging: bool = False
     reserve_mhc: bool = False
     mhc_max_tokens: int = 0
     mhc_hidden_size: int = 0
     mhc_split_k: int = _MHC_DEFAULT_SPLIT_K
+    reserve_wo_projection: bool = False
+    wo_max_tokens: int = 0
+    wo_groups: int = 0
+    wo_group_width: int = 0
+    wo_rank: int = 0
+    wo_hidden_size: int = 0
     extend_indexer_tile_logits_k_rows: int = 0
     paged_indexer_logits_q_rows: int = 0
     paged_indexer_logits_k_rows: int = 0
@@ -399,6 +413,11 @@ class B12XAttentionArenaCaps:
             "reserve_paged_indexer_logits",
             bool(self.reserve_paged_indexer_logits),
         )
+        object.__setattr__(
+            self,
+            "reserve_compressed_mla_staging",
+            bool(self.reserve_compressed_mla_staging),
+        )
         object.__setattr__(self, "reserve_mhc", bool(self.reserve_mhc))
         object.__setattr__(self, "mhc_max_tokens", max(int(self.mhc_max_tokens), 0))
         object.__setattr__(self, "mhc_hidden_size", max(int(self.mhc_hidden_size), 0))
@@ -409,6 +428,26 @@ class B12XAttentionArenaCaps:
             raise ValueError(
                 "reserve_mhc requires positive mhc_max_tokens and mhc_hidden_size"
             )
+        object.__setattr__(self, "reserve_wo_projection", bool(self.reserve_wo_projection))
+        object.__setattr__(self, "wo_max_tokens", max(int(self.wo_max_tokens), 0))
+        object.__setattr__(self, "wo_groups", max(int(self.wo_groups), 0))
+        object.__setattr__(self, "wo_group_width", max(int(self.wo_group_width), 0))
+        object.__setattr__(self, "wo_rank", max(int(self.wo_rank), 0))
+        object.__setattr__(self, "wo_hidden_size", max(int(self.wo_hidden_size), 0))
+        if self.reserve_wo_projection:
+            if (
+                int(self.wo_max_tokens) <= 0
+                or int(self.wo_groups) <= 0
+                or int(self.wo_group_width) <= 0
+                or int(self.wo_rank) <= 0
+                or int(self.wo_hidden_size) <= 0
+            ):
+                raise ValueError(
+                    "reserve_wo_projection requires positive wo_max_tokens, "
+                    "wo_groups, wo_group_width, wo_rank, and wo_hidden_size"
+                )
+            _check_wo_mxfp8_k(int(self.wo_group_width))
+            _check_wo_mxfp8_k(int(self.wo_rank) * int(self.wo_groups))
         object.__setattr__(
             self,
             "extend_indexer_tile_logits_k_rows",
@@ -484,6 +523,129 @@ class B12XAttentionWorkspaceContract:
 
 
 @dataclass(frozen=True, kw_only=True)
+class _B12XWOProjectionArenaLayout:
+    nbytes: int = 0
+    x_q_values_offset_bytes: int = 0
+    x_q_scale_rows_offset_bytes: int = 0
+    x_q_scale_mma_offset_bytes: int = 0
+    tmp_offset_bytes: int = 0
+    tmp_q_values_offset_bytes: int = 0
+    tmp_q_scale_rows_offset_bytes: int = 0
+    tmp_q_scale_mma_offset_bytes: int = 0
+    output_offset_bytes: int = 0
+
+
+def _check_wo_mxfp8_k(k: int) -> None:
+    if int(k) <= 0 or int(k) % 128 != 0:
+        raise ValueError(f"WO MXFP8 dense-GEMM K must be a positive multiple of 128, got {k}")
+
+
+def _wo_mxfp8_scale_physical_shape(
+    *,
+    m: int,
+    k: int,
+    num_groups: int,
+) -> tuple[int, int, int, int, int, int]:
+    sf_k = int(k) // _WO_MXFP8_SCALE_VEC_SIZE
+    return (
+        int(num_groups),
+        _ceil_div(int(m), _WO_MXFP8_SCALE_ROW_TILE),
+        _ceil_div(sf_k, _WO_MXFP8_SCALE_K_TILE),
+        32,
+        4,
+        4,
+    )
+
+
+def _layout_wo_projection(
+    *,
+    offset_bytes: int,
+    tokens: int,
+    groups: int,
+    group_width: int,
+    rank: int,
+    hidden: int,
+) -> _B12XWOProjectionArenaLayout:
+    tokens = max(int(tokens), 1)
+    groups = int(groups)
+    group_width = int(group_width)
+    rank = int(rank)
+    hidden = int(hidden)
+    if groups <= 0 or group_width <= 0 or rank <= 0 or hidden <= 0:
+        raise ValueError("WO projection arena requires positive groups, group_width, rank, and hidden")
+    _check_wo_mxfp8_k(group_width)
+    _check_wo_mxfp8_k(rank * groups)
+
+    start = int(offset_bytes)
+    cursor = _align_up(start, _ARENA_ALIGN_BYTES)
+
+    x_q_values_offset_bytes = cursor
+    cursor += tokens * group_width * groups * _dtype_nbytes(torch.float8_e4m3fn)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    x_q_scale_rows_offset_bytes = cursor
+    cursor += (
+        groups
+        * tokens
+        * (group_width // _WO_MXFP8_SCALE_VEC_SIZE)
+        * _dtype_nbytes(torch.float8_e8m0fnu)
+    )
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    x_q_scale_mma_offset_bytes = cursor
+    cursor += _shape_numel(
+        _wo_mxfp8_scale_physical_shape(
+            m=tokens,
+            k=group_width,
+            num_groups=groups,
+        )
+    ) * _dtype_nbytes(torch.uint8)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    tmp_offset_bytes = cursor
+    cursor += tokens * rank * groups * _dtype_nbytes(torch.bfloat16)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    tmp_q_width = rank * groups
+    tmp_q_values_offset_bytes = cursor
+    cursor += tokens * tmp_q_width * _dtype_nbytes(torch.float8_e4m3fn)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    tmp_q_scale_rows_offset_bytes = cursor
+    cursor += (
+        tokens
+        * (tmp_q_width // _WO_MXFP8_SCALE_VEC_SIZE)
+        * _dtype_nbytes(torch.float8_e8m0fnu)
+    )
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    tmp_q_scale_mma_offset_bytes = cursor
+    cursor += _shape_numel(
+        _wo_mxfp8_scale_physical_shape(
+            m=tokens,
+            k=tmp_q_width,
+            num_groups=1,
+        )
+    ) * _dtype_nbytes(torch.uint8)
+    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+
+    output_offset_bytes = cursor
+    cursor += tokens * hidden * _dtype_nbytes(torch.bfloat16)
+
+    return _B12XWOProjectionArenaLayout(
+        nbytes=max(0, int(cursor) - start),
+        x_q_values_offset_bytes=x_q_values_offset_bytes,
+        x_q_scale_rows_offset_bytes=x_q_scale_rows_offset_bytes,
+        x_q_scale_mma_offset_bytes=x_q_scale_mma_offset_bytes,
+        tmp_offset_bytes=tmp_offset_bytes,
+        tmp_q_values_offset_bytes=tmp_q_values_offset_bytes,
+        tmp_q_scale_rows_offset_bytes=tmp_q_scale_rows_offset_bytes,
+        tmp_q_scale_mma_offset_bytes=tmp_q_scale_mma_offset_bytes,
+        output_offset_bytes=output_offset_bytes,
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
 class _B12XAttentionArenaLayout:
     arena_nbytes: int
     mla_phase_nbytes: int
@@ -496,6 +658,10 @@ class _B12XAttentionArenaLayout:
     ragged_kv_nbytes: int
     output_buffer_nbytes: int
     final_lse_nbytes: int
+    compressed_q_stage_nbytes: int
+    compressed_index_stage_nbytes: int
+    compressed_page_table_stage_nbytes: int
+    compressed_lengths_stage_nbytes: int
     indexer_logits_nbytes: int
     indexer_extend_logits_nbytes: int
     indexer_extend_tile_logits_nbytes: int
@@ -503,6 +669,7 @@ class _B12XAttentionArenaLayout:
     indexer_extend_topk_values_nbytes: int
     indexer_extend_topk_scratch_indices_nbytes: int
     indexer_extend_topk_scratch_values_nbytes: int
+    indexer_extend_topk_position_nbytes: int
     indexer_extend_candidate_values_nbytes: int
     indexer_extend_candidate_indices_nbytes: int
     indexer_extend_lengths_nbytes: int
@@ -514,11 +681,18 @@ class _B12XAttentionArenaLayout:
     mhc_post_nbytes: int
     mhc_comb_nbytes: int
     mhc_out_nbytes: int
+    wo_projection_layout: _B12XWOProjectionArenaLayout
     ragged_kv_offset_bytes: int
     tmp_output_offset_bytes: int
     tmp_lse_offset_bytes: int
     output_buffer_offset_bytes: int
     final_lse_offset_bytes: int
+    compressed_q_stage_offset_bytes: int
+    compressed_swa_indices_stage_offset_bytes: int
+    compressed_swa_lengths_stage_offset_bytes: int
+    compressed_indexed_indices_stage_offset_bytes: int
+    compressed_indexed_lengths_stage_offset_bytes: int
+    compressed_indexed_page_table_stage_offset_bytes: int
     indexer_k_quant_offset_bytes: int
     indexer_k_scale_offset_bytes: int
     indexer_extend_logits_offset_bytes: int
@@ -527,6 +701,7 @@ class _B12XAttentionArenaLayout:
     indexer_extend_topk_values_offset_bytes: int
     indexer_extend_topk_scratch_indices_offset_bytes: int
     indexer_extend_topk_scratch_values_offset_bytes: int
+    indexer_extend_topk_position_offset_bytes: int
     indexer_extend_candidate_values_offset_bytes: int
     indexer_extend_candidate_indices_offset_bytes: int
     indexer_extend_lengths_offset_bytes: int
@@ -554,6 +729,10 @@ class B12XAttentionArena:
     ragged_kv_nbytes: int
     output_buffer_nbytes: int
     final_lse_nbytes: int
+    compressed_q_stage_nbytes: int
+    compressed_index_stage_nbytes: int
+    compressed_page_table_stage_nbytes: int
+    compressed_lengths_stage_nbytes: int
     indexer_logits_nbytes: int
     indexer_extend_logits_nbytes: int
     indexer_extend_tile_logits_nbytes: int
@@ -561,6 +740,7 @@ class B12XAttentionArena:
     indexer_extend_topk_values_nbytes: int
     indexer_extend_topk_scratch_indices_nbytes: int
     indexer_extend_topk_scratch_values_nbytes: int
+    indexer_extend_topk_position_nbytes: int
     indexer_extend_candidate_values_nbytes: int
     indexer_extend_candidate_indices_nbytes: int
     indexer_extend_lengths_nbytes: int
@@ -572,11 +752,18 @@ class B12XAttentionArena:
     mhc_post_nbytes: int
     mhc_comb_nbytes: int
     mhc_out_nbytes: int
+    wo_projection_layout: _B12XWOProjectionArenaLayout
     ragged_kv_offset_bytes: int
     tmp_output_offset_bytes: int
     tmp_lse_offset_bytes: int
     output_buffer_offset_bytes: int
     final_lse_offset_bytes: int
+    compressed_q_stage_offset_bytes: int
+    compressed_swa_indices_stage_offset_bytes: int
+    compressed_swa_lengths_stage_offset_bytes: int
+    compressed_indexed_indices_stage_offset_bytes: int
+    compressed_indexed_lengths_stage_offset_bytes: int
+    compressed_indexed_page_table_stage_offset_bytes: int
     indexer_k_quant_offset_bytes: int
     indexer_k_scale_offset_bytes: int
     indexer_extend_logits_offset_bytes: int
@@ -585,6 +772,7 @@ class B12XAttentionArena:
     indexer_extend_topk_values_offset_bytes: int
     indexer_extend_topk_scratch_indices_offset_bytes: int
     indexer_extend_topk_scratch_values_offset_bytes: int
+    indexer_extend_topk_position_offset_bytes: int
     indexer_extend_candidate_values_offset_bytes: int
     indexer_extend_candidate_indices_offset_bytes: int
     indexer_extend_lengths_offset_bytes: int
@@ -603,9 +791,11 @@ class B12XAttentionArena:
         max_paged_q_rows = max(int(caps.paged_max_q_rows), 1)
         paged_logits_q_rows = max(int(caps.paged_indexer_logits_q_rows), 1)
         max_kv_rows = max(int(caps.extend_max_kv_rows), 1)
-        indexer_k_rows = _align_up(
-            max(int(caps.indexer_max_k_rows or 0), 1),
-            _INDEXER_BLOCK_K,
+        raw_indexer_k_rows = max(int(caps.indexer_max_k_rows or 0), 0)
+        indexer_k_rows = (
+            0
+            if raw_indexer_k_rows == 0
+            else _align_up(raw_indexer_k_rows, _INDEXER_BLOCK_K)
         )
         default_mla_tmp_q_chunks = mla_max_total_q * int(caps.max_chunks_per_row)
         mla_tmp_q_chunks = (
@@ -663,6 +853,50 @@ class B12XAttentionArena:
         )
         mla_offset += final_lse_nbytes
         mla_offset = _align_up(mla_offset, _ARENA_ALIGN_BYTES)
+
+        compressed_q_stage_offset_bytes = mla_offset
+        compressed_q_stage_nbytes = 0
+        compressed_index_stage_nbytes = 0
+        compressed_page_table_stage_nbytes = 0
+        compressed_lengths_stage_nbytes = 0
+        compressed_swa_indices_stage_offset_bytes = compressed_swa_lengths_stage_offset_bytes = 0
+        compressed_indexed_indices_stage_offset_bytes = compressed_indexed_lengths_stage_offset_bytes = 0
+        compressed_indexed_page_table_stage_offset_bytes = 0
+        if caps.reserve_compressed_mla_staging:
+            compressed_q_stage_nbytes = (
+                mla_max_total_q
+                * int(caps.num_q_heads)
+                * int(caps.head_dim)
+                * _dtype_nbytes(caps.dtype)
+            )
+            mla_offset += compressed_q_stage_nbytes
+            mla_offset = _align_up(mla_offset, _ARENA_ALIGN_BYTES)
+            compressed_swa_indices_stage_offset_bytes = mla_offset
+            compressed_index_stage_nbytes = (
+                mla_max_total_q
+                * int(caps.topk)
+                * _dtype_nbytes(torch.int32)
+            )
+            mla_offset += compressed_index_stage_nbytes
+            mla_offset = _align_up(mla_offset, _ARENA_ALIGN_BYTES)
+            compressed_swa_lengths_stage_offset_bytes = mla_offset
+            compressed_lengths_stage_nbytes = mla_max_total_q * _dtype_nbytes(torch.int32)
+            mla_offset += compressed_lengths_stage_nbytes
+            mla_offset = _align_up(mla_offset, _ARENA_ALIGN_BYTES)
+            compressed_indexed_indices_stage_offset_bytes = mla_offset
+            mla_offset += compressed_index_stage_nbytes
+            mla_offset = _align_up(mla_offset, _ARENA_ALIGN_BYTES)
+            compressed_indexed_lengths_stage_offset_bytes = mla_offset
+            mla_offset += compressed_lengths_stage_nbytes
+            mla_offset = _align_up(mla_offset, _ARENA_ALIGN_BYTES)
+            compressed_indexed_page_table_stage_offset_bytes = mla_offset
+            compressed_page_table_stage_nbytes = (
+                mla_max_total_q
+                * int(caps.max_page_table_width)
+                * _dtype_nbytes(torch.int32)
+            )
+            mla_offset += compressed_page_table_stage_nbytes
+            mla_offset = _align_up(mla_offset, _ARENA_ALIGN_BYTES)
         mla_phase_nbytes = int(mla_offset)
 
         extend_offset = 0
@@ -767,6 +1001,16 @@ class B12XAttentionArena:
                 paged_tile_candidate_chunks,
             )
         candidate_chunks = max(extend_candidate_chunks, paged_candidate_chunks)
+        indexer_extend_topk_position_offset_bytes = extend_offset
+        extend_topk_position_nbytes = 0
+        if candidate_chunks > 1:
+            extend_topk_position_nbytes = (
+                indexer_q_rows
+                * indexer_topk
+                * _dtype_nbytes(torch.int64)
+            )
+            extend_offset += extend_topk_position_nbytes
+            extend_offset = _align_up(extend_offset, _ARENA_ALIGN_BYTES)
         indexer_extend_candidate_values_offset_bytes = extend_offset
         extend_candidate_values_nbytes = (
             int(candidate_chunks)
@@ -811,55 +1055,67 @@ class B12XAttentionArena:
 
         indexer_phase_nbytes = int(max(extend_offset, paged_offset))
         attention_phase_nbytes = max(mla_phase_nbytes, indexer_phase_nbytes, 1)
-        mhc_offset = attention_phase_nbytes
+        aux_offset = attention_phase_nbytes
         mhc_partials_offset_bytes = mhc_y_offset_bytes = 0
         mhc_post_offset_bytes = mhc_comb_offset_bytes = mhc_out_offset_bytes = 0
         mhc_partials_nbytes = mhc_y_nbytes = mhc_post_nbytes = 0
         mhc_comb_nbytes = mhc_out_nbytes = 0
         if caps.reserve_mhc:
-            mhc_offset = _align_up(mhc_offset, _ARENA_ALIGN_BYTES)
-            mhc_partials_offset_bytes = mhc_offset
+            aux_offset = _align_up(aux_offset, _ARENA_ALIGN_BYTES)
+            mhc_partials_offset_bytes = aux_offset
             mhc_partials_nbytes = (
                 int(caps.mhc_max_tokens)
                 * int(caps.mhc_split_k)
                 * _MHC_PARTIALS
                 * _dtype_nbytes(torch.float32)
             )
-            mhc_offset += mhc_partials_nbytes
-            mhc_offset = _align_up(mhc_offset, _ARENA_ALIGN_BYTES)
-            mhc_y_offset_bytes = mhc_offset
+            aux_offset += mhc_partials_nbytes
+            aux_offset = _align_up(aux_offset, _ARENA_ALIGN_BYTES)
+            mhc_y_offset_bytes = aux_offset
             mhc_y_nbytes = (
                 int(caps.mhc_max_tokens)
                 * int(caps.mhc_hidden_size)
                 * _dtype_nbytes(caps.dtype)
             )
-            mhc_offset += mhc_y_nbytes
-            mhc_offset = _align_up(mhc_offset, _ARENA_ALIGN_BYTES)
-            mhc_post_offset_bytes = mhc_offset
+            aux_offset += mhc_y_nbytes
+            aux_offset = _align_up(aux_offset, _ARENA_ALIGN_BYTES)
+            mhc_post_offset_bytes = aux_offset
             mhc_post_nbytes = (
                 int(caps.mhc_max_tokens) * _MHC_MULT * _dtype_nbytes(torch.float32)
             )
-            mhc_offset += mhc_post_nbytes
-            mhc_offset = _align_up(mhc_offset, _ARENA_ALIGN_BYTES)
-            mhc_comb_offset_bytes = mhc_offset
+            aux_offset += mhc_post_nbytes
+            aux_offset = _align_up(aux_offset, _ARENA_ALIGN_BYTES)
+            mhc_comb_offset_bytes = aux_offset
             mhc_comb_nbytes = (
                 int(caps.mhc_max_tokens)
                 * _MHC_MULT
                 * _MHC_MULT
                 * _dtype_nbytes(torch.float32)
             )
-            mhc_offset += mhc_comb_nbytes
-            mhc_offset = _align_up(mhc_offset, _ARENA_ALIGN_BYTES)
-            mhc_out_offset_bytes = mhc_offset
+            aux_offset += mhc_comb_nbytes
+            aux_offset = _align_up(aux_offset, _ARENA_ALIGN_BYTES)
+            mhc_out_offset_bytes = aux_offset
             mhc_out_nbytes = (
                 int(caps.mhc_max_tokens)
                 * _MHC_MULT
                 * int(caps.mhc_hidden_size)
                 * _dtype_nbytes(caps.dtype)
             )
-            mhc_offset += mhc_out_nbytes
-        mhc_nbytes = max(0, int(mhc_offset) - int(attention_phase_nbytes))
-        arena_nbytes = max(attention_phase_nbytes, int(mhc_offset), 1)
+            aux_offset += mhc_out_nbytes
+        mhc_nbytes = max(0, int(aux_offset) - int(attention_phase_nbytes))
+
+        wo_projection_layout = _B12XWOProjectionArenaLayout()
+        if caps.reserve_wo_projection:
+            wo_projection_layout = _layout_wo_projection(
+                offset_bytes=aux_offset,
+                tokens=int(caps.wo_max_tokens),
+                groups=int(caps.wo_groups),
+                group_width=int(caps.wo_group_width),
+                rank=int(caps.wo_rank),
+                hidden=int(caps.wo_hidden_size),
+            )
+            aux_offset += wo_projection_layout.nbytes
+        arena_nbytes = max(attention_phase_nbytes, int(aux_offset), 1)
         ragged_kv_nbytes = max_kv_rows * _MLA_PACKED_DIM * _dtype_nbytes(caps.kv_dtype)
         return _B12XAttentionArenaLayout(
             arena_nbytes=int(arena_nbytes),
@@ -873,6 +1129,10 @@ class B12XAttentionArena:
             ragged_kv_nbytes=ragged_kv_nbytes,
             output_buffer_nbytes=output_buffer_nbytes,
             final_lse_nbytes=final_lse_nbytes,
+            compressed_q_stage_nbytes=compressed_q_stage_nbytes,
+            compressed_index_stage_nbytes=compressed_index_stage_nbytes,
+            compressed_page_table_stage_nbytes=compressed_page_table_stage_nbytes,
+            compressed_lengths_stage_nbytes=compressed_lengths_stage_nbytes,
             indexer_logits_nbytes=max(
                 extend_logits_nbytes,
                 extend_tile_logits_nbytes,
@@ -880,6 +1140,7 @@ class B12XAttentionArena:
                 extend_topk_values_nbytes,
                 extend_topk_scratch_indices_nbytes,
                 extend_topk_scratch_values_nbytes,
+                extend_topk_position_nbytes,
                 extend_candidate_values_nbytes,
                 extend_candidate_indices_nbytes,
                 extend_lengths_nbytes,
@@ -892,6 +1153,7 @@ class B12XAttentionArena:
             indexer_extend_topk_values_nbytes=extend_topk_values_nbytes,
             indexer_extend_topk_scratch_indices_nbytes=extend_topk_scratch_indices_nbytes,
             indexer_extend_topk_scratch_values_nbytes=extend_topk_scratch_values_nbytes,
+            indexer_extend_topk_position_nbytes=extend_topk_position_nbytes,
             indexer_extend_candidate_values_nbytes=extend_candidate_values_nbytes,
             indexer_extend_candidate_indices_nbytes=extend_candidate_indices_nbytes,
             indexer_extend_lengths_nbytes=extend_lengths_nbytes,
@@ -903,11 +1165,18 @@ class B12XAttentionArena:
             mhc_post_nbytes=mhc_post_nbytes,
             mhc_comb_nbytes=mhc_comb_nbytes,
             mhc_out_nbytes=mhc_out_nbytes,
+            wo_projection_layout=wo_projection_layout,
             ragged_kv_offset_bytes=ragged_kv_offset_bytes,
             tmp_output_offset_bytes=tmp_output_offset_bytes,
             tmp_lse_offset_bytes=tmp_lse_offset_bytes,
             output_buffer_offset_bytes=output_buffer_offset_bytes,
             final_lse_offset_bytes=final_lse_offset_bytes,
+            compressed_q_stage_offset_bytes=compressed_q_stage_offset_bytes,
+            compressed_swa_indices_stage_offset_bytes=compressed_swa_indices_stage_offset_bytes,
+            compressed_swa_lengths_stage_offset_bytes=compressed_swa_lengths_stage_offset_bytes,
+            compressed_indexed_indices_stage_offset_bytes=compressed_indexed_indices_stage_offset_bytes,
+            compressed_indexed_lengths_stage_offset_bytes=compressed_indexed_lengths_stage_offset_bytes,
+            compressed_indexed_page_table_stage_offset_bytes=compressed_indexed_page_table_stage_offset_bytes,
             indexer_k_quant_offset_bytes=indexer_k_quant_offset_bytes,
             indexer_k_scale_offset_bytes=indexer_k_scale_offset_bytes,
             indexer_extend_logits_offset_bytes=indexer_extend_logits_offset_bytes,
@@ -916,6 +1185,7 @@ class B12XAttentionArena:
             indexer_extend_topk_values_offset_bytes=indexer_extend_topk_values_offset_bytes,
             indexer_extend_topk_scratch_indices_offset_bytes=indexer_extend_topk_scratch_indices_offset_bytes,
             indexer_extend_topk_scratch_values_offset_bytes=indexer_extend_topk_scratch_values_offset_bytes,
+            indexer_extend_topk_position_offset_bytes=indexer_extend_topk_position_offset_bytes,
             indexer_extend_candidate_values_offset_bytes=indexer_extend_candidate_values_offset_bytes,
             indexer_extend_candidate_indices_offset_bytes=indexer_extend_candidate_indices_offset_bytes,
             indexer_extend_lengths_offset_bytes=indexer_extend_lengths_offset_bytes,
@@ -965,6 +1235,10 @@ class B12XAttentionArena:
             ragged_kv_nbytes=layout.ragged_kv_nbytes,
             output_buffer_nbytes=layout.output_buffer_nbytes,
             final_lse_nbytes=layout.final_lse_nbytes,
+            compressed_q_stage_nbytes=layout.compressed_q_stage_nbytes,
+            compressed_index_stage_nbytes=layout.compressed_index_stage_nbytes,
+            compressed_page_table_stage_nbytes=layout.compressed_page_table_stage_nbytes,
+            compressed_lengths_stage_nbytes=layout.compressed_lengths_stage_nbytes,
             indexer_logits_nbytes=layout.indexer_logits_nbytes,
             indexer_extend_logits_nbytes=layout.indexer_extend_logits_nbytes,
             indexer_extend_tile_logits_nbytes=layout.indexer_extend_tile_logits_nbytes,
@@ -972,6 +1246,7 @@ class B12XAttentionArena:
             indexer_extend_topk_values_nbytes=layout.indexer_extend_topk_values_nbytes,
             indexer_extend_topk_scratch_indices_nbytes=layout.indexer_extend_topk_scratch_indices_nbytes,
             indexer_extend_topk_scratch_values_nbytes=layout.indexer_extend_topk_scratch_values_nbytes,
+            indexer_extend_topk_position_nbytes=layout.indexer_extend_topk_position_nbytes,
             indexer_extend_candidate_values_nbytes=layout.indexer_extend_candidate_values_nbytes,
             indexer_extend_candidate_indices_nbytes=layout.indexer_extend_candidate_indices_nbytes,
             indexer_extend_lengths_nbytes=layout.indexer_extend_lengths_nbytes,
@@ -983,11 +1258,18 @@ class B12XAttentionArena:
             mhc_post_nbytes=layout.mhc_post_nbytes,
             mhc_comb_nbytes=layout.mhc_comb_nbytes,
             mhc_out_nbytes=layout.mhc_out_nbytes,
+            wo_projection_layout=layout.wo_projection_layout,
             ragged_kv_offset_bytes=layout.ragged_kv_offset_bytes,
             tmp_output_offset_bytes=layout.tmp_output_offset_bytes,
             tmp_lse_offset_bytes=layout.tmp_lse_offset_bytes,
             output_buffer_offset_bytes=layout.output_buffer_offset_bytes,
             final_lse_offset_bytes=layout.final_lse_offset_bytes,
+            compressed_q_stage_offset_bytes=layout.compressed_q_stage_offset_bytes,
+            compressed_swa_indices_stage_offset_bytes=layout.compressed_swa_indices_stage_offset_bytes,
+            compressed_swa_lengths_stage_offset_bytes=layout.compressed_swa_lengths_stage_offset_bytes,
+            compressed_indexed_indices_stage_offset_bytes=layout.compressed_indexed_indices_stage_offset_bytes,
+            compressed_indexed_lengths_stage_offset_bytes=layout.compressed_indexed_lengths_stage_offset_bytes,
+            compressed_indexed_page_table_stage_offset_bytes=layout.compressed_indexed_page_table_stage_offset_bytes,
             indexer_k_quant_offset_bytes=layout.indexer_k_quant_offset_bytes,
             indexer_k_scale_offset_bytes=layout.indexer_k_scale_offset_bytes,
             indexer_extend_logits_offset_bytes=layout.indexer_extend_logits_offset_bytes,
@@ -996,6 +1278,7 @@ class B12XAttentionArena:
             indexer_extend_topk_values_offset_bytes=layout.indexer_extend_topk_values_offset_bytes,
             indexer_extend_topk_scratch_indices_offset_bytes=layout.indexer_extend_topk_scratch_indices_offset_bytes,
             indexer_extend_topk_scratch_values_offset_bytes=layout.indexer_extend_topk_scratch_values_offset_bytes,
+            indexer_extend_topk_position_offset_bytes=layout.indexer_extend_topk_position_offset_bytes,
             indexer_extend_candidate_values_offset_bytes=layout.indexer_extend_candidate_values_offset_bytes,
             indexer_extend_candidate_indices_offset_bytes=layout.indexer_extend_candidate_indices_offset_bytes,
             indexer_extend_lengths_offset_bytes=layout.indexer_extend_lengths_offset_bytes,
@@ -1072,6 +1355,128 @@ class B12XAttentionArena:
             comb=comb,
             out=out,
             split_k=split_k,
+        )
+
+    def make_wo_projection_workspace(self, tokens: int | None = None):
+        if not self.caps.reserve_wo_projection or self.wo_projection_layout.nbytes <= 0:
+            raise RuntimeError("attention arena was allocated without WO projection workspace capacity")
+        from b12x.gemm.wo_projection import MXFP8Rows, WOProjectionWorkspace
+
+        max_tokens = int(self.caps.wo_max_tokens)
+        tokens = max_tokens if tokens is None else int(tokens)
+        if tokens <= 0 or tokens > max_tokens:
+            raise ValueError(
+                f"WO projection tokens={tokens} exceeds arena capacity {max_tokens}"
+            )
+
+        groups = int(self.caps.wo_groups)
+        group_width = int(self.caps.wo_group_width)
+        rank = int(self.caps.wo_rank)
+        hidden = int(self.caps.wo_hidden_size)
+        layout = _layout_wo_projection(
+            offset_bytes=self.wo_projection_layout.x_q_values_offset_bytes,
+            tokens=tokens,
+            groups=groups,
+            group_width=group_width,
+            rank=rank,
+            hidden=hidden,
+        )
+        if layout.nbytes > self.wo_projection_layout.nbytes:
+            raise RuntimeError(
+                "WO projection workspace layout exceeds reserved arena capacity: "
+                f"requested={layout.nbytes}, reserved={self.wo_projection_layout.nbytes}"
+            )
+
+        def mxfp8_rows(
+            *,
+            values_offset_bytes: int,
+            scale_rows_offset_bytes: int,
+            scale_mma_offset_bytes: int,
+            m: int,
+            k: int,
+            num_groups: int,
+        ) -> MXFP8Rows:
+            if num_groups == 1:
+                values, _ = _materialize_arena_view(
+                    self.shared_arena,
+                    offset_bytes=values_offset_bytes,
+                    shape=(m, k),
+                    dtype=torch.float8_e4m3fn,
+                )
+            else:
+                values, _ = _materialize_arena_strided_view(
+                    self.shared_arena,
+                    offset_bytes=values_offset_bytes,
+                    shape=(m, k, num_groups),
+                    stride=(k, 1, m * k),
+                    dtype=torch.float8_e4m3fn,
+                )
+            scale_rows, _ = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=scale_rows_offset_bytes,
+                shape=(num_groups, m, k // _WO_MXFP8_SCALE_VEC_SIZE),
+                dtype=torch.float8_e8m0fnu,
+            )
+            scale_physical_u8, _ = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=scale_mma_offset_bytes,
+                shape=_wo_mxfp8_scale_physical_shape(
+                    m=m,
+                    k=k,
+                    num_groups=num_groups,
+                ),
+                dtype=torch.uint8,
+            )
+            if m % _WO_MXFP8_SCALE_ROW_TILE:
+                scale_physical_u8.fill_(127)
+            scale_mma = scale_physical_u8.view(torch.float8_e8m0fnu).permute(
+                3,
+                4,
+                1,
+                5,
+                2,
+                0,
+            )
+            return MXFP8Rows(
+                values=values,
+                scale_rows=scale_rows,
+                scale_mma=scale_mma,
+            )
+
+        x_q = mxfp8_rows(
+            values_offset_bytes=layout.x_q_values_offset_bytes,
+            scale_rows_offset_bytes=layout.x_q_scale_rows_offset_bytes,
+            scale_mma_offset_bytes=layout.x_q_scale_mma_offset_bytes,
+            m=tokens,
+            k=group_width,
+            num_groups=groups,
+        )
+        tmp, _ = _materialize_arena_strided_view(
+            self.shared_arena,
+            offset_bytes=layout.tmp_offset_bytes,
+            shape=(tokens, rank, groups),
+            stride=(rank, 1, tokens * rank),
+            dtype=torch.bfloat16,
+        )
+        tmp_q = mxfp8_rows(
+            values_offset_bytes=layout.tmp_q_values_offset_bytes,
+            scale_rows_offset_bytes=layout.tmp_q_scale_rows_offset_bytes,
+            scale_mma_offset_bytes=layout.tmp_q_scale_mma_offset_bytes,
+            m=tokens,
+            k=rank * groups,
+            num_groups=1,
+        )
+        output, _ = _materialize_arena_view(
+            self.shared_arena,
+            offset_bytes=layout.output_offset_bytes,
+            shape=(tokens, hidden, 1),
+            dtype=torch.bfloat16,
+        )
+        return WOProjectionWorkspace(
+            x_q=x_q,
+            tmp=tmp,
+            tmp_q=tmp_q,
+            output=output,
         )
 
     def make_workspace(
@@ -1174,6 +1579,10 @@ class B12XAttentionArena:
             paged_logits_width_tokens=self.paged_logits_width_tokens,
             paged_tile_logits_width_tokens=self.paged_tile_logits_width_tokens,
             ragged_kv_nbytes=self.ragged_kv_nbytes,
+            compressed_q_stage_nbytes=self.compressed_q_stage_nbytes,
+            compressed_index_stage_nbytes=self.compressed_index_stage_nbytes,
+            compressed_page_table_stage_nbytes=self.compressed_page_table_stage_nbytes,
+            compressed_lengths_stage_nbytes=self.compressed_lengths_stage_nbytes,
             indexer_logits_nbytes=self.indexer_logits_nbytes,
             indexer_extend_logits_nbytes=self.indexer_extend_logits_nbytes,
             indexer_extend_tile_logits_nbytes=self.indexer_extend_tile_logits_nbytes,
@@ -1181,6 +1590,7 @@ class B12XAttentionArena:
             indexer_extend_topk_values_nbytes=self.indexer_extend_topk_values_nbytes,
             indexer_extend_topk_scratch_indices_nbytes=self.indexer_extend_topk_scratch_indices_nbytes,
             indexer_extend_topk_scratch_values_nbytes=self.indexer_extend_topk_scratch_values_nbytes,
+            indexer_extend_topk_position_nbytes=self.indexer_extend_topk_position_nbytes,
             indexer_extend_candidate_values_nbytes=self.indexer_extend_candidate_values_nbytes,
             indexer_extend_candidate_indices_nbytes=self.indexer_extend_candidate_indices_nbytes,
             indexer_extend_lengths_nbytes=self.indexer_extend_lengths_nbytes,
@@ -1246,6 +1656,10 @@ class B12XAttentionWorkspace:
     ragged_kv_nbytes: int = 0
     output_buffer_nbytes: int = 0
     final_lse_nbytes: int = 0
+    compressed_q_stage_nbytes: int = 0
+    compressed_index_stage_nbytes: int = 0
+    compressed_page_table_stage_nbytes: int = 0
+    compressed_lengths_stage_nbytes: int = 0
     indexer_logits_nbytes: int = 0
     indexer_extend_logits_nbytes: int = 0
     indexer_extend_tile_logits_nbytes: int = 0
@@ -1253,6 +1667,7 @@ class B12XAttentionWorkspace:
     indexer_extend_topk_values_nbytes: int = 0
     indexer_extend_topk_scratch_indices_nbytes: int = 0
     indexer_extend_topk_scratch_values_nbytes: int = 0
+    indexer_extend_topk_position_nbytes: int = 0
     indexer_extend_candidate_values_nbytes: int = 0
     indexer_extend_candidate_indices_nbytes: int = 0
     indexer_extend_lengths_nbytes: int = 0
@@ -1270,11 +1685,18 @@ class B12XAttentionWorkspace:
     indexer_extend_topk_values: torch.Tensor | None = None
     indexer_extend_topk_scratch_indices: torch.Tensor | None = None
     indexer_extend_topk_scratch_values: torch.Tensor | None = None
+    indexer_extend_topk_positions: torch.Tensor | None = None
     indexer_extend_candidate_values: torch.Tensor | None = None
     indexer_extend_candidate_indices: torch.Tensor | None = None
     indexer_extend_lengths: torch.Tensor | None = None
     indexer_extend_mapped_indices: torch.Tensor | None = None
     indexer_paged_logits: torch.Tensor | None = None
+    compressed_mla_q_stage: torch.Tensor | None = None
+    compressed_mla_swa_indices_stage: torch.Tensor | None = None
+    compressed_mla_swa_lengths_stage: torch.Tensor | None = None
+    compressed_mla_indexed_indices_stage: torch.Tensor | None = None
+    compressed_mla_indexed_lengths_stage: torch.Tensor | None = None
+    compressed_mla_indexed_page_table_stage: torch.Tensor | None = None
     # Phantom tensors for stable host-launcher cache keys (fixed_capacity only).
     _contract_q: torch.Tensor | None = None
     _contract_kv_rows: torch.Tensor | None = None
@@ -1436,6 +1858,7 @@ class B12XAttentionWorkspace:
         paged_indexer_logits_k_rows: int = 0,
         paged_indexer_tile_logits_k_rows: int = 0,
         max_chunks_per_row: int = 64,
+        reserve_compressed_mla_staging: bool = False,
     ) -> B12XAttentionWorkspace:
         device = _canonical_device(device)
         if indexer_num_q_heads is None:
@@ -1469,6 +1892,7 @@ class B12XAttentionWorkspace:
             padded_heads=padded_heads,
             max_chunks_per_row=max_chunks_per_row,
             reserve_paged_indexer_logits=reserve_paged_indexer_logits,
+            reserve_compressed_mla_staging=reserve_compressed_mla_staging,
             paged_indexer_logits_q_rows=int(paged_indexer_logits_q_rows),
             paged_indexer_logits_k_rows=int(paged_indexer_logits_k_rows),
             paged_indexer_tile_logits_k_rows=int(paged_indexer_tile_logits_k_rows),
@@ -1537,9 +1961,13 @@ class B12XAttentionWorkspace:
         indexer_q_rows = max(max_total_q, max_paged_q_rows)
         max_kv_rows = max(int(self.max_kv_rows), 1)
         indexer_k_rows = (
-            max(int(self.arena.indexer_k_rows), 1)
+            int(self.arena.indexer_k_rows)
             if self.arena is not None
-            else _align_up(max_kv_rows, _INDEXER_BLOCK_K)
+            else (
+                0
+                if int(self.max_kv_rows) <= 0
+                else _align_up(max_kv_rows, _INDEXER_BLOCK_K)
+            )
         )
         paged_width_tokens = (
             max(int(self.arena.paged_logits_width_tokens), 1)
@@ -1553,6 +1981,10 @@ class B12XAttentionWorkspace:
         self.ragged_kv_nbytes = self.arena.ragged_kv_nbytes
         self.output_buffer_nbytes = self.arena.output_buffer_nbytes
         self.final_lse_nbytes = self.arena.final_lse_nbytes
+        self.compressed_q_stage_nbytes = self.arena.compressed_q_stage_nbytes
+        self.compressed_index_stage_nbytes = self.arena.compressed_index_stage_nbytes
+        self.compressed_page_table_stage_nbytes = self.arena.compressed_page_table_stage_nbytes
+        self.compressed_lengths_stage_nbytes = self.arena.compressed_lengths_stage_nbytes
         self.paged_logits_q_rows = self.arena.paged_logits_q_rows
         self.indexer_extend_logits_nbytes = self.arena.indexer_extend_logits_nbytes
         self.indexer_extend_tile_logits_nbytes = self.arena.indexer_extend_tile_logits_nbytes
@@ -1560,6 +1992,7 @@ class B12XAttentionWorkspace:
         self.indexer_extend_topk_values_nbytes = self.arena.indexer_extend_topk_values_nbytes
         self.indexer_extend_topk_scratch_indices_nbytes = self.arena.indexer_extend_topk_scratch_indices_nbytes
         self.indexer_extend_topk_scratch_values_nbytes = self.arena.indexer_extend_topk_scratch_values_nbytes
+        self.indexer_extend_topk_position_nbytes = self.arena.indexer_extend_topk_position_nbytes
         self.indexer_extend_candidate_values_nbytes = self.arena.indexer_extend_candidate_values_nbytes
         self.indexer_extend_candidate_indices_nbytes = self.arena.indexer_extend_candidate_indices_nbytes
         self.indexer_extend_lengths_nbytes = self.arena.indexer_extend_lengths_nbytes
@@ -1604,29 +2037,78 @@ class B12XAttentionWorkspace:
             shape=(max_total_q, int(self.num_q_heads)),
             dtype=torch.float32,
         )
+        if self.compressed_q_stage_nbytes:
+            self.compressed_mla_q_stage, _ = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=self.arena.compressed_q_stage_offset_bytes,
+                shape=(max_total_q, int(self.num_q_heads), int(self.head_dim)),
+                dtype=self.dtype,
+            )
+            self.compressed_mla_swa_indices_stage, _ = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=self.arena.compressed_swa_indices_stage_offset_bytes,
+                shape=(max_total_q, int(self.topk)),
+                dtype=torch.int32,
+            )
+            self.compressed_mla_swa_lengths_stage, _ = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=self.arena.compressed_swa_lengths_stage_offset_bytes,
+                shape=(max_total_q,),
+                dtype=torch.int32,
+            )
+            self.compressed_mla_indexed_indices_stage, _ = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=self.arena.compressed_indexed_indices_stage_offset_bytes,
+                shape=(max_total_q, int(self.topk)),
+                dtype=torch.int32,
+            )
+            self.compressed_mla_indexed_lengths_stage, _ = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=self.arena.compressed_indexed_lengths_stage_offset_bytes,
+                shape=(max_total_q,),
+                dtype=torch.int32,
+            )
+            self.compressed_mla_indexed_page_table_stage, _ = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=self.arena.compressed_indexed_page_table_stage_offset_bytes,
+                shape=(max_total_q, int(self.max_page_table_width)),
+                dtype=torch.int32,
+            )
 
-        self.indexer_k_quant_bytes, extend_offset = _materialize_arena_view(
-            self.shared_arena,
-            offset_bytes=self.arena.indexer_k_quant_offset_bytes,
-            shape=(indexer_k_rows, _INDEX_HEAD_DIM),
-            dtype=torch.uint8,
-        )
-        self.indexer_k_scales, extend_offset = _materialize_arena_view(
-            self.shared_arena,
-            offset_bytes=self.arena.indexer_k_scale_offset_bytes,
-            shape=(indexer_k_rows,),
-            dtype=torch.float32,
-        )
-        self.indexer_k_tma_desc, self.indexer_k_tma_desc_ptrs = _encode_indexer_k_tma_descriptor(
-            self.indexer_k_quant_bytes,
-            block_k=_INDEXER_BLOCK_K,
-        )
-        self.indexer_k_tma_prefill_desc, self.indexer_k_tma_prefill_desc_ptrs = (
-            _encode_indexer_k_tma_descriptor(
+        if indexer_k_rows > 0:
+            self.indexer_k_quant_bytes, extend_offset = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=self.arena.indexer_k_quant_offset_bytes,
+                shape=(indexer_k_rows, _INDEX_HEAD_DIM),
+                dtype=torch.uint8,
+            )
+            self.indexer_k_scales, extend_offset = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=self.arena.indexer_k_scale_offset_bytes,
+                shape=(indexer_k_rows,),
+                dtype=torch.float32,
+            )
+            (
+                self.indexer_k_tma_desc,
+                self.indexer_k_tma_desc_ptrs,
+            ) = _encode_indexer_k_tma_descriptor(
+                self.indexer_k_quant_bytes,
+                block_k=_INDEXER_BLOCK_K,
+            )
+            (
+                self.indexer_k_tma_prefill_desc,
+                self.indexer_k_tma_prefill_desc_ptrs,
+            ) = _encode_indexer_k_tma_descriptor(
                 self.indexer_k_quant_bytes,
                 block_k=_INDEXER_PREFILL_BLOCK_K,
             )
-        )
+        else:
+            self.indexer_k_quant_bytes = None
+            self.indexer_k_scales = None
+            self.indexer_k_tma_desc = None
+            self.indexer_k_tma_desc_ptrs = None
+            self.indexer_k_tma_prefill_desc = None
+            self.indexer_k_tma_prefill_desc_ptrs = None
         if self.indexer_extend_logits_nbytes:
             self.indexer_extend_logits, _ = _materialize_arena_view(
                 self.shared_arena,
@@ -1681,6 +2163,15 @@ class B12XAttentionWorkspace:
             )
         else:
             self.indexer_extend_topk_scratch_values = None
+        if self.indexer_extend_topk_position_nbytes:
+            self.indexer_extend_topk_positions, _ = _materialize_arena_view(
+                self.shared_arena,
+                offset_bytes=self.arena.indexer_extend_topk_position_offset_bytes,
+                shape=(indexer_q_rows, int(self.indexer_topk)),
+                dtype=torch.int64,
+            )
+        else:
+            self.indexer_extend_topk_positions = None
         if self.indexer_extend_candidate_values_nbytes:
             candidate_chunks = self.indexer_extend_candidate_values_nbytes // (
                 indexer_q_rows * int(self.indexer_topk) * _dtype_nbytes(torch.float32)
@@ -1785,8 +2276,8 @@ class B12XAttentionWorkspace:
             return
         assert self.kv_chunk_size_ptr is not None
         assert self.num_chunks_ptr is not None
-        self.kv_chunk_size_ptr[0] = int(split_cfg.chunk_size)
-        self.num_chunks_ptr[0] = int(split_cfg.num_chunks)
+        self.kv_chunk_size_ptr.fill_(int(split_cfg.chunk_size))
+        self.num_chunks_ptr.fill_(int(split_cfg.num_chunks))
         self.kv_chunk_size_value = int(split_cfg.chunk_size)
         self.num_chunks_value = int(split_cfg.num_chunks)
 
@@ -1801,10 +2292,10 @@ class B12XAttentionWorkspace:
         assert self.kv_chunk_size_ptr is not None
         assert self.num_chunks_ptr is not None
         if self.kv_chunk_size_value != int(kv_chunk_size):
-            self.kv_chunk_size_ptr[0] = int(kv_chunk_size)
+            self.kv_chunk_size_ptr.fill_(int(kv_chunk_size))
             self.kv_chunk_size_value = int(kv_chunk_size)
         if self.num_chunks_value != int(num_chunks):
-            self.num_chunks_ptr[0] = int(num_chunks)
+            self.num_chunks_ptr.fill_(int(num_chunks))
             self.num_chunks_value = int(num_chunks)
 
     def set_decode_chunk_config(self, *, kv_chunk_size: int, num_chunks: int) -> None:
@@ -1947,6 +2438,22 @@ class B12XAttentionWorkspace:
             self.indexer_extend_topk_scratch_indices[:row_count],
         )
 
+    def get_indexer_extend_topk_position_buffer(self, *, row_count: int) -> torch.Tensor:
+        if self.indexer_extend_topk_positions is None:
+            raise B12XIndexerTopKPositionBufferUnavailable(
+                "fixed-capacity workspace is missing indexer extend top-k position buffer"
+            )
+        row_count = int(row_count)
+        if row_count < 0:
+            raise ValueError(f"row_count must be non-negative, got {row_count}")
+        capacity_rows = int(self.indexer_extend_topk_positions.shape[0])
+        if row_count > capacity_rows:
+            raise ValueError(
+                "row_count "
+                f"{row_count} exceeds workspace top-k position capacity {capacity_rows}"
+            )
+        return self.indexer_extend_topk_positions[:row_count]
+
     def get_indexer_extend_candidate_buffers(self) -> tuple[torch.Tensor, torch.Tensor]:
         if (
             self.indexer_extend_candidate_values is None
@@ -2000,6 +2507,112 @@ class B12XAttentionWorkspace:
         if self.paged_indexer_active_width_cap is None:
             raise RuntimeError("fixed-capacity workspace is missing paged indexer active-width cap")
         return self.paged_indexer_active_width_cap
+
+    def bind_compressed_mla(
+        self,
+        *,
+        q: torch.Tensor,
+        swa_indices: torch.Tensor,
+        swa_lengths: torch.Tensor,
+        indexed_indices: torch.Tensor | None = None,
+        indexed_lengths: torch.Tensor | None = None,
+        indexed_page_table: torch.Tensor | None = None,
+    ):
+        from b12x.integration.compressed_scratch import build_compressed_mla_binding
+
+        return build_compressed_mla_binding(
+            workspace=self,
+            q=q,
+            swa_indices=swa_indices,
+            swa_lengths=swa_lengths,
+            indexed_indices=indexed_indices,
+            indexed_lengths=indexed_lengths,
+            indexed_page_table=indexed_page_table,
+        )
+
+    def bind_sparse_mla(
+        self,
+        *,
+        q: torch.Tensor,
+        selected_indices: torch.Tensor,
+        cache_seqlens_int32: torch.Tensor,
+        nsa_cache_seqlens_int32: torch.Tensor,
+    ):
+        from b12x.integration.sparse_mla_scratch import build_sparse_mla_binding
+
+        return build_sparse_mla_binding(
+            workspace=self,
+            q=q,
+            selected_indices=selected_indices,
+            cache_seqlens_int32=cache_seqlens_int32,
+            nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
+        )
+
+    def bind_compressed_indexer(
+        self,
+        *,
+        real_page_table: torch.Tensor,
+        cache_seqlens_int32: torch.Tensor,
+        active_width: torch.Tensor | None = None,
+        schedule_metadata: torch.Tensor | None = None,
+        expected_num_q_heads: int | None = None,
+        shared_page_table: bool = False,
+    ):
+        from b12x.integration.compressed_scratch import build_compressed_indexer_binding
+
+        return build_compressed_indexer_binding(
+            workspace=self,
+            real_page_table=real_page_table,
+            cache_seqlens_int32=cache_seqlens_int32,
+            active_width=active_width,
+            schedule_metadata=schedule_metadata,
+            expected_num_q_heads=expected_num_q_heads,
+            shared_page_table=shared_page_table,
+        )
+
+    def bind_indexer_paged_decode(
+        self,
+        *,
+        real_page_table: torch.Tensor,
+        cache_seqlens_int32: torch.Tensor,
+        active_width: torch.Tensor | None = None,
+        paged_mqa_schedule_metadata: torch.Tensor | None = None,
+    ):
+        from b12x.integration.indexer_scratch import build_indexer_paged_binding
+
+        return build_indexer_paged_binding(
+            workspace=self,
+            real_page_table=real_page_table,
+            cache_seqlens_int32=cache_seqlens_int32,
+            active_width=active_width,
+            paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
+        )
+
+    def bind_indexer_extend(
+        self,
+        *,
+        k_start: torch.Tensor,
+        k_end: torch.Tensor,
+        gather_rows: int | None = None,
+        topk: int | None = None,
+        include_topk_buffers: bool = True,
+        include_candidate_buffers: bool = True,
+        include_lengths: bool = True,
+        include_merge_positions: bool = True,
+    ):
+        from b12x.integration.indexer_scratch import build_indexer_extend_binding
+
+        return build_indexer_extend_binding(
+            workspace=self,
+            k_start=k_start,
+            k_end=k_end,
+            gather_rows=gather_rows,
+            topk=self.indexer_topk if topk is None else topk,
+            include_topk_buffers=include_topk_buffers,
+            include_candidate_buffers=include_candidate_buffers,
+            include_lengths=include_lengths,
+            include_merge_positions=include_merge_positions,
+        )
 
     def get_paged_indexer_persistent_ctas(self) -> int:
         return _resolve_paged_indexer_persistent_ctas(

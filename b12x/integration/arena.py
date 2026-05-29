@@ -74,6 +74,7 @@ class B12XMoEArenaCaps:
     device: torch.device
     dtype: torch.dtype
     quant_mode: str | None = None
+    source_format: str = "modelopt_nvfp4"
     weight_E: int
     k: int
     n: int
@@ -96,6 +97,7 @@ class B12XMoEArenaCaps:
         if quant_mode not in {"nvfp4", "w4a16"}:
             raise ValueError(f"unsupported quant_mode {self.quant_mode!r}")
         object.__setattr__(self, "quant_mode", quant_mode)
+        object.__setattr__(self, "source_format", str(self.source_format).lower())
         object.__setattr__(self, "weight_E", max(int(self.weight_E), 1))
         object.__setattr__(self, "k", max(int(self.k), 1))
         object.__setattr__(self, "n", max(int(self.n), 1))
@@ -251,6 +253,21 @@ def _attention_caps_cover(
         or getattr(existing, "mhc_split_k", 0) != getattr(requested, "mhc_split_k", 0)
     ):
         return False
+    if getattr(requested, "reserve_wo_projection", False) and not getattr(
+        existing,
+        "reserve_wo_projection",
+        False,
+    ):
+        return False
+    if getattr(requested, "reserve_wo_projection", False) and (
+        getattr(existing, "wo_groups", 0) != getattr(requested, "wo_groups", 0)
+        or getattr(existing, "wo_group_width", 0)
+        != getattr(requested, "wo_group_width", 0)
+        or getattr(existing, "wo_rank", 0) != getattr(requested, "wo_rank", 0)
+        or getattr(existing, "wo_hidden_size", 0)
+        != getattr(requested, "wo_hidden_size", 0)
+    ):
+        return False
     existing_mla_q_chunks = int(
         getattr(existing, "mla_max_q_chunks", 0)
         or int(getattr(existing, "mla_max_total_q", 1))
@@ -284,6 +301,7 @@ def _attention_caps_cover(
             "paged_indexer_logits_k_rows",
             "paged_indexer_tile_logits_k_rows",
             "mhc_max_tokens",
+            "wo_max_tokens",
         ),
     )
 
@@ -340,6 +358,7 @@ def _single_moe_caps_cover(
             "device",
             "dtype",
             "quant_mode",
+            "source_format",
             "activation",
             "apply_router_weight_on_input",
             "swiglu_limit",
@@ -524,6 +543,8 @@ class B12XExecutionLaneArena:
                     dtype=caps.dtype,
                     core_token_counts=caps.core_token_counts,
                     quant_mode=caps.quant_mode,
+                    source_format=caps.source_format,
+                    w13_layout=caps.w13_layout,
                     activation=caps.activation,
                     apply_router_weight_on_input=caps.apply_router_weight_on_input,
                     swiglu_limit=caps.swiglu_limit,

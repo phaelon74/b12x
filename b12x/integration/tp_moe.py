@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import os
+import logging
+import time
+from collections.abc import Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
-from typing import Dict, Tuple
+from typing import Any, Dict, Tuple
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -14,6 +17,7 @@ import torch
 import torch.nn.functional as F
 from torch.profiler import record_function
 
+from b12x.cute.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x.cute.fp4 import align_up, as_grouped_scale_view
 from b12x.cute.utils import (
     current_cuda_stream,
@@ -39,18 +43,43 @@ from b12x.moe.fused.micro import (
     _direct_k_segments_supported,
 )
 from b12x.moe.tuning import lookup_max_active_clusters
-from b12x.runtime_control import raise_if_kernel_resolution_frozen
+from b12x.cute.runtime_control import raise_if_kernel_resolution_frozen
+from b12x.cute.scratch import B12XScratchBufferSpec, scratch_buffer_spec, scratch_tensor
+
+logger = logging.getLogger(__name__)
+_B12X_TIMING = os.getenv("B12X_TIMING", "0") == "1" or os.getenv(
+    "VLLM_B12X_TIMING", "0"
+) == "1"
+_B12X_TIMING_THRESHOLD_MS = float(
+    os.getenv(
+        "B12X_TIMING_THRESHOLD_MS",
+        os.getenv("VLLM_B12X_TIMING_THRESHOLD_MS", "0"),
+    )
+)
 
 _NVFP4_BLOCK_SIZE = 16
 _RUNTIME_MEMREF_LIMIT = (1 << 31) - 1
 _LEVEL_TILE_M = 128
 _LEVEL_TILE_N = 128
 _DYNAMIC_SLICE_CHUNK = 1
+_W4A16_ROUTE_PACK_PREWARMED: set[tuple[object, ...]] = set()
 _MOE_FORCE_A16_ENV = "B12X_MOE_FORCE_A16"
 _FP4_SOURCE_FORMATS = {
     "modelopt_nvfp4": "modelopt_nvfp4",
-    "mxfp4_native": "mxfp4_native",
+    "fp4_e8m0_k32": "fp4_e8m0_k32",
     "compressed_tensors": "compressed_tensors",
+}
+_W4A16_SCALE_FORMATS = {
+    "e4m3_k16": "e4m3_k16",
+    "e8m0_k32": "e8m0_k32",
+}
+_W13_LAYOUTS = {
+    "w13": "w13",
+    "w31": "w31",
+    # Accept the physical FC1-half spellings as aliases; "up_gate" needs the
+    # in-place W13 row rotation ("w13"), "gate_up" is already kernel-native.
+    "up_gate": "w13",
+    "gate_up": "w31",
 }
 
 
@@ -82,6 +111,15 @@ class TPMoEWorkspace:
     packed_a_storage_ptr: object = None
     route_workspace: "_TPRouteWorkspace | None" = None
     volatile_launch_state: bool = False
+
+    def bind_fp4(self, **kwargs) -> "TPMoEFP4Binding":
+        return build_tp_moe_fp4_binding(workspace=self, **kwargs)
+
+    def bind_route(self, **kwargs) -> "TPMoERouteBinding":
+        return build_tp_moe_route_binding(workspace=self, **kwargs)
+
+    def bind_sparse_fp4(self, **kwargs) -> "TPMoESparseFP4Binding":
+        return build_tp_moe_sparse_fp4_binding(workspace=self, **kwargs)
 
 
 @dataclass(kw_only=True)
@@ -144,10 +182,20 @@ class TPW4A16Workspace:
     planned_token_counts: frozenset[int] = field(default_factory=frozenset)
     planned_apply_router_weight_on_input: bool = False
     planned_swiglu_limit: float | None = None
+    planned_scale_format: str = "e4m3_k16"
     planned_fused_moe_launches: dict[object, object] = field(default_factory=dict)
     planned_topk_sum_launches: dict[int, object] = field(default_factory=dict)
     route_workspace: "_TPRouteWorkspace | None" = None
     volatile_launch_state: bool = False
+
+    def bind_fp4(self, **kwargs) -> "TPMoEFP4Binding":
+        return build_tp_moe_fp4_binding(workspace=self, **kwargs)
+
+    def bind_route(self, **kwargs) -> "TPMoERouteBinding":
+        return build_tp_moe_route_binding(workspace=self, **kwargs)
+
+    def bind_sparse_fp4(self, **kwargs) -> "TPMoESparseFP4Binding":
+        return build_tp_moe_sparse_fp4_binding(workspace=self, **kwargs)
 
 
 @dataclass
@@ -201,6 +249,15 @@ class TPMoEWorkspacePool:
         self.core_arena_nbytes = core_workspace_nbytes
         self.frozen = bool(frozen)
 
+    def bind_fp4(self, **kwargs) -> "TPMoEFP4Binding":
+        return build_tp_moe_fp4_binding(workspace=self, **kwargs)
+
+    def bind_route(self, **kwargs) -> "TPMoERouteBinding":
+        return build_tp_moe_route_binding(workspace=self, **kwargs)
+
+    def bind_sparse_fp4(self, **kwargs) -> "TPMoESparseFP4Binding":
+        return build_tp_moe_sparse_fp4_binding(workspace=self, **kwargs)
+
 
 @dataclass(frozen=True, kw_only=True)
 class B12XFP4ExpertWeights:
@@ -215,6 +272,7 @@ class B12XFP4ExpertWeights:
     w2_blockscale: torch.Tensor
     w2_alphas: torch.Tensor
     source_format: str = "modelopt_nvfp4"
+    w13_layout: str = "w13"
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -222,6 +280,26 @@ class B12XFP4ExpertWeights:
             "source_format",
             _normalize_fp4_source_format(self.source_format),
         )
+        object.__setattr__(self, "w13_layout", _normalize_w13_layout(self.w13_layout))
+
+
+@dataclass(frozen=True, kw_only=True)
+class B12XPreparedFP4MoEWeights:
+    """Derived FP4 MoE weight representations prepared from a source contract."""
+
+    source_format: str
+    w13_layout: str = "w13"
+    w1_runtime_alphas: torch.Tensor | None = None
+    w2_runtime_alphas: torch.Tensor | None = None
+    w4a16: Any | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "source_format",
+            _normalize_fp4_source_format(self.source_format),
+        )
+        object.__setattr__(self, "w13_layout", _normalize_w13_layout(self.w13_layout))
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -307,6 +385,246 @@ class TPMoEPlan:
 
 
 @dataclass(frozen=True, kw_only=True)
+class TPMoEScratchCaps:
+    max_tokens: int
+    weight_E: int
+    k: int
+    n: int
+    num_topk: int
+    device: torch.device | str
+    dtype: torch.dtype
+    core_token_counts: tuple[int, ...] | None = None
+    route_num_experts: int | None = None
+    route_logits_dtype: torch.dtype | None = None
+    quant_mode: str | None = None
+    activation: str = "silu"
+    apply_router_weight_on_input: bool = False
+    swiglu_limit: float | None = None
+    source_format: str = "modelopt_nvfp4"
+    w13_layout: str = "w13"
+    frozen: bool = True
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "max_tokens", max(int(self.max_tokens), 1))
+        object.__setattr__(self, "weight_E", max(int(self.weight_E), 1))
+        object.__setattr__(self, "k", max(int(self.k), 1))
+        object.__setattr__(self, "n", max(int(self.n), 1))
+        object.__setattr__(self, "num_topk", max(int(self.num_topk), 1))
+        object.__setattr__(self, "device", torch.device(self.device))
+        if self.core_token_counts is not None:
+            object.__setattr__(
+                self,
+                "core_token_counts",
+                tuple(max(int(count), 1) for count in self.core_token_counts),
+            )
+        if self.route_num_experts is not None:
+            object.__setattr__(
+                self,
+                "route_num_experts",
+                max(int(self.route_num_experts), 0),
+            )
+        object.__setattr__(self, "quant_mode", _normalize_quant_mode(self.quant_mode))
+        object.__setattr__(
+            self,
+            "source_format",
+            _normalize_fp4_source_format(self.source_format),
+        )
+        object.__setattr__(self, "w13_layout", _normalize_w13_layout(self.w13_layout))
+        object.__setattr__(self, "frozen", bool(self.frozen))
+
+
+@dataclass(frozen=True)
+class TPMoEScratchPlan:
+    caps: TPMoEScratchCaps
+    layout: TPMoEArenaLayout
+    _scratch_specs: tuple[B12XScratchBufferSpec, ...]
+
+    def scratch_specs(self) -> tuple[B12XScratchBufferSpec, ...]:
+        return self._scratch_specs
+
+    def shapes_and_dtypes(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
+        return tuple((spec.shape, spec.dtype) for spec in self._scratch_specs)
+
+    def make_workspace_pool(
+        self,
+        *,
+        scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
+    ) -> TPMoEWorkspacePool:
+        t0 = time.perf_counter() if _B12X_TIMING else 0.0
+        scratch_storage = scratch_tensor(scratch, self._scratch_specs, owner="TP MoE")
+        t_scratch = time.perf_counter() if _B12X_TIMING else 0.0
+        pool = allocate_tp_moe_workspace_pool(
+            shared_arena=scratch_storage,
+            route_workspace_nbytes=self.layout.route_workspace_nbytes,
+            core_workspace_nbytes=self.layout.core_workspace_nbytes,
+            frozen=self.caps.frozen,
+        )
+        t_pool = time.perf_counter() if _B12X_TIMING else 0.0
+        materialize_tp_moe_arena_workspaces(
+            pool,
+            max_tokens=self.caps.max_tokens,
+            weight_E=self.caps.weight_E,
+            k=self.caps.k,
+            n=self.caps.n,
+            num_topk=self.caps.num_topk,
+            device=self.caps.device,
+            dtype=self.caps.dtype,
+            core_token_counts=self.layout.core_token_counts,
+            quant_mode=self.caps.quant_mode,
+            activation=self.caps.activation,
+            apply_router_weight_on_input=self.caps.apply_router_weight_on_input,
+            swiglu_limit=self.caps.swiglu_limit,
+            source_format=self.caps.source_format,
+            w13_layout=self.caps.w13_layout,
+        )
+        if _B12X_TIMING:
+            t_done = time.perf_counter()
+            total_ms = (t_done - t0) * 1000.0
+            if total_ms >= _B12X_TIMING_THRESHOLD_MS:
+                logger.warning(
+                    "b12x_tp_moe_make_workspace_pool timing tokens=%d k=%d n=%d "
+                    "E=%d topk=%d quant=%s scratch=%.3fms pool=%.3fms "
+                    "materialize=%.3fms total=%.3fms",
+                    int(self.caps.max_tokens),
+                    int(self.caps.k),
+                    int(self.caps.n),
+                    int(self.caps.weight_E),
+                    int(self.caps.num_topk),
+                    self.caps.quant_mode,
+                    (t_scratch - t0) * 1000.0,
+                    (t_pool - t_scratch) * 1000.0,
+                    (t_done - t_pool) * 1000.0,
+                    total_ms,
+                )
+        return pool
+
+    def bind(
+        self,
+        *,
+        scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
+        a: torch.Tensor,
+        a1_gscale: torch.Tensor,
+        w1_fp4: torch.Tensor,
+        w1_blockscale: torch.Tensor,
+        w1_alphas: torch.Tensor,
+        a2_gscale: torch.Tensor,
+        w2_fp4: torch.Tensor,
+        w2_blockscale: torch.Tensor,
+        w2_alphas: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        apply_router_weight_on_input: bool = False,
+        output: torch.Tensor | None = None,
+        input_scales_are_reciprocal: bool | None = None,
+        input_scales_static: bool = False,
+        fast_math: bool | None = None,
+        activation: str = "silu",
+        quant_mode: str | None = None,
+        unit_scale_contract: bool = False,
+        source_format: str = "modelopt_nvfp4",
+        w13_layout: str = "w13",
+        prepared_w4a16: object | None = None,
+        swiglu_limit: float | None = None,
+    ) -> "TPMoEFP4Binding":
+        pool = self.make_workspace_pool(scratch=scratch)
+        return build_tp_moe_fp4_binding(
+            workspace=pool,
+            a=a,
+            a1_gscale=a1_gscale,
+            w1_fp4=w1_fp4,
+            w1_blockscale=w1_blockscale,
+            w1_alphas=w1_alphas,
+            a2_gscale=a2_gscale,
+            w2_fp4=w2_fp4,
+            w2_blockscale=w2_blockscale,
+            w2_alphas=w2_alphas,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            output=output,
+            input_scales_are_reciprocal=input_scales_are_reciprocal,
+            input_scales_static=input_scales_static,
+            fast_math=fast_math,
+            activation=activation,
+            quant_mode=quant_mode,
+            unit_scale_contract=unit_scale_contract,
+            source_format=source_format,
+            w13_layout=w13_layout,
+            prepared_w4a16=prepared_w4a16,
+            swiglu_limit=swiglu_limit,
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
+class TPMoEFP4Binding:
+    a: torch.Tensor
+    a1_gscale: torch.Tensor
+    w1_fp4: torch.Tensor
+    w1_blockscale: torch.Tensor
+    w1_alphas: torch.Tensor
+    a2_gscale: torch.Tensor
+    w2_fp4: torch.Tensor
+    w2_blockscale: torch.Tensor
+    w2_alphas: torch.Tensor
+    topk_weights: torch.Tensor
+    topk_ids: torch.Tensor
+    scratch: TPMoEWorkspace | TPW4A16Workspace | TPMoEWorkspacePool
+    apply_router_weight_on_input: bool = False
+    output: torch.Tensor | None = None
+    input_scales_are_reciprocal: bool | None = None
+    input_scales_static: bool = False
+    fast_math: bool | None = None
+    activation: str = "silu"
+    quant_mode: str | None = None
+    unit_scale_contract: bool = False
+    source_format: str = "modelopt_nvfp4"
+    w13_layout: str = "w13"
+    prepared_w4a16: object | None = None
+    swiglu_limit: float | None = None
+
+    def run(self) -> torch.Tensor:
+        return b12x_moe_fp4(binding=self)
+
+
+@dataclass(frozen=True, kw_only=True)
+class TPMoERouteBinding:
+    hidden_states: torch.Tensor
+    top_k: int
+    scratch: TPMoEWorkspace | TPW4A16Workspace | TPMoEWorkspacePool | None = None
+    gate_weight: torch.Tensor | None = None
+    gate_bias: torch.Tensor | None = None
+    router_logits: torch.Tensor | None = None
+    renormalize: bool = True
+
+    def run(self) -> B12XTopKRouting:
+        return b12x_route_experts_fast(binding=self)
+
+
+@dataclass(frozen=True, kw_only=True)
+class TPMoESparseFP4Binding:
+    hidden_states: torch.Tensor
+    experts: B12XFP4ExpertWeights
+    scratch: TPMoEWorkspace | TPW4A16Workspace | TPMoEWorkspacePool
+    routing: B12XTopKRouting | None = None
+    top_k: int | None = None
+    gate_weight: torch.Tensor | None = None
+    gate_bias: torch.Tensor | None = None
+    router_logits: torch.Tensor | None = None
+    renormalize_topk: bool = True
+    routed_scaling_factor: float = 1.0
+    output: torch.Tensor | None = None
+    return_routing: bool = False
+    input_scales_are_reciprocal: bool | None = None
+    input_scales_static: bool = False
+    fast_math: bool | None = None
+    activation: str = "silu"
+    quant_mode: str | None = None
+
+    def run(self) -> torch.Tensor | tuple[torch.Tensor, B12XTopKRouting]:
+        return b12x_sparse_moe_fp4(binding=self)
+
+
+@dataclass(frozen=True, kw_only=True)
 class _TPMoEWorkspacePolicy:
     can_chunk: bool
 
@@ -319,8 +637,8 @@ class _WeightViews:
     down: torch.Tensor  # [k, n//2, E] uint8 (permuted view, no copy)
     w13_sf: torch.Tensor  # 6D MMA view for concatenated w13 scale factors
     down_sf: torch.Tensor  # [E, down_sf_rows, sf_cols] uint8 (view)
-    w1_alpha: torch.Tensor  # [E] float32 contiguous tensor in plain CUDA storage
-    w2_alpha: torch.Tensor  # [E] float32 contiguous tensor in plain CUDA storage
+    w1_alpha: torch.Tensor  # [E] float32 contiguous tensor
+    w2_alpha: torch.Tensor  # [E] float32 contiguous tensor
     w1_storage: torch.Tensor  # original [E, w1_n, k//2] tensor for direct micro
     w1_scale_storage: torch.Tensor
     w2_storage: torch.Tensor  # original [E, k, n//2] tensor for direct micro
@@ -404,13 +722,86 @@ def _normalize_quant_mode(quant_mode: str | None) -> str:
 
 
 def _normalize_fp4_source_format(source_format: str) -> str:
+    if source_format.lower() == "mxfp4_native":
+        raise ValueError(
+            "source_format='mxfp4_native' has been removed; use "
+            "source_format='fp4_e8m0_k32' for byte-preserved E8M0 K/32 "
+            "scales, or add a real MXFP4 source contract"
+        )
     try:
         return _FP4_SOURCE_FORMATS[source_format.lower()]
     except KeyError as exc:
         raise ValueError(
             "source_format must be one of 'modelopt_nvfp4', "
-            "'mxfp4_native', or 'compressed_tensors', "
+            "'fp4_e8m0_k32', or 'compressed_tensors', "
             f"got {source_format!r}"
+        ) from exc
+
+
+def _normalize_w4a16_scale_format(scale_format: str) -> str:
+    try:
+        return _W4A16_SCALE_FORMATS[scale_format.lower()]
+    except KeyError as exc:
+        raise ValueError(
+            "scale_format must be one of 'e4m3_k16' or 'e8m0_k32', "
+            f"got {scale_format!r}"
+        ) from exc
+
+
+def _w4a16_scale_format_for_source(source_format: str) -> str:
+    source_format = _normalize_fp4_source_format(source_format)
+    return "e8m0_k32" if source_format == "fp4_e8m0_k32" else "e4m3_k16"
+
+
+_W4A16_E8M0_MICRO_ENV = "B12X_W4A16_E8M0_MICRO"
+
+
+def _w4a16_e8m0_micro_enabled() -> bool:
+    """Opt-in: route E8M0 W4A16 small M through the micro decode kernel.
+
+    Default off keeps E8M0 in the packed main-GEMM path (the prior, well-tuned
+    behavior with no prefill regression). When ``B12X_W4A16_E8M0_MICRO`` is set,
+    E8M0 weights are kept native (``modelopt``) so small M routes to micro and
+    med/large M to the main GEMM from a single copy.
+    """
+    return _env_flag(_W4A16_E8M0_MICRO_ENV, default=False)
+
+
+def _w4a16_weight_layout_for_source(source_format: str) -> str:
+    """W4A16 weight layout implied by the FP4 source format (+ micro opt-in).
+
+    With the micro opt-in set, E8M0 K/32 weights stay native (``modelopt``) so a
+    single copy serves both the small-M micro decode kernel and the med/large-M
+    main GEMM. Otherwise (and for NVFP4 sources) weights are repacked
+    (``packed``). Must mirror ``_get_w4a16_packed_weights`` so the plan-time
+    launch and the runtime ``prepared.weight_layout`` agree.
+    """
+    source_format = _normalize_fp4_source_format(source_format)
+    if source_format == "fp4_e8m0_k32" and _w4a16_e8m0_micro_enabled():
+        return "modelopt"
+    return "packed"
+
+
+_W4A16_WEIGHT_LAYOUTS = {"packed", "modelopt"}
+
+
+def _normalize_w4a16_weight_layout(weight_layout: str) -> str:
+    layout = str(weight_layout).lower()
+    if layout not in _W4A16_WEIGHT_LAYOUTS:
+        raise ValueError(
+            "weight_layout must be one of "
+            f"{sorted(_W4A16_WEIGHT_LAYOUTS)}, got {weight_layout!r}"
+        )
+    return layout
+
+
+def _normalize_w13_layout(w13_layout: str) -> str:
+    try:
+        return _W13_LAYOUTS[w13_layout.lower()]
+    except KeyError as exc:
+        raise ValueError(
+            "w13_layout must be one of 'w13'/'w31' (or the 'up_gate'/'gate_up' "
+            f"aliases), got {w13_layout!r}"
         ) from exc
 
 
@@ -466,15 +857,10 @@ def _dynamic_tile_m(quant_mode: str = "nvfp4") -> int:
 
 _WEIGHT_CACHE: Dict[Tuple[int, int, int], _WeightViews] = {}
 _W4A16_PACKED_WEIGHT_CACHE: Dict[Tuple[object, ...], object] = {}
-_MICRO_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
-_STATIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
-_DYNAMIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
+_MICRO_KERNEL_CACHE: Dict[Tuple, object] = {}
+_STATIC_KERNEL_CACHE: Dict[Tuple, object] = {}
+_DYNAMIC_KERNEL_CACHE: Dict[Tuple, object] = {}
 _MAC_CACHE: Dict[Tuple[int, str], int] = {}  # (device_idx, impl) → max_active_clusters
-_PLAIN_PARAM_CACHE: Dict[
-    Tuple[int, Tuple[int, ...], Tuple[int, ...], torch.dtype, torch.dtype, int],
-    torch.Tensor,
-] = {}
-_W4A16_ALPHA_CACHE: Dict[Tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 _MICRO_COMPACT_CUTOVER_PAIRS_DEFAULT = 20
 _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK_DEFAULT = 80
 _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 640
@@ -537,8 +923,6 @@ def clear_tp_moe_caches() -> None:
     _MAC_CACHE.clear()
     _MICRO_DIRECT_LAUNCH_CAP_CACHE.clear()
     _EXACT_RELU2_BS1_NEMOTRON_CACHE.clear()
-    _PLAIN_PARAM_CACHE.clear()
-    _W4A16_ALPHA_CACHE.clear()
     _MICRO_COMPACT_CUTOVER_PAIRS_CACHE = None
     _STATIC_COMPACT_CUTOVER_PAIRS_CACHE.clear()
     _DYNAMIC_MULTICTA_CACHE = None
@@ -601,16 +985,31 @@ def _arena_core_token_counts(
     max_tokens = max(int(max_tokens), 1)
     num_topk = max(int(num_topk), 1)
     quant_mode = _normalize_quant_mode(quant_mode)
+    if quant_mode == "w4a16":
+        from b12x.moe.fused.w4a16.host import route_pack_token_capacity
+
+        max_tokens = route_pack_token_capacity(max_tokens, num_topk)
     if core_token_counts is None:
         normalized = (max_tokens,)
     else:
         normalized = tuple(max(int(token_count), 1) for token_count in core_token_counts)
+        if quant_mode == "w4a16":
+            normalized = tuple(
+                route_pack_token_capacity(token_count, num_topk)
+                for token_count in normalized
+            )
         if max_tokens not in normalized:
             normalized = (max_tokens, *normalized)
+    normalized = tuple(dict.fromkeys(normalized))
     static_cutover_pairs = _get_static_compact_cutover_pairs(quant_mode)
     max_static_tokens = static_cutover_pairs // num_topk
     if max_static_tokens >= 1:
         static_boundary_tokens = min(max_tokens, max_static_tokens)
+        if quant_mode == "w4a16":
+            static_boundary_tokens = route_pack_token_capacity(
+                static_boundary_tokens,
+                num_topk,
+            )
         if static_boundary_tokens not in normalized:
             normalized = (*normalized, static_boundary_tokens)
     return normalized
@@ -681,73 +1080,34 @@ def _prepare_expert_scale(scale: torch.Tensor, weight_E: int) -> torch.Tensor:
     with record_function("tp_moe.prepare_expert_scale"):
         if scale.numel() == 1:
             with record_function("tp_moe.prepare_expert_scale.expand_scalar"):
-                return _get_plain_cuda_tensor(
-                    scale.expand(weight_E), dtype=torch.float32
-                )
+                return scale.reshape(()).expand(weight_E).to(torch.float32).contiguous()
         if scale.numel() != weight_E:
             raise ValueError(
                 f"expected expert scale with {weight_E} elements, got {scale.numel()}"
             )
-        return _get_plain_cuda_tensor(scale, dtype=torch.float32)
+        return scale.reshape(weight_E).to(torch.float32).contiguous()
 
 
-def _get_plain_cuda_tensor(
-    t: torch.Tensor, *, dtype: torch.dtype | None = None
-) -> torch.Tensor:
-    with record_function("tp_moe.get_plain_cuda_tensor"):
-        target_dtype = t.dtype if dtype is None else dtype
-        key = (
-            t.data_ptr(),
-            tuple(t.shape),
-            tuple(t.stride()),
-            t.dtype,
-            target_dtype,
-            _tensor_version(t),
-        )
-        cached = _PLAIN_PARAM_CACHE.get(key)
-        if cached is not None:
-            return cached
-        plain = torch.empty(tuple(t.shape), dtype=target_dtype, device=t.device)
-        with record_function("tp_moe.get_plain_cuda_tensor.copy"):
-            plain.copy_(t.to(target_dtype) if t.dtype != target_dtype else t)
-        _PLAIN_PARAM_CACHE[key] = plain
-        return plain
-
-
-def _tensor_cache_key(
-    t: torch.Tensor,
-) -> Tuple[int, Tuple[int, ...], Tuple[int, ...], torch.dtype, int]:
-    return (
-        t.data_ptr(),
-        tuple(t.shape),
-        tuple(t.stride()),
-        t.dtype,
-        _tensor_version(t),
-    )
-
-
-def _w4a16_default_alpha(
-    alpha: torch.Tensor,
-    input_scale: torch.Tensor,
+def _prepare_expert_scale_vector(
+    scale: torch.Tensor,
     weight_E: int,
+    *,
+    name: str,
 ) -> torch.Tensor:
-    key = (
-        _tensor_cache_key(alpha),
-        _tensor_cache_key(input_scale),
-        weight_E,
-    )
-    cached = _W4A16_ALPHA_CACHE.get(key)
-    if cached is not None:
-        cached_alpha, cached_input_scale, cached_adjusted = cached
-        if cached_alpha is alpha and cached_input_scale is input_scale:
-            return cached_adjusted
-
-    alpha_plain = _get_plain_cuda_tensor(alpha, dtype=torch.float32)
-    scale_plain = _prepare_expert_scale(input_scale, weight_E)
-    adjusted = torch.empty_like(alpha_plain)
-    torch.mul(alpha_plain, scale_plain, out=adjusted)
-    _W4A16_ALPHA_CACHE[key] = (alpha, input_scale, adjusted)
-    return adjusted
+    with record_function("tp_moe.prepare_expert_scale_vector"):
+        if scale.numel() == 1:
+            with record_function("tp_moe.prepare_expert_scale_vector.expand_scalar"):
+                return (
+                    scale.reshape(())
+                    .expand(weight_E)
+                    .to(torch.float32)
+                    .contiguous()
+                )
+        if scale.numel() != weight_E:
+            raise ValueError(
+                f"expected {name} with {weight_E} elements, got {scale.numel()}"
+            )
+        return scale.reshape(weight_E).to(torch.float32).contiguous()
 
 
 def _safe_max_rows_per_launch(E: int, k: int, n: int) -> int:
@@ -1121,7 +1481,7 @@ def _plan_core_workspace(
                     "weight_expert_ids", (state_E,), torch.int32, init="arange"
                 ),
                 _TensorAllocSpec("global_to_local_expert", (weight_E,), torch.int32),
-                _TensorAllocSpec("compact_topk_ids", (state_E,), torch.int32),
+                _TensorAllocSpec("compact_topk_ids", (routed_rows,), torch.int32),
                 _TensorAllocSpec(
                     "micro_intermediate",
                     (micro_intermediate_elements,),
@@ -1530,6 +1890,8 @@ def _get_weight_views(
     bs_u8 = w1_blockscale.view(torch.uint8)
     w13_sf = as_grouped_scale_view(bs_u8, w1_n, k)
     down_sf = as_grouped_scale_view(w2_blockscale.view(torch.uint8), k, n)
+    if not w1_alphas.is_contiguous() or not w2_alphas.is_contiguous():
+        raise ValueError("w1_alphas and w2_alphas must be contiguous")
 
     sf_dtype = cutlass.Float8E4M3FN
     views = _WeightViews(
@@ -1537,8 +1899,8 @@ def _get_weight_views(
         down=down,
         w13_sf=w13_sf,
         down_sf=down_sf,
-        w1_alpha=_get_plain_cuda_tensor(w1_alphas),
-        w2_alpha=_get_plain_cuda_tensor(w2_alphas),
+        w1_alpha=w1_alphas,
+        w2_alpha=w2_alphas,
         w1_storage=w1_fp4,
         w1_scale_storage=w1_blockscale,
         w2_storage=w2_fp4,
@@ -1572,15 +1934,16 @@ def _get_w4a16_packed_weights(
     activation: str,
     params_dtype: torch.dtype,
     source_format: str = "modelopt_nvfp4",
+    w13_layout: str = "w13",
     reuse_input_storage: bool = False,
 ):
     from b12x.moe.fused.w4a16.prepare import (
-        prepare_w4a16_compressed_tensors_weights,
-        prepare_w4a16_modelopt_nvfp4_weights,
-        prepare_w4a16_mxfp4_native_weights,
+        prepare_w4a16_e8m0_native_weights,
+        prepare_w4a16_packed_weights,
     )
 
     source_format = _normalize_fp4_source_format(source_format)
+    w13_layout = _normalize_w13_layout(w13_layout)
     key = (
         w1_fp4.data_ptr(),
         w1_blockscale.data_ptr(),
@@ -1591,131 +1954,173 @@ def _get_w4a16_packed_weights(
         activation,
         params_dtype,
         source_format,
+        w13_layout,
         reuse_input_storage,
     )
     cached = _W4A16_PACKED_WEIGHT_CACHE.get(key)
     if cached is not None:
         return cached
-    if source_format == "modelopt_nvfp4":
-        prepare_weights = prepare_w4a16_modelopt_nvfp4_weights
-    elif source_format == "compressed_tensors":
-        prepare_weights = prepare_w4a16_compressed_tensors_weights
-    elif source_format == "mxfp4_native":
-        prepare_weights = prepare_w4a16_mxfp4_native_weights
+    if source_format == "fp4_e8m0_k32" and _w4a16_e8m0_micro_enabled():
+        # Opt-in (B12X_W4A16_E8M0_MICRO): native weight_layout="modelopt"
+        # single-copy object so small-M decode routes to the micro kernel and
+        # med/large M to the main W4A16 GEMM. The E8M0 scale grid is
+        # byte-identical to the packed path (both pack via _pack_e8m0_k32_scales),
+        # so this only changes the weight layout. Default off keeps E8M0 packed.
+        prepared = prepare_w4a16_e8m0_native_weights(
+            w1_fp4,
+            w1_blockscale,
+            w1_alphas,
+            w2_fp4,
+            w2_blockscale,
+            w2_alphas,
+            activation=activation,
+            params_dtype=params_dtype,
+            w13_layout=w13_layout,
+        )
     else:
-        raise AssertionError(f"unhandled W4A16 source_format {source_format!r}")
-    prepared = prepare_weights(
-        w1_fp4,
-        w1_blockscale,
-        w1_alphas,
-        w2_fp4,
-        w2_blockscale,
-        w2_alphas,
-        activation=activation,
-        params_dtype=params_dtype,
-        reuse_input_storage=reuse_input_storage,
-    )
+        prepared = prepare_w4a16_packed_weights(
+            w1_fp4,
+            w1_blockscale,
+            w1_alphas,
+            w2_fp4,
+            w2_blockscale,
+            w2_alphas,
+            activation=activation,
+            params_dtype=params_dtype,
+            source_format=source_format,
+            w13_layout=w13_layout,
+            reuse_input_storage=reuse_input_storage,
+        )
     _W4A16_PACKED_WEIGHT_CACHE[key] = prepared
     return prepared
 
 
-def prepare_b12x_w4a16_packed_weights(
-    w1_fp4: torch.Tensor,
-    w1_blockscale: torch.Tensor,
-    w1_alphas: torch.Tensor,
+def _prepare_modelopt_nvfp4_runtime_alphas(
+    w1_global_scale: torch.Tensor,
     a1_gscale: torch.Tensor,
-    w2_fp4: torch.Tensor,
-    w2_blockscale: torch.Tensor,
-    w2_alphas: torch.Tensor,
+    w2_global_scale: torch.Tensor,
     a2_gscale: torch.Tensor,
     *,
-    activation: str,
-    params_dtype: torch.dtype,
-    quant_mode: str | None = "w4a16",
-    source_format: str = "modelopt_nvfp4",
-    reuse_input_storage: bool = False,
-) -> object:
-    """Prepare W4A16 packed weights using the same contract as b12x_moe_fp4."""
-    quant_mode_arg = quant_mode
-    quant_mode = _normalize_quant_mode(quant_mode_arg)
-    if quant_mode != "w4a16":
-        raise ValueError("W4A16 packed weights require quant_mode='w4a16'")
-    source_format = _normalize_fp4_source_format(source_format)
-    _validate_fp4_source_format_for_quant_mode(
-        source_format=source_format,
-        quant_mode=quant_mode,
-    )
+    weight_E: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prepare W4A4 runtime alphas from raw ModelOpt NVFP4 scales.
 
-    weight_E = int(w1_fp4.shape[0])
-    if quant_mode_arg is None:
-        w1_alphas = _w4a16_default_alpha(w1_alphas, a1_gscale, weight_E)
-        w2_alphas = _w4a16_default_alpha(w2_alphas, a2_gscale, weight_E)
-
-    return _get_w4a16_packed_weights(
-        w1_fp4,
-        w1_blockscale,
-        w1_alphas,
-        w2_fp4,
-        w2_blockscale,
-        w2_alphas,
-        activation=activation,
-        params_dtype=params_dtype,
-        source_format=source_format,
-        reuse_input_storage=reuse_input_storage,
-    )
-
-
-def prepare_b12x_w4a16_modelopt_nvfp4_weights(
-    w1_fp4: torch.Tensor,
-    w1_blockscale: torch.Tensor,
-    w1_alphas: torch.Tensor,
-    a1_gscale: torch.Tensor,
-    w2_fp4: torch.Tensor,
-    w2_blockscale: torch.Tensor,
-    w2_alphas: torch.Tensor,
-    a2_gscale: torch.Tensor,
-    *,
-    activation: str,
-    params_dtype: torch.dtype,
-    quant_mode: str | None = "w4a16",
-    source_format: str = "modelopt_nvfp4",
-    reuse_input_storage: bool = False,
-) -> object:
-    """Prepare ModelOpt NVFP4 W4A16 weights from the normal NVFP4 scale contract.
-
-    The ModelOpt/vLLM tensors use the same fused ``w*_alphas`` consumed by
-    W4A4: activation input scale multiplied by weight global scale. W4A16 uses
-    BF16 activations directly, so recover the weight global scale by applying
-    the reciprocal input scales before the W4A16 weight preparation step.
+    ModelOpt stores per-expert weight global scales separately from activation
+    input scales. The existing NVFP4 W4A4 kernels consume
+    ``weight_global_scale * input_scale`` while vLLM exposes reciprocal input
+    scales in ``a*_gscale``. Keep that conversion in B12X preparation so
+    integrations do not mutate checkpoint-owned scale tensors in-place.
     """
-    quant_mode = _normalize_quant_mode(quant_mode)
-    if quant_mode != "w4a16":
-        raise ValueError("W4A16 ModelOpt NVFP4 weights require quant_mode='w4a16'")
-    source_format = _normalize_fp4_source_format(source_format)
-    _validate_fp4_source_format_for_quant_mode(
-        source_format=source_format,
-        quant_mode=quant_mode,
+    if weight_E is None:
+        weight_E = int(w1_global_scale.numel())
+    w1_scale = _prepare_expert_scale_vector(
+        w1_global_scale,
+        weight_E,
+        name="w1_global_scale",
     )
-    if source_format != "modelopt_nvfp4":
+    w2_scale = _prepare_expert_scale_vector(
+        w2_global_scale,
+        weight_E,
+        name="w2_global_scale",
+    )
+    a1_recip = _prepare_expert_scale_vector(a1_gscale, weight_E, name="a1_gscale")
+    a2_recip = _prepare_expert_scale_vector(a2_gscale, weight_E, name="a2_gscale")
+    w1_runtime = torch.empty_like(w1_scale)
+    w2_runtime = torch.empty_like(w2_scale)
+    torch.div(w1_scale, a1_recip, out=w1_runtime)
+    torch.div(w2_scale, a2_recip, out=w2_runtime)
+    return w1_runtime.contiguous(), w2_runtime.contiguous()
+
+
+def prepare_b12x_fp4_moe_weights(
+    *,
+    source_format: str = "modelopt_nvfp4",
+    w13_layout: str = "w13",
+    w1_global_scale: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    a1_gscale: torch.Tensor | None = None,
+    a2_gscale: torch.Tensor | None = None,
+    w1_fp4: torch.Tensor | None = None,
+    w1_blockscale: torch.Tensor | None = None,
+    w2_fp4: torch.Tensor | None = None,
+    w2_blockscale: torch.Tensor | None = None,
+    activation: str | None = None,
+    params_dtype: torch.dtype | None = None,
+    prepare_runtime_alphas: bool = False,
+    prepare_w4a16: bool = False,
+    reuse_input_storage: bool = False,
+) -> B12XPreparedFP4MoEWeights:
+    """Prepare B12X FP4 MoE runtime representations from a source contract."""
+    source_format = _normalize_fp4_source_format(source_format)
+    w13_layout = _normalize_w13_layout(w13_layout)
+    if not prepare_runtime_alphas and not prepare_w4a16:
         raise ValueError(
-            "W4A16 ModelOpt NVFP4 weights require source_format='modelopt_nvfp4'"
+            "prepare_b12x_fp4_moe_weights requires at least one requested "
+            "representation"
         )
 
-    weight_E = int(w1_fp4.shape[0])
-    w1_alphas = _w4a16_default_alpha(w1_alphas, a1_gscale, weight_E)
-    w2_alphas = _w4a16_default_alpha(w2_alphas, a2_gscale, weight_E)
+    w1_runtime_alphas = None
+    w2_runtime_alphas = None
+    if prepare_runtime_alphas:
+        if source_format != "modelopt_nvfp4":
+            raise ValueError(
+                "runtime alpha preparation is only defined for "
+                "source_format='modelopt_nvfp4'"
+            )
+        if a1_gscale is None or a2_gscale is None:
+            raise ValueError(
+                "a1_gscale and a2_gscale are required to prepare runtime alphas"
+            )
+        weight_E = (
+            int(w1_fp4.shape[0])
+            if w1_fp4 is not None
+            else int(w1_global_scale.numel())
+        )
+        w1_runtime_alphas, w2_runtime_alphas = _prepare_modelopt_nvfp4_runtime_alphas(
+            w1_global_scale,
+            a1_gscale,
+            w2_global_scale,
+            a2_gscale,
+            weight_E=weight_E,
+        )
 
-    return _get_w4a16_packed_weights(
-        w1_fp4,
-        w1_blockscale,
-        w1_alphas,
-        w2_fp4,
-        w2_blockscale,
-        w2_alphas,
-        activation=activation,
-        params_dtype=params_dtype,
+    w4a16 = None
+    if prepare_w4a16:
+        if (
+            w1_fp4 is None
+            or w1_blockscale is None
+            or w2_fp4 is None
+            or w2_blockscale is None
+        ):
+            raise ValueError(
+                "w1/w2 FP4 tensors and block scales are required to prepare W4A16"
+            )
+        if activation is None or params_dtype is None:
+            raise ValueError("activation and params_dtype are required for W4A16")
+        _validate_fp4_source_format_for_quant_mode(
+            source_format=source_format,
+            quant_mode="w4a16",
+        )
+        w4a16 = _get_w4a16_packed_weights(
+            w1_fp4,
+            w1_blockscale,
+            w1_global_scale,
+            w2_fp4,
+            w2_blockscale,
+            w2_global_scale,
+            activation=activation,
+            params_dtype=params_dtype,
+            source_format=source_format,
+            w13_layout=w13_layout,
+            reuse_input_storage=reuse_input_storage,
+        )
+
+    return B12XPreparedFP4MoEWeights(
         source_format=source_format,
-        reuse_input_storage=reuse_input_storage,
+        w13_layout=w13_layout,
+        w1_runtime_alphas=w1_runtime_alphas,
+        w2_runtime_alphas=w2_runtime_alphas,
+        w4a16=w4a16,
     )
 
 
@@ -2020,7 +2425,9 @@ def _validate_frozen_w4a16_launch(
     apply_router_weight_on_input: bool,
     swiglu_limit: float | None,
     weight_layout: str,
+    scale_format: str,
 ) -> None:
+    scale_format = _normalize_w4a16_scale_format(scale_format)
     token_count = int(plan.max_tokens_per_launch)
     planned_capacity = min(
         (planned for planned in workspace.planned_token_counts if planned >= token_count),
@@ -2045,15 +2452,38 @@ def _validate_frozen_w4a16_launch(
             "frozen W4A16 MoE workspace swiglu_limit mismatch: "
             f"requested={requested_limit}, planned={workspace.planned_swiglu_limit}"
         )
-    fused = workspace.planned_fused_moe_launches.get((weight_layout, planned_capacity))
+    planned_scale_format = _normalize_w4a16_scale_format(
+        getattr(workspace, "planned_scale_format", "e4m3_k16")
+    )
+    if scale_format != planned_scale_format:
+        raise RuntimeError(
+            "frozen W4A16 MoE workspace scale_format mismatch: "
+            f"requested={scale_format!r}, planned={planned_scale_format!r}"
+        )
+    fused = workspace.planned_fused_moe_launches.get(
+        (weight_layout, scale_format, planned_capacity)
+    )
+    if fused is None:
+        legacy_fused = workspace.planned_fused_moe_launches.get(
+            (weight_layout, planned_capacity)
+        )
+        if (
+            scale_format == "e4m3_k16"
+            and getattr(legacy_fused, "weight_layout", "packed") == weight_layout
+        ):
+            fused = legacy_fused
     if fused is None:
         legacy_fused = workspace.planned_fused_moe_launches.get(planned_capacity)
-        if getattr(legacy_fused, "weight_layout", "packed") == weight_layout:
+        if (
+            scale_format == "e4m3_k16"
+            and getattr(legacy_fused, "weight_layout", "packed") == weight_layout
+        ):
             fused = legacy_fused
     if fused is None:
         raise RuntimeError(
             "frozen W4A16 MoE workspace is missing its preplanned fused launch "
-            f"for capacity={planned_capacity}, weight_layout={weight_layout!r}"
+            f"for capacity={planned_capacity}, weight_layout={weight_layout!r}, "
+            f"scale_format={scale_format!r}"
         )
     if planned_capacity not in workspace.planned_topk_sum_launches:
         raise RuntimeError(
@@ -2067,8 +2497,10 @@ def _w4a16_preplanned_launches(
     *,
     token_count: int,
     weight_layout: str,
+    scale_format: str = "e4m3_k16",
 ) -> tuple[object | None, object | None]:
     token_count = int(token_count)
+    scale_format = _normalize_w4a16_scale_format(scale_format)
     if not workspace.planned_token_counts:
         return None, None
     planned_capacity = min(
@@ -2080,16 +2512,31 @@ def _w4a16_preplanned_launches(
             "W4A16 MoE workspace was asked to launch an unplanned token count: "
             f"tokens={token_count}, planned={sorted(workspace.planned_token_counts)}"
         )
-    fused = workspace.planned_fused_moe_launches.get((weight_layout, planned_capacity))
+    fused = workspace.planned_fused_moe_launches.get(
+        (weight_layout, scale_format, planned_capacity)
+    )
+    if fused is None:
+        legacy_fused = workspace.planned_fused_moe_launches.get(
+            (weight_layout, planned_capacity)
+        )
+        if (
+            scale_format == "e4m3_k16"
+            and getattr(legacy_fused, "weight_layout", "packed") == weight_layout
+        ):
+            fused = legacy_fused
     if fused is None:
         legacy_fused = workspace.planned_fused_moe_launches.get(planned_capacity)
-        if getattr(legacy_fused, "weight_layout", "packed") == weight_layout:
+        if (
+            scale_format == "e4m3_k16"
+            and getattr(legacy_fused, "weight_layout", "packed") == weight_layout
+        ):
             fused = legacy_fused
     topk_sum = workspace.planned_topk_sum_launches.get(planned_capacity)
     if fused is None or topk_sum is None:
         raise RuntimeError(
             "W4A16 MoE workspace is missing preplanned launches for "
-            f"capacity={planned_capacity}, weight_layout={weight_layout!r}"
+            f"capacity={planned_capacity}, weight_layout={weight_layout!r}, "
+            f"scale_format={scale_format!r}"
         )
     return fused, topk_sum
 
@@ -2104,7 +2551,9 @@ def _resolve_workspace(
     apply_router_weight_on_input: bool = False,
     swiglu_limit: float | None = None,
     weight_layout: str = "packed",
+    scale_format: str = "e4m3_k16",
 ) -> object:
+    scale_format = _normalize_w4a16_scale_format(scale_format)
     if isinstance(workspace, (TPMoEWorkspace, TPW4A16Workspace)):
         _validate_workspace(workspace, plan=plan)
         if isinstance(workspace, TPDynamicWorkspace):
@@ -2251,6 +2700,7 @@ def _resolve_workspace(
             apply_router_weight_on_input=apply_router_weight_on_input,
             swiglu_limit=swiglu_limit,
             weight_layout=weight_layout,
+            scale_format=scale_format,
         )
 
     if isinstance(resolved, TPDynamicWorkspace):
@@ -2392,18 +2842,49 @@ def plan_tp_moe_arena_layout(
             dynamic_task_capacity=plan.dynamic_task_capacity,
         )
         core_nbytes = max(core_nbytes, _core_workspace_nbytes(core_plan))
-    route_nbytes = _route_workspace_nbytes(
-        num_tokens=max_tokens,
-        num_experts=route_num_experts,
-        top_k=num_topk,
-        logits_dtype=route_logits_dtype,
-    )
+    if route_num_experts > 0:
+        route_nbytes = _route_workspace_nbytes(
+            num_tokens=max_tokens,
+            num_experts=route_num_experts,
+            top_k=num_topk,
+            logits_dtype=route_logits_dtype,
+        )
+    else:
+        route_nbytes = 0
     route_nbytes = align_up(route_nbytes, 16)
     return TPMoEArenaLayout(
         route_workspace_nbytes=route_nbytes,
         core_workspace_nbytes=core_nbytes,
         total_nbytes=max(route_nbytes + core_nbytes, 1),
         core_token_counts=core_token_counts,
+    )
+
+
+def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
+    layout = plan_tp_moe_arena_layout(
+        max_tokens=caps.max_tokens,
+        weight_E=caps.weight_E,
+        k=caps.k,
+        n=caps.n,
+        num_topk=caps.num_topk,
+        device=caps.device,
+        dtype=caps.dtype,
+        core_token_counts=caps.core_token_counts,
+        route_num_experts=caps.route_num_experts,
+        route_logits_dtype=caps.route_logits_dtype,
+        quant_mode=caps.quant_mode,
+        activation=caps.activation,
+    )
+    return TPMoEScratchPlan(
+        caps=caps,
+        layout=layout,
+        _scratch_specs=(
+            scratch_buffer_spec(
+                "tp_moe.scratch",
+                nbytes=layout.total_nbytes,
+                device=torch.device(caps.device),
+            ),
+        ),
     )
 
 
@@ -2474,10 +2955,22 @@ def _prewarm_w4a16_planned_launches(
     token_counts: tuple[int, ...],
     apply_router_weight_on_input: bool,
     swiglu_limit: float | None,
+    scale_format: str = "e4m3_k16",
+    weight_layout: str = "packed",
+    w13_layout: str = "w13",
 ) -> None:
-    """Resolve every W4A16 kernel shape owned by a frozen arena."""
+    """Resolve every W4A16 kernel shape owned by a frozen arena.
+
+    ``weight_layout`` and ``w13_layout`` must match the prepared weights the
+    binding will run with: E8M0 sources keep native ``modelopt`` weights (so the
+    FC1 ``source_n_rotation`` depends on ``w13_layout``), while NVFP4 sources are
+    ``packed`` (rotation already folded in, ``w13_layout`` irrelevant).
+    """
     if workspace.device.type != "cuda":
         raise RuntimeError("W4A16 MoE launch planning requires a CUDA device")
+    scale_format = _normalize_w4a16_scale_format(scale_format)
+    weight_layout = _normalize_w4a16_weight_layout(weight_layout)
+    w13_layout = _normalize_w13_layout(w13_layout)
 
     from b12x.moe.fused.w4a16.host import (
         max_packed_route_slots,
@@ -2494,7 +2987,9 @@ def _prewarm_w4a16_planned_launches(
     if not token_counts:
         raise ValueError("W4A16 launch planning requires at least one token count")
 
+    t0 = time.perf_counter() if _B12X_TIMING else 0.0
     with torch.cuda.device(workspace.device):
+        is_capturing = torch.cuda.is_current_stream_capturing()
         props = torch.cuda.get_device_properties(workspace.device)
         sms = int(props.multi_processor_count)
         max_shared_mem = int(
@@ -2504,6 +2999,7 @@ def _prewarm_w4a16_planned_launches(
         fused_launches: dict[object, object] = {}
         topk_sum_launches: dict[int, object] = {}
         for token_count in token_counts:
+            t_token = time.perf_counter() if _B12X_TIMING else 0.0
             block_size_m = select_route_block_size_m(
                 token_count,
                 workspace.num_topk,
@@ -2516,8 +3012,10 @@ def _prewarm_w4a16_planned_launches(
                 workspace.weight_E,
             )
             max_m_blocks = (route_slots + block_size_m - 1) // block_size_m
-            weight_layout = "packed"
-            fused_launches[(weight_layout, token_count)] = compile_w4a16_fused_moe(
+            t_shape = time.perf_counter() if _B12X_TIMING else 0.0
+            fused_launches[
+                (weight_layout, scale_format, token_count)
+            ] = compile_w4a16_fused_moe(
                 size_m=token_count,
                 hidden_size=workspace.k,
                 intermediate_size=workspace.n,
@@ -2533,13 +3031,62 @@ def _prewarm_w4a16_planned_launches(
                 max_shared_mem=max_shared_mem,
                 swiglu_limit=swiglu_limit,
                 weight_layout=weight_layout,
+                scale_format=scale_format,
+                w13_layout=w13_layout,
             )
+            t_fused = time.perf_counter() if _B12X_TIMING else 0.0
             topk_sum_launches[token_count] = compile_w4a16_topk_sum(
                 m=token_count,
                 topk=workspace.num_topk,
                 hidden_size=workspace.k,
                 element_dtype=element_dtype,
             )
+            t_sum = time.perf_counter() if _B12X_TIMING else 0.0
+
+            # The real route-pack launch happens in run_w4a16_moe. During CUDA
+            # graph capture this prewarm-only launch would be recorded as
+            # useless work in every captured MoE graph.
+            if is_capturing:
+                if _B12X_TIMING:
+                    total_ms = (t_sum - t_token) * 1000.0
+                    if total_ms >= _B12X_TIMING_THRESHOLD_MS:
+                        logger.warning(
+                            "b12x_w4a16_prewarm timing tokens=%d capturing=%s "
+                            "shape=%.3fms compile_fused=%.3fms "
+                            "compile_sum=%.3fms route_pack=skipped total=%.3fms",
+                            int(token_count),
+                            is_capturing,
+                            (t_shape - t_token) * 1000.0,
+                            (t_fused - t_shape) * 1000.0,
+                            (t_sum - t_fused) * 1000.0,
+                            total_ms,
+                        )
+                continue
+
+            route_pack_key = (
+                workspace.device.type,
+                int(torch.cuda.current_device()),
+                int(token_count) * int(workspace.num_topk),
+                int(block_size_m),
+                int(workspace.weight_E),
+                bool(False),
+            )
+            if route_pack_key in _W4A16_ROUTE_PACK_PREWARMED:
+                if _B12X_TIMING:
+                    total_ms = (t_sum - t_token) * 1000.0
+                    if total_ms >= _B12X_TIMING_THRESHOLD_MS:
+                        logger.warning(
+                            "b12x_w4a16_prewarm timing tokens=%d capturing=%s "
+                            "shape=%.3fms compile_fused=%.3fms "
+                            "compile_sum=%.3fms route_pack=cached total=%.3fms",
+                            int(token_count),
+                            is_capturing,
+                            (t_shape - t_token) * 1000.0,
+                            (t_fused - t_shape) * 1000.0,
+                            (t_sum - t_fused) * 1000.0,
+                            total_ms,
+                        )
+                continue
 
             dummy_topk_ids = torch.empty(
                 token_count,
@@ -2557,8 +3104,37 @@ def _prewarm_w4a16_planned_launches(
                 packed_route_count=workspace.packed_route_count,
                 expert_offsets=workspace.expert_offsets,
             )
+            _W4A16_ROUTE_PACK_PREWARMED.add(route_pack_key)
+            if _B12X_TIMING:
+                t_route = time.perf_counter()
+                total_ms = (t_route - t_token) * 1000.0
+                if total_ms >= _B12X_TIMING_THRESHOLD_MS:
+                    logger.warning(
+                        "b12x_w4a16_prewarm timing tokens=%d capturing=%s "
+                        "shape=%.3fms compile_fused=%.3fms compile_sum=%.3fms "
+                        "route_pack=%.3fms total=%.3fms",
+                        int(token_count),
+                        is_capturing,
+                        (t_shape - t_token) * 1000.0,
+                        (t_fused - t_shape) * 1000.0,
+                        (t_sum - t_fused) * 1000.0,
+                        (t_route - t_sum) * 1000.0,
+                        total_ms,
+                    )
         workspace.planned_fused_moe_launches = fused_launches
         workspace.planned_topk_sum_launches = topk_sum_launches
+        workspace.planned_scale_format = scale_format
+    if _B12X_TIMING:
+        t_done = time.perf_counter()
+        total_ms = (t_done - t0) * 1000.0
+        if total_ms >= _B12X_TIMING_THRESHOLD_MS:
+            logger.warning(
+                "b12x_w4a16_prewarm_total timing counts=%s capturing=%s "
+                "total=%.3fms",
+                token_counts,
+                is_capturing,
+                total_ms,
+            )
 
 
 def materialize_tp_moe_arena_workspaces(
@@ -2576,9 +3152,20 @@ def materialize_tp_moe_arena_workspaces(
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
     swiglu_limit: float | None = None,
+    source_format: str = "modelopt_nvfp4",
+    w13_layout: str = "w13",
 ) -> None:
     """Materialize graph-capture-sensitive workspaces from arena sizing caps."""
+    t0 = time.perf_counter() if _B12X_TIMING else 0.0
     quant_mode = _normalize_quant_mode(quant_mode)
+    source_format = _normalize_fp4_source_format(source_format)
+    w13_layout = _normalize_w13_layout(w13_layout)
+    _validate_fp4_source_format_for_quant_mode(
+        source_format=source_format,
+        quant_mode=quant_mode,
+    )
+    w4a16_scale_format = _w4a16_scale_format_for_source(source_format)
+    w4a16_weight_layout = _w4a16_weight_layout_for_source(source_format)
 
     device = torch.device(device)
     max_tokens = max(int(max_tokens), 1)
@@ -2592,6 +3179,7 @@ def materialize_tp_moe_arena_workspaces(
         core_token_counts=core_token_counts,
         quant_mode=quant_mode,
     )
+    t_counts = time.perf_counter() if _B12X_TIMING else 0.0
     selected: dict[tuple, tuple[TPMoEPlan, _TPCoreWorkspacePlan, int]] = {}
     for token_count in core_token_counts:
         plan = _make_workspace_plan(
@@ -2639,6 +3227,9 @@ def materialize_tp_moe_arena_workspaces(
         if existing_selection is None or required_nbytes > existing_selection[2]:
             selected[key] = (plan, core_plan, required_nbytes)
 
+    t_selected = time.perf_counter() if _B12X_TIMING else 0.0
+    materialize_ms = 0.0
+    prewarm_ms = 0.0
     for key, (plan, core_plan, required_nbytes) in selected.items():
         existing = pool.workspaces.get(key)
         if existing is not None:
@@ -2650,6 +3241,10 @@ def materialize_tp_moe_arena_workspaces(
                     != bool(apply_router_weight_on_input)
                     or existing.planned_swiglu_limit
                     != _normalize_w4a16_swiglu_limit(swiglu_limit)
+                    or _normalize_w4a16_scale_format(
+                        getattr(existing, "planned_scale_format", "e4m3_k16")
+                    )
+                    != w4a16_scale_format
                 ):
                     pass
                 else:
@@ -2682,6 +3277,7 @@ def materialize_tp_moe_arena_workspaces(
         else:
             a1_init = torch.ones((), dtype=torch.float32, device=plan.device)
             a2_init = torch.ones((), dtype=torch.float32, device=plan.device)
+        t_materialize0 = time.perf_counter() if _B12X_TIMING else 0.0
         materialized = _materialize_workspace_from_core_arena(
             core_plan,
             arena,
@@ -2690,6 +3286,8 @@ def materialize_tp_moe_arena_workspaces(
             input_scales_static=True,
             volatile_launch_state=bool(pool.shared_arena is not None),
         )
+        if _B12X_TIMING:
+            materialize_ms += (time.perf_counter() - t_materialize0) * 1000.0
         if quant_mode == "w4a16":
             if not isinstance(materialized, TPW4A16Workspace):
                 raise TypeError(
@@ -2703,13 +3301,37 @@ def materialize_tp_moe_arena_workspaces(
             materialized.planned_swiglu_limit = _normalize_w4a16_swiglu_limit(
                 swiglu_limit
             )
+            t_prewarm0 = time.perf_counter() if _B12X_TIMING else 0.0
             _prewarm_w4a16_planned_launches(
                 materialized,
                 token_counts=core_token_counts,
                 apply_router_weight_on_input=bool(apply_router_weight_on_input),
                 swiglu_limit=materialized.planned_swiglu_limit,
+                scale_format=w4a16_scale_format,
+                weight_layout=w4a16_weight_layout,
+                w13_layout=w13_layout,
             )
+            if _B12X_TIMING:
+                prewarm_ms += (time.perf_counter() - t_prewarm0) * 1000.0
         pool.workspaces[key] = materialized
+    if _B12X_TIMING:
+        t_done = time.perf_counter()
+        total_ms = (t_done - t0) * 1000.0
+        if total_ms >= _B12X_TIMING_THRESHOLD_MS:
+            logger.warning(
+                "b12x_tp_moe_materialize timing max_tokens=%d counts=%s "
+                "selected=%d quant=%s counts=%.3fms select=%.3fms "
+                "materialize=%.3fms prewarm=%.3fms total=%.3fms",
+                max_tokens,
+                core_token_counts,
+                len(selected),
+                quant_mode,
+                (t_counts - t0) * 1000.0,
+                (t_selected - t_counts) * 1000.0,
+                materialize_ms,
+                prewarm_ms,
+                total_ms,
+            )
 
 
 def allocate_tp_moe_workspace_pool(
@@ -2729,6 +3351,181 @@ def allocate_tp_moe_workspace_pool(
             frozen=frozen,
         )
     return pool
+
+
+def build_tp_moe_fp4_binding(
+    *,
+    workspace: TPMoEWorkspace | TPW4A16Workspace | TPMoEWorkspacePool,
+    a: torch.Tensor,
+    a1_gscale: torch.Tensor,
+    w1_fp4: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w1_alphas: torch.Tensor,
+    a2_gscale: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_alphas: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    apply_router_weight_on_input: bool = False,
+    output: torch.Tensor | None = None,
+    input_scales_are_reciprocal: bool | None = None,
+    input_scales_static: bool = False,
+    fast_math: bool | None = None,
+    activation: str = "silu",
+    quant_mode: str | None = None,
+    unit_scale_contract: bool = False,
+    source_format: str = "modelopt_nvfp4",
+    w13_layout: str = "w13",
+    prepared_w4a16: object | None = None,
+    swiglu_limit: float | None = None,
+) -> TPMoEFP4Binding:
+    if not isinstance(workspace, (TPMoEWorkspace, TPW4A16Workspace, TPMoEWorkspacePool)):
+        raise TypeError(
+            "workspace must be a TPMoEWorkspace, TPW4A16Workspace, or TPMoEWorkspacePool"
+        )
+    if a.ndim != 2:
+        raise ValueError(f"expected input activations with rank 2, got {tuple(a.shape)}")
+    if topk_weights.ndim != 2 or topk_ids.ndim != 2:
+        raise ValueError("topk_weights and topk_ids must be rank-2 tensors")
+    if topk_weights.shape != topk_ids.shape:
+        raise ValueError(
+            "topk_weights and topk_ids shape mismatch: "
+            f"{tuple(topk_weights.shape)} vs {tuple(topk_ids.shape)}"
+        )
+    if topk_ids.shape[0] != a.shape[0]:
+        raise ValueError(
+            f"routing batch mismatch: expected {a.shape[0]}, got {topk_ids.shape[0]}"
+        )
+    return TPMoEFP4Binding(
+        a=a,
+        a1_gscale=a1_gscale,
+        w1_fp4=w1_fp4,
+        w1_blockscale=w1_blockscale,
+        w1_alphas=w1_alphas,
+        a2_gscale=a2_gscale,
+        w2_fp4=w2_fp4,
+        w2_blockscale=w2_blockscale,
+        w2_alphas=w2_alphas,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        scratch=workspace,
+        apply_router_weight_on_input=bool(apply_router_weight_on_input),
+        output=output,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        input_scales_static=bool(input_scales_static),
+        fast_math=fast_math,
+        activation=activation,
+        quant_mode=quant_mode,
+        unit_scale_contract=bool(unit_scale_contract),
+        source_format=source_format,
+        w13_layout=w13_layout,
+        prepared_w4a16=prepared_w4a16,
+        swiglu_limit=swiglu_limit,
+    )
+
+
+def build_tp_moe_route_binding(
+    *,
+    workspace: TPMoEWorkspace | TPW4A16Workspace | TPMoEWorkspacePool | None,
+    hidden_states: torch.Tensor,
+    top_k: int,
+    gate_weight: torch.Tensor | None = None,
+    gate_bias: torch.Tensor | None = None,
+    router_logits: torch.Tensor | None = None,
+    renormalize: bool = True,
+) -> TPMoERouteBinding:
+    if workspace is not None and not isinstance(
+        workspace,
+        (TPMoEWorkspace, TPW4A16Workspace, TPMoEWorkspacePool),
+    ):
+        raise TypeError(
+            "workspace must be a TPMoEWorkspace, TPW4A16Workspace, TPMoEWorkspacePool, or None"
+        )
+    if hidden_states.ndim != 2:
+        raise ValueError(
+            "expected hidden_states with rank 2, got shape "
+            f"{tuple(hidden_states.shape)}"
+        )
+    if int(top_k) <= 0:
+        raise ValueError(f"top_k must be positive, got {top_k}")
+    if router_logits is not None and gate_weight is not None:
+        raise ValueError("pass either router_logits or gate_weight, not both")
+    if router_logits is None and gate_weight is None:
+        raise ValueError("expected router_logits or gate_weight")
+    return TPMoERouteBinding(
+        hidden_states=hidden_states,
+        top_k=int(top_k),
+        scratch=workspace,
+        gate_weight=gate_weight,
+        gate_bias=gate_bias,
+        router_logits=router_logits,
+        renormalize=bool(renormalize),
+    )
+
+
+def build_tp_moe_sparse_fp4_binding(
+    *,
+    workspace: TPMoEWorkspace | TPW4A16Workspace | TPMoEWorkspacePool,
+    hidden_states: torch.Tensor,
+    experts: B12XFP4ExpertWeights,
+    routing: B12XTopKRouting | None = None,
+    top_k: int | None = None,
+    gate_weight: torch.Tensor | None = None,
+    gate_bias: torch.Tensor | None = None,
+    router_logits: torch.Tensor | None = None,
+    renormalize_topk: bool = True,
+    routed_scaling_factor: float = 1.0,
+    output: torch.Tensor | None = None,
+    return_routing: bool = False,
+    input_scales_are_reciprocal: bool | None = None,
+    input_scales_static: bool = False,
+    fast_math: bool | None = None,
+    activation: str = "silu",
+    quant_mode: str | None = None,
+) -> TPMoESparseFP4Binding:
+    if not isinstance(workspace, (TPMoEWorkspace, TPW4A16Workspace, TPMoEWorkspacePool)):
+        raise TypeError(
+            "workspace must be a TPMoEWorkspace, TPW4A16Workspace, or TPMoEWorkspacePool"
+        )
+    if hidden_states.ndim != 2:
+        raise ValueError(
+            "expected hidden_states with rank 2, got shape "
+            f"{tuple(hidden_states.shape)}"
+        )
+    if not isinstance(experts, B12XFP4ExpertWeights):
+        raise TypeError("experts must be a B12XFP4ExpertWeights")
+    if routing is not None:
+        if (
+            top_k is not None
+            or gate_weight is not None
+            or gate_bias is not None
+            or router_logits is not None
+        ):
+            raise ValueError(
+                "routing is mutually exclusive with top_k/gate_weight/gate_bias/router_logits"
+            )
+    elif top_k is None:
+        raise ValueError("top_k is required when routing is not provided")
+    return TPMoESparseFP4Binding(
+        hidden_states=hidden_states,
+        experts=experts,
+        scratch=workspace,
+        routing=routing,
+        top_k=None if top_k is None else int(top_k),
+        gate_weight=gate_weight,
+        gate_bias=gate_bias,
+        router_logits=router_logits,
+        renormalize_topk=bool(renormalize_topk),
+        routed_scaling_factor=float(routed_scaling_factor),
+        output=output,
+        return_routing=bool(return_routing),
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        input_scales_static=bool(input_scales_static),
+        fast_math=fast_math,
+        activation=activation,
+        quant_mode=quant_mode,
+    )
 
 
 def _get_kernel_cache(impl: str) -> Dict[Tuple, Tuple]:
@@ -2829,12 +3626,9 @@ def _get_static_kernel(
         "static",
         state_E,
         weight_E,
-        m,
         k,
         n,
         num_topk,
-        max_rows,
-        mac,
         mma_tiler_mn,
         topk_ids_dtype,
         fast_math,
@@ -2846,13 +3640,13 @@ def _get_static_kernel(
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
-        return last_kval
+        return last_kval, mac
     reuse_compiled = os.environ.get("B12X_STATIC_REUSE_COMPILED", "1") != "0"
     if reuse_compiled:
         cached = _STATIC_KERNEL_CACHE.get(cache_key)
         if cached is not None:
             _LAST_KERNEL = (cache_key, cached)
-            return cached
+            return cached, mac
 
     weight_dtype = cutlass.Float4E2M1FN
     a_scratch_dtype = weight_dtype
@@ -2875,46 +3669,31 @@ def _get_static_kernel(
         share_expert_scales=share_expert_scales,
     )
 
-    rows_pad_k = align_up(max_rows, 128)
-    cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
+    launch = _StaticMoELaunch(kernel, k=k, num_topk=num_topk, state_E=state_E)
 
-    a_input_fake = cute.runtime.make_fake_compact_tensor(
-        a_dtype,
-        (m, k),
-        stride_order=(1, 0),
-        assumed_align=16,
-    )
     topk_ids_cutlass_dtype = (
         cutlass.Int32 if topk_ids_dtype == torch.int32 else cutlass.Int64
     )
     topk_ids_align = 4 if topk_ids_dtype == torch.int32 else 8
-    topk_ids_fake = cute.runtime.make_fake_compact_tensor(
+    a_input_fake = make_ptr(a_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    topk_ids_fake = make_ptr(
         topk_ids_cutlass_dtype,
-        (m * num_topk,),
+        topk_ids_align,
+        cute.AddressSpace.gmem,
         assumed_align=topk_ids_align,
     )
-    topk_weights_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (m * num_topk,),
-        assumed_align=4,
+    topk_weights_fake = make_ptr(
+        cutlass.Float32, 4, cute.AddressSpace.gmem, assumed_align=4
     )
-    packed_a_fake = cute.runtime.make_fake_compact_tensor(
-        a_scratch_dtype,
-        (max_rows, k, state_E),
-        stride_order=(1, 0, 2),
-        assumed_align=16,
+    packed_a_fake = make_ptr(
+        a_scratch_dtype, 16, cute.AddressSpace.gmem, assumed_align=16
     )
     sfa_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    packed_a_storage_elements = state_E * max_rows * (k // 2)
-    packed_a_storage_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8,
-        (packed_a_storage_elements,),
-        assumed_align=16,
+    packed_a_storage_fake = make_ptr(
+        cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16
     )
-    scale_storage_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8,
-        (state_E * rows_pad_k * cols_pad_k,),
-        assumed_align=16,
+    scale_storage_fake = make_ptr(
+        cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16
     )
     barrier_count_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
@@ -2981,29 +3760,18 @@ def _get_static_kernel(
         (weight_E,),
         assumed_align=16,
     )
-    scatter_fake = cute.runtime.make_fake_compact_tensor(
-        a_dtype,
-        (m, k),
-        stride_order=(1, 0),
-        assumed_align=16,
+    scatter_fake = make_ptr(a_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    token_map_fake = make_ptr(
+        cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4
     )
-    token_map_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (state_E, max_rows),
-        stride_order=(1, 0),
-        assumed_align=4,
-    )
-    token_weights_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype,
-        (state_E, max_rows),
-        stride_order=(1, 0),
-        assumed_align=16,
+    token_weights_fake = make_ptr(
+        alpha_dtype, 4, cute.AddressSpace.gmem, assumed_align=4
     )
     raise_if_kernel_resolution_frozen(
-        "cute.compile", target=kernel, cache_key=cache_key
+        "cute.compile", target=launch, cache_key=cache_key
     )
-    compiled = cute.compile(
-        kernel,
+    compiled = b12x_compile(
+        launch,
         a_input_fake,
         topk_ids_fake,
         topk_weights_fake,
@@ -3028,15 +3796,21 @@ def _get_static_kernel(
         scatter_fake,
         token_map_fake,
         token_weights_fake,
-        mac,
+        1,
+        1,
+        1,
         current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key(
+            "integration.tp_moe.static",
+            1,
+            cache_key,
+        ),
     )
 
-    result = (compiled, mac)
     if reuse_compiled:
-        _STATIC_KERNEL_CACHE[cache_key] = result
-    _LAST_KERNEL = (cache_key, result)
-    return result
+        _STATIC_KERNEL_CACHE[cache_key] = compiled
+    _LAST_KERNEL = (cache_key, compiled)
+    return compiled, mac
 
 
 def _get_micro_kernel(
@@ -3061,33 +3835,6 @@ def _get_micro_kernel(
     mac = mac_override if mac_override is not None else _get_impl_mac("micro")
     dynamic_down_scale = _dynamic_down_scale_enabled()
 
-    global _LAST_KERNEL
-    cache_key = (
-        quant_mode,
-        "micro_direct",
-        m,
-        k,
-        n,
-        num_topk,
-        weight_E,
-        topk_ids_dtype,
-        fast_math,
-        share_input_across_experts,
-        share_expert_scales,
-        single_token,
-        activation,
-        dynamic_down_scale,
-    )
-    last_kkey, last_kval = _LAST_KERNEL
-    if last_kkey == cache_key:
-        return last_kval
-    reuse_compiled = os.environ.get("B12X_MICRO_REUSE_COMPILED", "1") != "0"
-    if reuse_compiled:
-        cached = _MICRO_KERNEL_CACHE.get(cache_key)
-        if cached is not None:
-            _LAST_KERNEL = (cache_key, cached)
-            return cached
-
     kernel = activation_spec.make_micro_kernel(
         sf_vec_size=16,
         mma_tiler_mn=(64, 128),
@@ -3099,6 +3846,24 @@ def _get_micro_kernel(
         dynamic_down_scale=dynamic_down_scale,
     )
     kernel.configure(m, k, n, num_topk, weight_E, max_active_ctas=mac, device=device)
+    kernel_key = kernel.__cache_key__
+
+    global _LAST_KERNEL
+    cache_key = (
+        quant_mode,
+        "micro_direct",
+        kernel_key,
+        topk_ids_dtype,
+    )
+    last_kkey, last_kval = _LAST_KERNEL
+    if last_kkey == cache_key:
+        return last_kval, kernel.grid_x
+    reuse_compiled = os.environ.get("B12X_MICRO_REUSE_COMPILED", "1") != "0"
+    if reuse_compiled:
+        cached = _MICRO_KERNEL_CACHE.get(cache_key)
+        if cached is not None:
+            _LAST_KERNEL = (cache_key, cached)
+            return cached, kernel.grid_x
 
     def dummy(dt):
         return make_ptr(dt, 16, cute.AddressSpace.gmem, assumed_align=16)
@@ -3117,7 +3882,8 @@ def _get_micro_kernel(
     compile_options = os.environ.get("B12X_DIRECT_CUTE_OPTIONS", "")
     if compile_options:
         compile_kwargs["options"] = compile_options
-    compiled = cute.compile(
+    compile_m = int(kernel.m_const) if int(kernel.m_const) != 0 else 8
+    compiled = b12x_compile(
         kernel,
         dummy(cutlass.BFloat16),  # x_ptr
         dummy(cutlass.Uint8),  # w1_ptr
@@ -3134,23 +3900,27 @@ def _get_micro_kernel(
         dummy(cutlass.BFloat16),  # out_ptr
         barrier_fake,  # barrier_count
         barrier_fake,  # barrier_epoch
-        Int32(m),  # m_val
-        Int32(kernel.grid_x),  # grid_x
+        Int32(compile_m),  # m_val
+        Int32(1),  # grid_x
         current_cuda_stream(),  # stream
+        compile_spec=KernelCompileSpec.from_key(
+            "integration.tp_moe.micro_direct",
+            1,
+            cache_key,
+        ),
         **compile_kwargs,
     )
     with suppress(Exception):
         setattr(
             compiled,
             _DIRECT_MICRO_SHAPE_ATTR,
-            (quant_mode, int(m), int(k), int(n), int(num_topk), int(weight_E)),
+            cache_key,
         )
 
-    result = (compiled, kernel.grid_x)
     if reuse_compiled:
-        _MICRO_KERNEL_CACHE[cache_key] = result
-    _LAST_KERNEL = (cache_key, result)
-    return result
+        _MICRO_KERNEL_CACHE[cache_key] = compiled
+    _LAST_KERNEL = (cache_key, compiled)
+    return compiled, kernel.grid_x
 
 
 def _direct_micro_shape_accepts_block_dim(compiled, block_dim: int) -> bool:
@@ -3214,6 +3984,122 @@ def _compiled_direct_micro_accepts_block_dim(compiled, block_dim: int) -> bool:
     return accepted
 
 
+class _StaticMoELaunch:
+    """Thin wrapper that makes compact static token counts runtime Int32."""
+
+    def __init__(self, kernel, *, k: int, num_topk: int, state_E: int):
+        self._kernel = kernel
+        self._k = k
+        self._half_k = k // 2
+        self._num_topk = num_topk
+        self._state_E = state_E
+        self._cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
+
+    @cute.jit
+    def __call__(
+        self,
+        a_ptr: cute.Pointer,
+        topk_ids_ptr: cute.Pointer,
+        topk_weights_ptr: cute.Pointer,
+        packed_a_ptr: cute.Pointer,
+        sfa_ptr: cute.Pointer,
+        packed_a_storage_ptr: cute.Pointer,
+        scale_storage_ptr: cute.Pointer,
+        barrier_count: cute.Tensor,
+        barrier_epoch: cute.Tensor,
+        b_w13: cute.Tensor,
+        sfb_w13_ptr: cute.Pointer,
+        b_down: cute.Tensor,
+        sfb_down_ptr: cute.Pointer,
+        row_counts: cute.Tensor,
+        active_expert_count: cute.Tensor,
+        weight_expert_ids: cute.Tensor,
+        global_to_local_expert: cute.Tensor,
+        input_global_scale: cute.Tensor,
+        alpha: cute.Tensor,
+        down_alpha: cute.Tensor,
+        global_scale: cute.Tensor,
+        scatter_ptr: cute.Pointer,
+        token_map_ptr: cute.Pointer,
+        token_weights_ptr: cute.Pointer,
+        num_tokens: cutlass.Int32,
+        max_rows: cutlass.Int32,
+        max_active_clusters: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        rows_pad_k = ((max_rows + Int32(127)) // Int32(128)) * Int32(128)
+        a_input = cute.make_tensor(
+            a_ptr, layout=cute.make_layout((num_tokens, self._k), stride=(self._k, 1))
+        )
+        topk_ids = cute.make_tensor(
+            topk_ids_ptr,
+            layout=cute.make_layout((num_tokens * self._num_topk,), stride=(1,)),
+        )
+        topk_weights_t = cute.make_tensor(
+            topk_weights_ptr,
+            layout=cute.make_layout((num_tokens * self._num_topk,), stride=(1,)),
+        )
+        packed_a = cute.make_tensor(
+            packed_a_ptr,
+            layout=cute.make_layout(
+                (max_rows, self._k, self._state_E),
+                stride=(self._k, 1, max_rows * self._k),
+            ),
+        )
+        packed_a_storage = cute.make_tensor(
+            packed_a_storage_ptr,
+            layout=cute.make_layout(
+                (self._state_E * max_rows * self._half_k,), stride=(1,)
+            ),
+        )
+        scale_storage = cute.make_tensor(
+            scale_storage_ptr,
+            layout=cute.make_layout(
+                (self._state_E * rows_pad_k * self._cols_pad_k,), stride=(1,)
+            ),
+        )
+        scatter_output = cute.make_tensor(
+            scatter_ptr,
+            layout=cute.make_layout((num_tokens, self._k), stride=(self._k, 1)),
+        )
+        token_map = cute.make_tensor(
+            token_map_ptr,
+            layout=cute.make_layout((self._state_E, max_rows), stride=(max_rows, 1)),
+        )
+        token_weights_t = cute.make_tensor(
+            token_weights_ptr,
+            layout=cute.make_layout((self._state_E, max_rows), stride=(max_rows, 1)),
+        )
+        self._kernel(
+            a_input,
+            topk_ids,
+            topk_weights_t,
+            packed_a,
+            sfa_ptr,
+            packed_a_storage,
+            scale_storage,
+            barrier_count,
+            barrier_epoch,
+            b_w13,
+            sfb_w13_ptr,
+            b_down,
+            sfb_down_ptr,
+            row_counts,
+            active_expert_count,
+            weight_expert_ids,
+            global_to_local_expert,
+            input_global_scale,
+            alpha,
+            down_alpha,
+            global_scale,
+            scatter_output,
+            token_map,
+            token_weights_t,
+            max_active_clusters=max_active_clusters,
+            stream=stream,
+        )
+
+
 class _DynamicMoELaunch:
     """Thin wrapper that makes num_tokens and max_rows runtime Int32."""
 
@@ -3267,7 +4153,7 @@ class _DynamicMoELaunch:
         rows_padded: cutlass.Int32,
         max_tasks: cutlass.Int32,
         max_phys_tiles: cutlass.Int32,
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         a_input = cute.make_tensor(
@@ -3404,7 +4290,6 @@ def _get_dynamic_kernel(
         k,
         n,
         num_topk,
-        mac,
         mma_tiler_mn,
         topk_ids_dtype,
         fast_math,
@@ -3414,7 +4299,7 @@ def _get_dynamic_kernel(
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
-        return last_kval
+        return last_kval, mac
     reuse_compiled = _first_env(
         "B12X_DYNAMIC_REUSE_COMPILED", "B12X_LEVEL10_REUSE_COMPILED"
     )
@@ -3425,7 +4310,7 @@ def _get_dynamic_kernel(
         cached = _DYNAMIC_KERNEL_CACHE.get(cache_key)
         if cached is not None:
             _LAST_KERNEL = (cache_key, cached)
-            return cached
+            return cached, mac
 
     weight_dtype = cutlass.Float4E2M1FN
     a_scratch_dtype = weight_dtype
@@ -3585,7 +4470,7 @@ def _get_dynamic_kernel(
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=launch, cache_key=cache_key
     )
-    compiled = cute.compile(
+    compiled = b12x_compile(
         launch,
         a_input_fake,
         topk_ids_fake,
@@ -3627,15 +4512,19 @@ def _get_dynamic_kernel(
         1,
         1,
         1,
-        mac,
+        1,
         current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key(
+            "integration.tp_moe.dynamic",
+            1,
+            cache_key,
+        ),
     )
 
-    result = (compiled, mac)
     if reuse_compiled:
-        _DYNAMIC_KERNEL_CACHE[cache_key] = result
-    _LAST_KERNEL = (cache_key, result)
-    return result
+        _DYNAMIC_KERNEL_CACHE[cache_key] = compiled
+    _LAST_KERNEL = (cache_key, compiled)
+    return compiled, mac
 
 
 def _is_exact_relu2_bs1_nemotron_case(
@@ -3838,14 +4727,22 @@ def _launch_exact_relu2_bs1_nemotron(
     )
     assert isinstance(resolved, TPCompactStaticWorkspace)
     _reset_volatile_launch_state(resolved)
+    def _gptr(dtype, t, align=16):
+        return make_ptr(
+            dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align
+        )
+    ids_cutlass_dtype = (
+        cutlass.Int32 if flat_ids.dtype == torch.int32 else cutlass.Int64
+    )
+    ids_align = 4 if flat_ids.dtype == torch.int32 else 8
     launcher.compiled(
-        a,
-        flat_ids,
-        flat_weights,
-        resolved.packed_a_view,
+        _gptr(cutlass.BFloat16, a),
+        _gptr(ids_cutlass_dtype, flat_ids, ids_align),
+        _gptr(cutlass.Float32, flat_weights, 4),
+        _gptr(cutlass.Float4E2M1FN, resolved.packed_a_view),
         resolved.sfa_ptr,
-        resolved.packed_a_flat,
-        resolved.scale_flat,
+        _gptr(cutlass.Uint8, resolved.packed_a_flat),
+        _gptr(cutlass.Uint8, resolved.scale_flat),
         resolved.barrier_count,
         resolved.barrier_epoch,
         launcher.weights.w13_fp4,
@@ -3860,9 +4757,12 @@ def _launch_exact_relu2_bs1_nemotron(
         launcher.weights.w1_alpha,
         launcher.weights.w2_alpha,
         launcher.down_input_scale,
-        scatter_output,
-        resolved.token_map,
-        resolved.token_weights,
+        _gptr(cutlass.BFloat16, scatter_output),
+        _gptr(cutlass.Int32, resolved.token_map, 4),
+        _gptr(cutlass.Float32, resolved.token_weights, 4),
+        int(a.shape[0]),
+        resolved.max_rows,
+        launcher.mac,
         current_cuda_stream(),
     )
     return scatter_output
@@ -3958,6 +4858,7 @@ def _launch_dynamic(
         workspace.physical_tiles_capacity * _dynamic_tile_m(quant_mode),
         workspace.task_capacity,
         workspace.physical_tiles_capacity,
+        mac,
         stream,
     )
 
@@ -3998,7 +4899,7 @@ def _launch_compact_static(
         weight_E=weight_E,
     )
     if use_micro_direct:
-        if flat_ids.dtype in (torch.int32, torch.int64) and flat_ids.is_contiguous():
+        if flat_ids.dtype == torch.int32 and flat_ids.is_contiguous():
             launch_ids = flat_ids
         else:
             launch_ids = workspace.compact_topk_ids[: flat_ids.numel()]
@@ -4009,7 +4910,7 @@ def _launch_compact_static(
             k,
             n,
             num_topk,
-            topk_ids_dtype=topk_ids_dtype,
+            topk_ids_dtype=launch_ids.dtype,
             fast_math=fast_math,
             share_input_across_experts=share_input_across_experts,
             share_expert_scales=share_expert_scales,
@@ -4072,14 +4973,22 @@ def _launch_compact_static(
     )
     launch_ids = flat_ids
     _reset_volatile_launch_state(workspace)
+    def _gptr(dtype, t, align=16):
+        return make_ptr(
+            dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align
+        )
+    ids_cutlass_dtype = (
+        cutlass.Int32 if launch_ids.dtype == torch.int32 else cutlass.Int64
+    )
+    ids_align = 4 if launch_ids.dtype == torch.int32 else 8
     compiled(
-        a,
-        launch_ids,
-        flat_weights,
-        workspace.packed_a_view,
+        _gptr(cutlass.BFloat16, a),
+        _gptr(ids_cutlass_dtype, launch_ids, ids_align),
+        _gptr(cutlass.Float32, flat_weights, 4),
+        _gptr(cutlass.Float4E2M1FN, workspace.packed_a_view),
         workspace.sfa_ptr,
-        workspace.packed_a_flat,
-        workspace.scale_flat,
+        _gptr(cutlass.Uint8, workspace.packed_a_flat),
+        _gptr(cutlass.Uint8, workspace.scale_flat),
         workspace.barrier_count,
         workspace.barrier_epoch,
         weights.w13_fp4,
@@ -4094,29 +5003,32 @@ def _launch_compact_static(
         weights.w1_alpha,
         weights.w2_alpha,
         down_input_scale,
-        scatter_output,
-        workspace.token_map,
-        workspace.token_weights,
+        _gptr(cutlass.BFloat16, scatter_output),
+        _gptr(cutlass.Int32, workspace.token_map, 4),
+        _gptr(cutlass.Float32, workspace.token_weights, 4),
+        m,
+        workspace.max_rows,
+        mac,
         stream,
     )
 
 
 @torch._dynamo.disable
 def b12x_moe_fp4(
-    a: torch.Tensor,  # [m, k] bf16 activations
-    a1_gscale: torch.Tensor,  # [E] or scalar — reciprocal input quant global scale
-    w1_fp4: torch.Tensor,  # [E, 2*n, k//2] uint8
-    w1_blockscale: torch.Tensor,  # [E, ...] float8_e4m3fn swizzled
-    w1_alphas: torch.Tensor,  # [E] float32
-    a2_gscale: torch.Tensor,  # [E] or scalar — reciprocal intermediate quant global scale
-    w2_fp4: torch.Tensor,  # [E, k, n//2] uint8
-    w2_blockscale: torch.Tensor,  # [E, ...] float8_e4m3fn swizzled
-    w2_alphas: torch.Tensor,  # [E] float32
-    topk_weights: torch.Tensor,  # [m, topk] float
-    topk_ids: torch.Tensor,  # [m, topk] int
+    a: torch.Tensor | None = None,  # [m, k] bf16 activations
+    a1_gscale: torch.Tensor | None = None,  # [E] or scalar — reciprocal input quant global scale
+    w1_fp4: torch.Tensor | None = None,  # [E, 2*n, k//2] uint8
+    w1_blockscale: torch.Tensor | None = None,  # [E, ...] float8_e4m3fn swizzled
+    w1_alphas: torch.Tensor | None = None,  # [E] float32
+    a2_gscale: torch.Tensor | None = None,  # [E] or scalar — reciprocal intermediate quant global scale
+    w2_fp4: torch.Tensor | None = None,  # [E, k, n//2] uint8
+    w2_blockscale: torch.Tensor | None = None,  # [E, ...] float8_e4m3fn swizzled
+    w2_alphas: torch.Tensor | None = None,  # [E] float32
+    topk_weights: torch.Tensor | None = None,  # [m, topk] float
+    topk_ids: torch.Tensor | None = None,  # [m, topk] int
     apply_router_weight_on_input: bool = False,
     *,
-    workspace: TPMoEWorkspace | TPMoEWorkspacePool,
+    workspace: TPMoEWorkspace | TPW4A16Workspace | TPMoEWorkspacePool | None = None,
     output: torch.Tensor | None = None,
     input_scales_are_reciprocal: bool | None = None,
     input_scales_static: bool = False,
@@ -4125,8 +5037,10 @@ def b12x_moe_fp4(
     quant_mode: str | None = None,
     unit_scale_contract: bool = False,
     source_format: str = "modelopt_nvfp4",
+    w13_layout: str = "w13",
     prepared_w4a16: object | None = None,
     swiglu_limit: float | None = None,
+    binding: TPMoEFP4Binding | None = None,
 ) -> torch.Tensor:
     """MoE with shape-selected fused static or dynamic kernels.
 
@@ -4134,10 +5048,94 @@ def b12x_moe_fp4(
     workloads use dynamic. Large token batches are chunked only when the chosen
     backend cannot describe the required work buffers in a single launch.
     """
+    if binding is not None:
+        extras = [
+            name
+            for name, value in (
+                ("a", a),
+                ("a1_gscale", a1_gscale),
+                ("w1_fp4", w1_fp4),
+                ("w1_blockscale", w1_blockscale),
+                ("w1_alphas", w1_alphas),
+                ("a2_gscale", a2_gscale),
+                ("w2_fp4", w2_fp4),
+                ("w2_blockscale", w2_blockscale),
+                ("w2_alphas", w2_alphas),
+                ("topk_weights", topk_weights),
+                ("topk_ids", topk_ids),
+                ("workspace", workspace),
+                ("output", output),
+                ("input_scales_are_reciprocal", input_scales_are_reciprocal),
+                ("fast_math", fast_math),
+                ("quant_mode", quant_mode),
+                ("prepared_w4a16", prepared_w4a16),
+                ("swiglu_limit", swiglu_limit),
+            )
+            if value is not None
+        ]
+        if apply_router_weight_on_input:
+            extras.append("apply_router_weight_on_input")
+        if input_scales_static:
+            extras.append("input_scales_static")
+        if activation != "silu":
+            extras.append("activation")
+        if unit_scale_contract:
+            extras.append("unit_scale_contract")
+        if source_format != "modelopt_nvfp4":
+            extras.append("source_format")
+        if w13_layout != "w13":
+            extras.append("w13_layout")
+        if extras:
+            raise ValueError(
+                "TP MoE FP4 binding owns runtime tensors, scratch, and options; "
+                f"do not also pass {', '.join(extras)}"
+            )
+        a = binding.a
+        a1_gscale = binding.a1_gscale
+        w1_fp4 = binding.w1_fp4
+        w1_blockscale = binding.w1_blockscale
+        w1_alphas = binding.w1_alphas
+        a2_gscale = binding.a2_gscale
+        w2_fp4 = binding.w2_fp4
+        w2_blockscale = binding.w2_blockscale
+        w2_alphas = binding.w2_alphas
+        topk_weights = binding.topk_weights
+        topk_ids = binding.topk_ids
+        workspace = binding.scratch
+        apply_router_weight_on_input = binding.apply_router_weight_on_input
+        output = binding.output
+        input_scales_are_reciprocal = binding.input_scales_are_reciprocal
+        input_scales_static = binding.input_scales_static
+        fast_math = binding.fast_math
+        activation = binding.activation
+        quant_mode = binding.quant_mode
+        unit_scale_contract = binding.unit_scale_contract
+        source_format = binding.source_format
+        w13_layout = binding.w13_layout
+        prepared_w4a16 = binding.prepared_w4a16
+        swiglu_limit = binding.swiglu_limit
+    if (
+        a is None
+        or a1_gscale is None
+        or w1_fp4 is None
+        or w1_blockscale is None
+        or w1_alphas is None
+        or a2_gscale is None
+        or w2_fp4 is None
+        or w2_blockscale is None
+        or w2_alphas is None
+        or topk_weights is None
+        or topk_ids is None
+        or workspace is None
+    ):
+        raise TypeError(
+            "b12x_moe_fp4 requires all FP4 tensors, routing tensors, and workspace or binding"
+        )
     _assert_reciprocal_input_scale_contract(input_scales_are_reciprocal)
     quant_mode_arg = quant_mode
     quant_mode = _normalize_quant_mode(quant_mode_arg)
     source_format = _normalize_fp4_source_format(source_format)
+    w13_layout = _normalize_w13_layout(w13_layout)
     _validate_fp4_source_format_for_quant_mode(
         source_format=source_format,
         quant_mode=quant_mode,
@@ -4178,22 +5176,6 @@ def b12x_moe_fp4(
         raise NotImplementedError("swiglu_limit is implemented only for W4A16 MoE")
     if fast_math is None:
         fast_math = _FAST_MATH_DEFAULT
-    if (
-        prepared_w4a16 is None
-        and quant_mode_arg is None
-        and quant_mode == "w4a16"
-        and source_format != "modelopt_nvfp4"
-    ):
-        w1_alphas = _w4a16_default_alpha(
-            w1_alphas,
-            a1_gscale,
-            weight_E,
-        )
-        w2_alphas = _w4a16_default_alpha(
-            w2_alphas,
-            a2_gscale,
-            weight_E,
-        )
     # Shared scalar input scales are weight-side constants in the benchmarked
     # path, so treat them as static and avoid re-expanding them every launch.
     effective_input_scales_static = input_scales_static or (
@@ -4227,32 +5209,26 @@ def b12x_moe_fp4(
 
         prepared = prepared_w4a16
         if prepared is None:
-            if source_format == "modelopt_nvfp4":
-                w1_prepare_alphas = _w4a16_default_alpha(
-                    w1_alphas,
-                    a1_gscale,
-                    weight_E,
-                )
-                w2_prepare_alphas = _w4a16_default_alpha(
-                    w2_alphas,
-                    a2_gscale,
-                    weight_E,
-                )
-            else:
-                w1_prepare_alphas = w1_alphas
-                w2_prepare_alphas = w2_alphas
             prepared = _get_w4a16_packed_weights(
                 w1_fp4,
                 w1_blockscale,
-                w1_prepare_alphas,
+                w1_alphas,
                 w2_fp4,
                 w2_blockscale,
-                w2_prepare_alphas,
+                w2_alphas,
                 activation=activation,
                 params_dtype=a.dtype,
                 source_format=source_format,
+                w13_layout=w13_layout,
             )
         weight_layout = getattr(prepared, "weight_layout", "packed")
+        scale_format = _normalize_w4a16_scale_format(
+            getattr(
+                prepared,
+                "scale_format",
+                _w4a16_scale_format_for_source(source_format),
+            )
+        )
         plan = _make_workspace_plan(
             num_tokens=m,
             weight_E=weight_E,
@@ -4273,6 +5249,7 @@ def b12x_moe_fp4(
             apply_router_weight_on_input=apply_router_weight_on_input,
             swiglu_limit=swiglu_limit,
             weight_layout=weight_layout,
+            scale_format=scale_format,
         )
         if not isinstance(w4a16_workspace, TPW4A16Workspace):
             raise TypeError("expected a TPW4A16Workspace for the W4A16 backend")
@@ -4292,6 +5269,7 @@ def b12x_moe_fp4(
             w4a16_workspace,
             token_count=m,
             weight_layout=weight_layout,
+            scale_format=scale_format,
         )
         return run_w4a16_moe(
             a,
@@ -4871,14 +5849,15 @@ def _select_experts_reference(
 
 
 def b12x_route_experts_fast(
-    hidden_states: torch.Tensor,
+    hidden_states: torch.Tensor | None = None,
     *,
-    top_k: int,
+    top_k: int | None = None,
     gate_weight: torch.Tensor | None = None,
     gate_bias: torch.Tensor | None = None,
     router_logits: torch.Tensor | None = None,
     renormalize: bool = True,
-    workspace: TPMoEWorkspace | TPMoEWorkspacePool | None = None,
+    workspace: TPMoEWorkspace | TPW4A16Workspace | TPMoEWorkspacePool | None = None,
+    binding: TPMoERouteBinding | None = None,
 ) -> B12XTopKRouting:
     """Public sparse-routing entrypoint for higher-level integrations.
 
@@ -4889,6 +5868,37 @@ def b12x_route_experts_fast(
     scratch and should be cloned by callers that want to retain them across
     subsequent launches on the same workspace.
     """
+    if binding is not None:
+        extras = [
+            name
+            for name, value in (
+                ("hidden_states", hidden_states),
+                ("top_k", top_k),
+                ("gate_weight", gate_weight),
+                ("gate_bias", gate_bias),
+                ("router_logits", router_logits),
+                ("workspace", workspace),
+            )
+            if value is not None
+        ]
+        if not renormalize:
+            extras.append("renormalize")
+        if extras:
+            raise ValueError(
+                "TP MoE route binding owns runtime tensors, scratch, and options; "
+                f"do not also pass {', '.join(extras)}"
+            )
+        hidden_states = binding.hidden_states
+        top_k = binding.top_k
+        gate_weight = binding.gate_weight
+        gate_bias = binding.gate_bias
+        router_logits = binding.router_logits
+        renormalize = binding.renormalize
+        workspace = binding.scratch
+    if hidden_states is None or top_k is None:
+        raise TypeError(
+            "b12x_route_experts_fast requires hidden_states/top_k inputs or binding"
+        )
     if hidden_states.ndim != 2:
         raise ValueError(
             "expected hidden_states with rank 2, got shape "
@@ -5008,10 +6018,10 @@ def b12x_route_experts_fast(
 
 
 def b12x_sparse_moe_fp4(
-    hidden_states: torch.Tensor,
+    hidden_states: torch.Tensor | None = None,
     *,
-    experts: B12XFP4ExpertWeights,
-    workspace: TPMoEWorkspace | TPMoEWorkspacePool,
+    experts: B12XFP4ExpertWeights | None = None,
+    workspace: TPMoEWorkspace | TPW4A16Workspace | TPMoEWorkspacePool | None = None,
     routing: B12XTopKRouting | None = None,
     top_k: int | None = None,
     gate_weight: torch.Tensor | None = None,
@@ -5026,6 +6036,7 @@ def b12x_sparse_moe_fp4(
     fast_math: bool | None = None,
     activation: str = "silu",
     quant_mode: str | None = None,
+    binding: TPMoESparseFP4Binding | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, B12XTopKRouting]:
     """Sparse-block FP4 MoE wrapper above the routed-expert TP primitive.
 
@@ -5033,6 +6044,61 @@ def b12x_sparse_moe_fp4(
     low-level contract while giving higher-level integrations a single call that
     can own `gate -> topk -> routed experts` at the sparse MoE block seam.
     """
+    if binding is not None:
+        extras = [
+            name
+            for name, value in (
+                ("hidden_states", hidden_states),
+                ("experts", experts),
+                ("workspace", workspace),
+                ("routing", routing),
+                ("top_k", top_k),
+                ("gate_weight", gate_weight),
+                ("gate_bias", gate_bias),
+                ("router_logits", router_logits),
+                ("output", output),
+                ("input_scales_are_reciprocal", input_scales_are_reciprocal),
+                ("fast_math", fast_math),
+                ("quant_mode", quant_mode),
+            )
+            if value is not None
+        ]
+        if not renormalize_topk:
+            extras.append("renormalize_topk")
+        if routed_scaling_factor != 1.0:
+            extras.append("routed_scaling_factor")
+        if return_routing:
+            extras.append("return_routing")
+        if input_scales_static:
+            extras.append("input_scales_static")
+        if activation != "silu":
+            extras.append("activation")
+        if extras:
+            raise ValueError(
+                "TP MoE sparse FP4 binding owns runtime tensors, scratch, and options; "
+                f"do not also pass {', '.join(extras)}"
+            )
+        hidden_states = binding.hidden_states
+        experts = binding.experts
+        workspace = binding.scratch
+        routing = binding.routing
+        top_k = binding.top_k
+        gate_weight = binding.gate_weight
+        gate_bias = binding.gate_bias
+        router_logits = binding.router_logits
+        renormalize_topk = binding.renormalize_topk
+        routed_scaling_factor = binding.routed_scaling_factor
+        output = binding.output
+        return_routing = binding.return_routing
+        input_scales_are_reciprocal = binding.input_scales_are_reciprocal
+        input_scales_static = binding.input_scales_static
+        fast_math = binding.fast_math
+        activation = binding.activation
+        quant_mode = binding.quant_mode
+    if hidden_states is None or experts is None or workspace is None:
+        raise TypeError(
+            "b12x_sparse_moe_fp4 requires hidden_states, experts, workspace, or binding"
+        )
 
     _assert_reciprocal_input_scale_contract(input_scales_are_reciprocal)
     quant_mode_arg = quant_mode
@@ -5087,6 +6153,7 @@ def b12x_sparse_moe_fp4(
         activation=activation,
         quant_mode=quant_mode_arg,
         source_format=experts.source_format,
+        w13_layout=experts.w13_layout,
     )
     if routed_scaling_factor != 1.0:
         routed_output.mul_(routed_scaling_factor)
