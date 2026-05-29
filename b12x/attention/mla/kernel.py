@@ -17,7 +17,10 @@ from cutlass.cute.runtime import from_dlpack
 
 from b12x.attention._cute import ops as attention_ops
 from b12x.cute.compiler import KernelCompileSpec, launch as b12x_launch
-from b12x.attention.mxfp6_mma import _literal_qk_mma_into_sfrag_mxfp6_raw_mla
+from b12x.attention.mxfp6_mma import (
+    _literal_pv_mma_into_ofrag_mxfp6_scaled_mla,
+    _literal_qk_mma_into_sfrag_mxfp6_raw_mla,
+)
 from b12x.cute.fp4 import (
     bf16_mma_m16n16k16_f32,
     bfloat2_habs2,
@@ -2765,8 +2768,33 @@ def _run_staged_pv_group_into_target(
     scale_base: Int32,
     tile_pv_scale: Float32,
     lane: Int32,
+    kv_nope_dtype,
 ):
     if cutlass.const_expr(
+        kv_nope_dtype == cutlass.Float6E3M2FN
+        or kv_nope_dtype == cutlass.Float6E2M3FN
+    ):
+        if cutlass.const_expr(os.environ.get("B12X_MLA_DEBUG_PV_BF16", "0") == "1"):
+            _literal_pv_mma_into_ofrag_fp8_raw_scaled(
+                target_frag,
+                p_frag,
+                group_base_addr,
+                sScale,
+                scale_base,
+                lane,
+            )
+        else:
+            _literal_pv_mma_into_ofrag_mxfp6_scaled_mla(
+                target_frag,
+                p_frag,
+                group_base_addr,
+                sScale,
+                scale_base,
+                tile_pv_scale,
+                lane,
+                kv_nope_dtype,
+            )
+    elif cutlass.const_expr(
         os.environ.get("B12X_MLA_ENABLE_MXFP8_PV", "0") != "1"
         or os.environ.get("B12X_MLA_DEBUG_PV_BF16", "0") == "1"
     ):
@@ -2803,6 +2831,7 @@ def _accumulate_pv_groups_from_p_frag(
     sScale: cute.Tensor,
     kv_base_addr: Int32,
     lane: Int32,
+    kv_nope_dtype,
 ):
     for block_offset in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
         group_idx = Int32(block_offset)
@@ -2837,6 +2866,31 @@ def _accumulate_pv_groups_from_p_frag(
         )
         _zero_output_frag(tile_o_frag)
         if cutlass.const_expr(
+            kv_nope_dtype == cutlass.Float6E3M2FN
+            or kv_nope_dtype == cutlass.Float6E2M3FN
+        ):
+            if cutlass.const_expr(os.environ.get("B12X_MLA_DEBUG_PV_BF16", "0") == "1"):
+                _literal_pv_mma_into_ofrag_fp8_raw_scaled(
+                    tile_o_frag,
+                    p_frag,
+                    kv_base_addr,
+                    sScale,
+                    Int32(0),
+                    lane,
+                )
+            else:
+                _literal_pv_mma_into_ofrag_mxfp6_scaled_mla(
+                    tile_o_frag,
+                    p_frag,
+                    kv_base_addr,
+                    sScale,
+                    Int32(0),
+                    tile_pv_scale,
+                    lane,
+                    kv_nope_dtype,
+                )
+            accum_scale = Float32(1.0)
+        elif cutlass.const_expr(
             os.environ.get("B12X_MLA_ENABLE_MXFP8_PV", "0") != "1"
             or os.environ.get("B12X_MLA_DEBUG_PV_BF16", "0") == "1"
         ):
@@ -3312,6 +3366,7 @@ def _accumulate_pv_groups_from_p_frag_staged(
     kv_base_addr: Int32,
     num_kv: Int32,
     lane: Int32,
+    kv_nope_dtype,
 ):
     # Pipelined KV streaming: overlap stage of next group with compute of current
     # Prologue: stage nope group 0
@@ -3342,19 +3397,47 @@ def _accumulate_pv_groups_from_p_frag_staged(
         # Compute PV from current buffer
         if cutlass.const_expr(block_offset == 0):
             _run_staged_pv_group_into_target(
-                o_frag0, p_frag, sScale, kv_base_addr, scale_base, tile_pv_scale, lane
+                o_frag0,
+                p_frag,
+                sScale,
+                kv_base_addr,
+                scale_base,
+                tile_pv_scale,
+                lane,
+                kv_nope_dtype,
             )
         elif cutlass.const_expr(block_offset == 1):
             _run_staged_pv_group_into_target(
-                o_frag1, p_frag, sScale, kv_base_addr, scale_base, tile_pv_scale, lane
+                o_frag1,
+                p_frag,
+                sScale,
+                kv_base_addr,
+                scale_base,
+                tile_pv_scale,
+                lane,
+                kv_nope_dtype,
             )
         elif cutlass.const_expr(block_offset == 2):
             _run_staged_pv_group_into_target(
-                o_frag2, p_frag, sScale, kv_base_addr, scale_base, tile_pv_scale, lane
+                o_frag2,
+                p_frag,
+                sScale,
+                kv_base_addr,
+                scale_base,
+                tile_pv_scale,
+                lane,
+                kv_nope_dtype,
             )
         else:
             _run_staged_pv_group_into_target(
-                o_frag3, p_frag, sScale, kv_base_addr, scale_base, tile_pv_scale, lane
+                o_frag3,
+                p_frag,
+                sScale,
+                kv_base_addr,
+                scale_base,
+                tile_pv_scale,
+                lane,
+                kv_nope_dtype,
             )
         cute.arch.sync_threads()
 
@@ -4157,6 +4240,7 @@ def _run_one_pass_sparse_mla_tile(
                 sScale,
                 kv_base_addr,
                 lane,
+                kv_nope_dtype,
             )
         else:
             _accumulate_pv_groups_from_p_frag_staged(
@@ -4171,6 +4255,7 @@ def _run_one_pass_sparse_mla_tile(
                 kv_base_addr,
                 Int32(kv_rows_u32.shape[0]),
                 lane,
+                kv_nope_dtype,
             )
     else:
         # Multi-tile: sequential per-group QK+PV (~10KB smem, ~9 CTAs/SM)
@@ -4255,6 +4340,7 @@ def _run_one_pass_sparse_mla_tile(
                     sScale,
                     kv_base_addr,
                     lane,
+                    kv_nope_dtype,
                 )
             else:
                 _accumulate_pv_groups_from_p_frag_staged(
@@ -4269,6 +4355,7 @@ def _run_one_pass_sparse_mla_tile(
                     kv_base_addr,
                     num_kv,
                     lane,
+                    kv_nope_dtype,
                 )
 
             token_base = tile_end

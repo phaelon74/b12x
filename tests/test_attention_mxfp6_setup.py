@@ -13,6 +13,7 @@ from b12x.cute.fp6 import (
 
 def test_mxfp6_mma_helpers_import():
     assert mxfp6_mma._literal_qk_mma_into_sfrag_mxfp6_raw_paged is not None
+    assert mxfp6_mma._literal_pv_mma_into_ofrag_mxfp6_scaled_mla is not None
     assert mxfp6_mma._compute_mxfp6_tile_partials is not None
 
 

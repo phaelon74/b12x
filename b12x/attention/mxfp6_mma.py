@@ -6,9 +6,17 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Uint32, const_expr
 
+# MLA sparse PV tile geometry (must match b12x.attention.mla.kernel).
+_MLA_NOPE_GROUP_KV_VECS = 8
+_MLA_VO_NUM_MMA_D = 8
+
 from b12x.cute.fp4 import (
+    bfloat2_habs2,
+    bfloat2_hmax2,
+    bfloat2_hmax_to_f32,
     bfloat2_mul,
     broadcast_f32_to_bfloat2,
+    cvt_f32_to_ue8m0,
     frag_layout_swizzle_16b_to_8b,
     frag_layout_swizzle_16b_to_8b_trans,
     ldmatrix_m8n8x4_b16,
@@ -16,6 +24,8 @@ from b12x.cute.fp4 import (
     ldmatrix_m8n8x4_right_half_b16,
     ldmatrix_m8n8x4_trans_left_half_b16,
     ldmatrix_m8n8x4_trans_right_half_b16,
+    pack_f32x2_to_bfloat2,
+    ue8m0_to_output_scale,
 )
 from b12x.cute.fp6 import (
     cvt_bf16x2_to_e2m3x2,
@@ -450,6 +460,208 @@ def _literal_pv_mma_into_ofrag_mxfp6_raw_paged(
                 v_offset_k1 = _advance_offset_by_column_128b_2(v_offset_k1, mma_d // 2)
 
         v_offset = _advance_offset_by_row_128b(v_offset, 32, upcast_stride_v)
+
+
+@cute.jit
+def _literal_pv_mma_into_ofrag_mxfp6_scaled_mla(
+    o_frag: cute.Tensor,
+    p_frag: cute.Tensor,
+    v_base_addr: Int32,
+    sScale: cute.Tensor,
+    scale_base: Int32,
+    pv_scale: Float32,
+    lane: Int32,
+    kv_dtype,
+):
+    """MLA sparse PV MMA with MX-FP6 V (P scaled+quantized, V from smem byte containers)."""
+    mask16 = Uint32(0xFFFF)
+    shift16 = Uint32(16)
+    lane_pair_base = Int32(2) * (lane % Int32(4))
+    del pv_scale
+    unit_scale = Uint32(0x7F7F7F7F)
+
+    scale01_k0 = pack_f32x2_to_bfloat2(
+        Float32(sScale[scale_base + lane_pair_base + Int32(0)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(1)]),
+    )
+    scale89_k0 = pack_f32x2_to_bfloat2(
+        Float32(sScale[scale_base + lane_pair_base + Int32(8)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(9)]),
+    )
+    scale01_k1 = pack_f32x2_to_bfloat2(
+        Float32(sScale[scale_base + lane_pair_base + Int32(16)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(17)]),
+    )
+    scale89_k1 = pack_f32x2_to_bfloat2(
+        Float32(sScale[scale_base + lane_pair_base + Int32(24)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(25)]),
+    )
+
+    a00 = bfloat2_mul(p_frag[0, 0, 0], scale01_k0)
+    a10 = bfloat2_mul(p_frag[0, 0, 1], scale01_k0)
+    a80 = bfloat2_mul(p_frag[0, 0, 2], scale89_k0)
+    a90 = bfloat2_mul(p_frag[0, 0, 3], scale89_k0)
+    a16 = bfloat2_mul(p_frag[0, 1, 0], scale01_k1)
+    a17 = bfloat2_mul(p_frag[0, 1, 1], scale01_k1)
+    a24 = bfloat2_mul(p_frag[0, 1, 2], scale89_k1)
+    a25 = bfloat2_mul(p_frag[0, 1, 3], scale89_k1)
+
+    sfa0 = cvt_f32_to_ue8m0(
+        bfloat2_hmax_to_f32(
+            bfloat2_hmax2(
+                bfloat2_hmax2(
+                    bfloat2_hmax2(
+                        bfloat2_habs2(a00),
+                        bfloat2_habs2(a10),
+                    ),
+                    bfloat2_hmax2(
+                        bfloat2_habs2(a80),
+                        bfloat2_habs2(a90),
+                    ),
+                ),
+                bfloat2_hmax2(
+                    bfloat2_hmax2(
+                        bfloat2_habs2(a16),
+                        bfloat2_habs2(a17),
+                    ),
+                    bfloat2_hmax2(
+                        bfloat2_habs2(a24),
+                        bfloat2_habs2(a25),
+                    ),
+                ),
+            )
+        )
+    )
+    inv_sfa0 = broadcast_f32_to_bfloat2(ue8m0_to_output_scale(sfa0))
+    sfa = Uint32(sfa0)
+
+    a_regs = cute.make_rmem_tensor(
+        cute.make_layout((1, 4), stride=(4, 1)),
+        Uint32,
+    )
+    if cutlass.const_expr(kv_dtype == cutlass.Float6E3M2FN):
+        a_regs[0, 0] = (cvt_bf16x2_to_e3m2x2(bfloat2_mul(a00, inv_sfa0)) & mask16) | (
+            (cvt_bf16x2_to_e3m2x2(bfloat2_mul(a80, inv_sfa0)) & mask16) << shift16
+        )
+        a_regs[0, 1] = (cvt_bf16x2_to_e3m2x2(bfloat2_mul(a10, inv_sfa0)) & mask16) | (
+            (cvt_bf16x2_to_e3m2x2(bfloat2_mul(a90, inv_sfa0)) & mask16) << shift16
+        )
+        a_regs[0, 2] = (cvt_bf16x2_to_e3m2x2(bfloat2_mul(a16, inv_sfa0)) & mask16) | (
+            (cvt_bf16x2_to_e3m2x2(bfloat2_mul(a24, inv_sfa0)) & mask16) << shift16
+        )
+        a_regs[0, 3] = (cvt_bf16x2_to_e3m2x2(bfloat2_mul(a17, inv_sfa0)) & mask16) | (
+            (cvt_bf16x2_to_e3m2x2(bfloat2_mul(a25, inv_sfa0)) & mask16) << shift16
+        )
+    else:
+        a_regs[0, 0] = (cvt_bf16x2_to_e2m3x2(bfloat2_mul(a00, inv_sfa0)) & mask16) | (
+            (cvt_bf16x2_to_e2m3x2(bfloat2_mul(a80, inv_sfa0)) & mask16) << shift16
+        )
+        a_regs[0, 1] = (cvt_bf16x2_to_e2m3x2(bfloat2_mul(a10, inv_sfa0)) & mask16) | (
+            (cvt_bf16x2_to_e2m3x2(bfloat2_mul(a90, inv_sfa0)) & mask16) << shift16
+        )
+        a_regs[0, 2] = (cvt_bf16x2_to_e2m3x2(bfloat2_mul(a16, inv_sfa0)) & mask16) | (
+            (cvt_bf16x2_to_e2m3x2(bfloat2_mul(a24, inv_sfa0)) & mask16) << shift16
+        )
+        a_regs[0, 3] = (cvt_bf16x2_to_e2m3x2(bfloat2_mul(a17, inv_sfa0)) & mask16) | (
+            (cvt_bf16x2_to_e2m3x2(bfloat2_mul(a25, inv_sfa0)) & mask16) << shift16
+        )
+
+    v_offset = _permuted_offset_128b(
+        lane % Int32(16),
+        lane // Int32(16),
+        Int32(_MLA_NOPE_GROUP_KV_VECS),
+    )
+    v_offset_k0 = v_offset
+    v_offset_k1 = _advance_offset_by_row_128b(v_offset, 16, Int32(_MLA_NOPE_GROUP_KV_VECS))
+    for mma_d in cutlass.range_constexpr(_MLA_VO_NUM_MMA_D):
+        if const_expr(mma_d % 2 == 0):
+            b0_k0, b1_k0 = ldmatrix_m8n8x4_trans_left_half_b16(
+                _smem_addr_from_b128_offset(v_base_addr, v_offset_k0)
+            )
+            b0_k1, b1_k1 = ldmatrix_m8n8x4_trans_left_half_b16(
+                _smem_addr_from_b128_offset(v_base_addr, v_offset_k1)
+            )
+        else:
+            b0_k0, b1_k0 = ldmatrix_m8n8x4_trans_right_half_b16(
+                _smem_addr_from_b128_offset(v_base_addr, v_offset_k0)
+            )
+            b0_k1, b1_k1 = ldmatrix_m8n8x4_trans_right_half_b16(
+                _smem_addr_from_b128_offset(v_base_addr, v_offset_k1)
+            )
+        b0_k0 = frag_layout_swizzle_16b_to_8b_trans(b0_k0)
+        b1_k0 = frag_layout_swizzle_16b_to_8b_trans(b1_k0)
+        b0_k1 = frag_layout_swizzle_16b_to_8b_trans(b0_k1)
+        b1_k1 = frag_layout_swizzle_16b_to_8b_trans(b1_k1)
+
+        if cutlass.const_expr(kv_dtype == cutlass.Float6E3M2FN):
+            d0, d1, d2, d3 = mxfp6_mma_m16n8k32_f32_e3m2_e3m2(
+                o_frag[0, mma_d, 0],
+                o_frag[0, mma_d, 1],
+                o_frag[0, mma_d, 2],
+                o_frag[0, mma_d, 3],
+                a_regs[0, 0],
+                a_regs[0, 1],
+                a_regs[0, 2],
+                a_regs[0, 3],
+                b0_k0,
+                b0_k1,
+                sfa,
+                unit_scale,
+            )
+            d4, d5, d6, d7 = mxfp6_mma_m16n8k32_f32_e3m2_e3m2(
+                o_frag[0, mma_d, 4],
+                o_frag[0, mma_d, 5],
+                o_frag[0, mma_d, 6],
+                o_frag[0, mma_d, 7],
+                a_regs[0, 0],
+                a_regs[0, 1],
+                a_regs[0, 2],
+                a_regs[0, 3],
+                b1_k0,
+                b1_k1,
+                sfa,
+                unit_scale,
+            )
+        else:
+            d0, d1, d2, d3 = mxfp6_mma_m16n8k32_f32_e2m3_e2m3(
+                o_frag[0, mma_d, 0],
+                o_frag[0, mma_d, 1],
+                o_frag[0, mma_d, 2],
+                o_frag[0, mma_d, 3],
+                a_regs[0, 0],
+                a_regs[0, 1],
+                a_regs[0, 2],
+                a_regs[0, 3],
+                b0_k0,
+                b0_k1,
+                sfa,
+                unit_scale,
+            )
+            d4, d5, d6, d7 = mxfp6_mma_m16n8k32_f32_e2m3_e2m3(
+                o_frag[0, mma_d, 4],
+                o_frag[0, mma_d, 5],
+                o_frag[0, mma_d, 6],
+                o_frag[0, mma_d, 7],
+                a_regs[0, 0],
+                a_regs[0, 1],
+                a_regs[0, 2],
+                a_regs[0, 3],
+                b1_k0,
+                b1_k1,
+                sfa,
+                unit_scale,
+            )
+        o_frag[0, mma_d, 0] = d0
+        o_frag[0, mma_d, 1] = d1
+        o_frag[0, mma_d, 2] = d2
+        o_frag[0, mma_d, 3] = d3
+        o_frag[0, mma_d, 4] = d4
+        o_frag[0, mma_d, 5] = d5
+        o_frag[0, mma_d, 6] = d6
+        o_frag[0, mma_d, 7] = d7
+        if const_expr(mma_d % 2 == 1):
+            v_offset_k0 = _advance_offset_by_column_128b_2(v_offset_k0, mma_d // 2)
+            v_offset_k1 = _advance_offset_by_column_128b_2(v_offset_k1, mma_d // 2)
 
 
 @cute.jit

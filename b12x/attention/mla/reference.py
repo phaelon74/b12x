@@ -6,6 +6,15 @@ import math
 
 import torch
 
+from b12x.cute.fp6 import (
+    FLOAT6_E2M3_MAX,
+    FLOAT6_E3M2_MAX,
+    Fp6Format,
+    _decode_fp6_e2m3,
+    _decode_fp6_e3m2,
+    _encode_fp6_nearest,
+)
+
 
 _FP8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
 _FP8_E4M3_MIN = float(torch.finfo(torch.float8_e4m3fn).min)
@@ -138,6 +147,134 @@ def sparse_mla_reference(
     """Reference attention using the packed NSA MLA cache layout."""
 
     kv = unpack_mla_kv_cache_reference(kv_cache).squeeze(1).to(torch.float32)
+    return _sparse_attention_reference(
+        q_all=q_all,
+        k_all=kv,
+        v_all=kv[:, :v_head_dim],
+        page_table_1=page_table_1,
+        active_token_counts=active_token_counts,
+        sm_scale=sm_scale,
+        return_lse=return_lse,
+    )
+
+
+def _fp6_format_max(fmt: Fp6Format) -> float:
+    return FLOAT6_E3M2_MAX if fmt == "e3m2" else FLOAT6_E2M3_MAX
+
+
+def pack_mla_kv_cache_fp6_reference(
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    *,
+    fmt: Fp6Format = "e3m2",
+    group_size: int = _MLA_GROUP_SIZE,
+) -> torch.Tensor:
+    """Pack MLA KV cache into the FP6+scale+rope byte layout (same width as FP8 NSA)."""
+
+    if group_size != _MLA_GROUP_SIZE:
+        raise ValueError(
+            f"Only group_size={_MLA_GROUP_SIZE} is supported in the reference."
+        )
+
+    k_nope_2d = _as_2d_cache(k_nope, _MLA_NOPE_DIM, "k_nope")
+    k_rope_2d = _as_2d_cache(k_rope, _MLA_ROPE_DIM, "k_rope")
+    if k_nope_2d.shape[0] != k_rope_2d.shape[0]:
+        raise ValueError("k_nope and k_rope must have the same token count")
+    if k_rope_2d.dtype != torch.bfloat16:
+        raise ValueError(
+            "k_rope must have dtype torch.bfloat16 because the packed MLA layout "
+            f"stores raw BF16 rope bytes, got {k_rope_2d.dtype}"
+        )
+
+    fp6_max = _fp6_format_max(fmt)
+    num_tokens = k_nope_2d.shape[0]
+    quant_bytes: list[torch.Tensor] = []
+    scale_bytes: list[torch.Tensor] = []
+    for block_start in range(0, _MLA_NOPE_DIM, group_size):
+        block = k_nope_2d[:, block_start : block_start + group_size].to(torch.float32)
+        scale = block.abs().amax(dim=1) / fp6_max
+        scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+        normalized = block / scale.unsqueeze(1)
+        codes = torch.empty(
+            (num_tokens, group_size),
+            dtype=torch.uint8,
+            device=k_nope_2d.device,
+        )
+        for row in range(num_tokens):
+            for col in range(group_size):
+                codes[row, col] = _encode_fp6_nearest(
+                    float(normalized[row, col].item()),
+                    fmt,
+                )
+        quant_bytes.append(codes)
+        scale_bytes.append(scale.view(torch.uint8).reshape(num_tokens, 4))
+
+    rope_bytes = k_rope_2d.view(torch.uint8).reshape(
+        k_rope_2d.shape[0], _MLA_ROPE_DIM * 2
+    )
+    packed = torch.cat(
+        [torch.cat(quant_bytes, dim=1), torch.cat(scale_bytes, dim=1), rope_bytes],
+        dim=1,
+    )
+    return packed.unsqueeze(1).contiguous()
+
+
+def unpack_mla_kv_cache_fp6_reference(
+    kv_cache: torch.Tensor,
+    *,
+    fmt: Fp6Format = "e3m2",
+    group_size: int = _MLA_GROUP_SIZE,
+) -> torch.Tensor:
+    """Unpack the NSA MLA byte layout with per-group FP6 nope codes."""
+
+    if group_size != _MLA_GROUP_SIZE:
+        raise ValueError(
+            f"Only group_size={_MLA_GROUP_SIZE} is supported in the reference."
+        )
+
+    decode = _decode_fp6_e3m2 if fmt == "e3m2" else _decode_fp6_e2m3
+    packed = _as_2d_cache(kv_cache, _MLA_PACKED_DIM, "kv_cache").view(torch.uint8)
+    num_tokens = packed.shape[0]
+    num_groups = _MLA_NOPE_DIM // group_size
+
+    nope_codes = packed[:, :_MLA_NOPE_DIM].contiguous()
+    scales = packed[:, _MLA_NOPE_DIM : _MLA_NOPE_DIM + num_groups * 4].contiguous()
+    scales = scales.view(torch.float32).reshape(num_tokens, num_groups)
+    rope = packed[:, _MLA_NOPE_DIM + num_groups * 4 :].contiguous().view(torch.bfloat16)
+    rope = rope.reshape(num_tokens, _MLA_ROPE_DIM).to(torch.float32)
+
+    nope = torch.empty(
+        (num_tokens, _MLA_NOPE_DIM),
+        dtype=torch.float32,
+        device=kv_cache.device,
+    )
+    for group_idx in range(num_groups):
+        block_start = group_idx * group_size
+        codes = nope_codes[:, block_start : block_start + group_size]
+        scale = scales[:, group_idx : group_idx + 1]
+        for row in range(num_tokens):
+            for col in range(group_size):
+                nope[row, block_start + col] = decode(int(codes[row, col].item()) & 0x3F) * float(
+                    scale[row, 0].item()
+                )
+
+    return torch.cat([nope, rope], dim=1).unsqueeze(1).contiguous()
+
+
+def sparse_mla_fp6_reference(
+    *,
+    q_all: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table_1: torch.Tensor,
+    active_token_counts: torch.Tensor | None = None,
+    sm_scale: float,
+    v_head_dim: int,
+    fmt: Fp6Format = "e3m2",
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Reference sparse MLA with FP6-packed KV cache."""
+
+    kv = unpack_mla_kv_cache_fp6_reference(kv_cache, fmt=fmt).squeeze(1).to(torch.float32)
     return _sparse_attention_reference(
         q_all=q_all,
         k_all=kv,

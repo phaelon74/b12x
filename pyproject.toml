@@ -9,9 +9,10 @@ license = { text = "Apache-2.0" }
 dependencies = [
   "torch>=2.10.0",
   "cuda-python",
-  "nvidia-cutlass-dsl>=4.5.0",
-  "nvidia-cutlass-dsl-libs-base>=4.5.0",
-  "nvidia-cutlass-dsl-libs-cu13>=4.5.0",
+  # 4.5.2 ICEs compressed-MLA cute-to-nvvm lowering; stay on 4.5.0 until upstream fix.
+  "nvidia-cutlass-dsl==4.5.0",
+  "nvidia-cutlass-dsl-libs-base==4.5.0",
+  "nvidia-cutlass-dsl-libs-cu13==4.5.0",
   "apache-tvm-ffi>=0.1.6,!=0.1.8,!=0.1.8.post0,<0.2",
   "rich>=13",
   "transformers>=4.51",
