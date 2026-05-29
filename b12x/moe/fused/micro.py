@@ -47,6 +47,8 @@ from b12x.cute.fp4 import (
 
 
 _BLOCK_SIZE = 16
+# MX-FP6 block scales use 32 elements per vector (see b12x.cute.fp6.MXFP6_SF_VEC_SIZE).
+MXFP6_BLOCK_SIZE = 32
 _FP8_E4M3_MAX = 448.0
 _FC2_TILE_RECIP_GS_NUM = 6.0 * _FP8_E4M3_MAX
 _NUM_WARPS = 16
@@ -554,6 +556,19 @@ class MoEMicroKernelBackend:
             and 0 < num_topk <= 32
             and weight_E > 0
         )
+
+    @classmethod
+    def is_supported_mxfp6(
+        cls,
+        m: int,
+        k: int,
+        n: int,
+        num_topk: int,
+        weight_E: int,
+    ) -> bool:
+        """MX-FP6 (W6A6) is not implemented on the micro decode kernel; use static/dynamic MoE."""
+        del m, k, n, num_topk, weight_E
+        return False
 
     def configure(
         self,

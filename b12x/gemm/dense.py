@@ -57,10 +57,14 @@ from b12x.cute.utils import (
     get_cutlass_dtype,
     get_max_active_clusters,
     get_num_sm,
+    is_mxfp6_ab_dtype,
     make_ptr,
+    mxfp6_logical_k_from_packed_bytes,
+    mxfp6_tile_k,
     sm120_make_smem_layout_sfa,
     sm120_make_smem_layout_sfb,
 )
+from b12x.gemm.dense_mxfp6 import emit_mxfp6_dense_mma_k_block
 from b12x.cute.runtime_control import raise_if_kernel_resolution_frozen
 
 logger = logging.getLogger(__name__)
@@ -167,10 +171,13 @@ class DenseGemmKernel:
         - Supported combinations:
             * NVF4: A/B: Float4E2M1FN, SF: Float8E4M3FN, sf_vec_size: 16
             * MXF4: A/B: Float4E2M1FN, SF: Float8E8M0FNU, sf_vec_size: 32
+            * MXFP8: A/B: Float8E4M3FN, SF: Float8E8M0FNU, sf_vec_size: 32
+            * MX-FP6: A/B: Float6E3M2FN or Float6E2M3FN, SF: Float8E8M0FNU,
+              sf_vec_size: 32 (inline ``mxf8f6f4`` MMA, m16n8k32)
         - Tile shape constraints:
             * tile_m must be divisible by 128
             * tile_n must be divisible by 128
-            * tile_k must be divisible by 64 (sf_vec_size=16) or 128 (sf_vec_size=32)
+            * tile_k must be divisible by 64 (sf_vec_size=16) or 128 (MXFP8 / MX-FP6)
     """
 
     def __init__(
@@ -256,6 +263,17 @@ class DenseGemmKernel:
                 self.acc_dtype,
                 self.sf_dtype,
             )
+        elif cutlass.const_expr(
+            self.a_dtype == cutlass.Float6E3M2FN
+            or self.a_dtype == cutlass.Float6E2M3FN
+        ):
+            # MX-FP6 uses inline ``mxf8f6f4`` MMA in the mainloop. Build tiled_mma
+            # with the MXFP8 op so smem/SF layouts match m16n8k32 geometry.
+            mma_op = cute.nvgpu.warp.MmaMXF8Op(
+                cutlass.Float8E4M3FN,
+                self.acc_dtype,
+                self.sf_dtype,
+            )
         else:
             mma_op = cute.nvgpu.warp.MmaMXF4NVF4Op(
                 self.a_dtype,
@@ -267,7 +285,11 @@ class DenseGemmKernel:
         permutation_mnk = sm120_utils.get_permutation_mnk(
             self.tile_shape_mnk,
             self.sf_vec_size,
-            cutlass.const_expr(self.a_dtype == cutlass.Float8E4M3FN),
+            cutlass.const_expr(
+                self.a_dtype == cutlass.Float8E4M3FN
+                or self.a_dtype == cutlass.Float6E3M2FN
+                or self.a_dtype == cutlass.Float6E2M3FN
+            ),
         )
         self.tiled_mma = cute.make_tiled_mma(
             mma_op,
@@ -935,15 +957,38 @@ class DenseGemmKernel:
                         # Manual atom unroll: avoids hasAuxTensor address space bug
                         for _mt in range(self.num_m_tiles):
                             for _nt in range(self.num_n_tiles):
-                                mma_atom.set(WarpField.SFA, tCrSFA_tile[None, _mt, k_block_idx].iterator)
-                                mma_atom.set(WarpField.SFB, tCrSFB_tile[None, _nt, k_block_idx].iterator)
-                                cute.gemm(
-                                    mma_atom,
-                                    accumulators[None, _mt, _nt],
-                                    tCrA[None, _mt, k_block_idx],
-                                    tCrB[None, _nt, k_block_idx],
-                                    accumulators[None, _mt, _nt],
-                                )
+                                if cutlass.const_expr(
+                                    self.a_dtype == cutlass.Float6E3M2FN
+                                    or self.a_dtype == cutlass.Float6E2M3FN
+                                ):
+                                    emit_mxfp6_dense_mma_k_block(
+                                        accumulators,
+                                        tCrA,
+                                        tCrB,
+                                        tCrSFA_tile,
+                                        tCrSFB_tile,
+                                        _mt,
+                                        _nt,
+                                        k_block_idx,
+                                        self.a_dtype,
+                                        self.b_dtype,
+                                    )
+                                else:
+                                    mma_atom.set(
+                                        WarpField.SFA,
+                                        tCrSFA_tile[None, _mt, k_block_idx].iterator,
+                                    )
+                                    mma_atom.set(
+                                        WarpField.SFB,
+                                        tCrSFB_tile[None, _nt, k_block_idx].iterator,
+                                    )
+                                    cute.gemm(
+                                        mma_atom,
+                                        accumulators[None, _mt, _nt],
+                                        tCrA[None, _mt, k_block_idx],
+                                        tCrB[None, _nt, k_block_idx],
+                                        accumulators[None, _mt, _nt],
+                                    )
                         cute.copy(
                             smem_tiled_copy_A,
                             tCsA_p[None, None, k_block_next],
@@ -1008,15 +1053,38 @@ class DenseGemmKernel:
                     # Manual atom unroll: avoids hasAuxTensor address space bug
                     for _mt in range(self.num_m_tiles):
                         for _nt in range(self.num_n_tiles):
-                            mma_atom.set(WarpField.SFA, tCrSFA_tile[None, _mt, k_block_idx].iterator)
-                            mma_atom.set(WarpField.SFB, tCrSFB_tile[None, _nt, k_block_idx].iterator)
-                            cute.gemm(
-                                mma_atom,
-                                accumulators[None, _mt, _nt],
-                                tCrA[None, _mt, k_block_idx],
-                                tCrB[None, _nt, k_block_idx],
-                                accumulators[None, _mt, _nt],
-                            )
+                            if cutlass.const_expr(
+                                self.a_dtype == cutlass.Float6E3M2FN
+                                or self.a_dtype == cutlass.Float6E2M3FN
+                            ):
+                                emit_mxfp6_dense_mma_k_block(
+                                    accumulators,
+                                    tCrA,
+                                    tCrB,
+                                    tCrSFA_tile,
+                                    tCrSFB_tile,
+                                    _mt,
+                                    _nt,
+                                    k_block_idx,
+                                    self.a_dtype,
+                                    self.b_dtype,
+                                )
+                            else:
+                                mma_atom.set(
+                                    WarpField.SFA,
+                                    tCrSFA_tile[None, _mt, k_block_idx].iterator,
+                                )
+                                mma_atom.set(
+                                    WarpField.SFB,
+                                    tCrSFB_tile[None, _nt, k_block_idx].iterator,
+                                )
+                                cute.gemm(
+                                    mma_atom,
+                                    accumulators[None, _mt, _nt],
+                                    tCrA[None, _mt, k_block_idx],
+                                    tCrB[None, _nt, k_block_idx],
+                                    accumulators[None, _mt, _nt],
+                                )
 
                 # EPILOGUE
                 _is_m_major = self.c_layout.is_m_major_c()
@@ -1543,12 +1611,21 @@ class DenseGemmKernel:
         # quanta, while the SF paths round narrow tiles up to full 128-element
         # scale-factor blocks.
         if mma_tiler_mn in ((16, 64), (16, 128), (32, 64), (32, 128)):
-            if ab_dtype != cutlass.Float8E4M3FN:
+            if ab_dtype not in (
+                cutlass.Float8E4M3FN,
+                cutlass.Float6E3M2FN,
+                cutlass.Float6E2M3FN,
+            ):
                 return False
         elif mma_tiler_mn[0] % 64 != 0 or mma_tiler_mn[1] % 64 != 0:
             return False
-        # The current target supports FP4 and MXFP8 warp MMA paths.
-        if ab_dtype not in (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN):
+        # The current target supports FP4, MXFP8, and MX-FP6 warp MMA paths.
+        if ab_dtype not in (
+            cutlass.Float4E2M1FN,
+            cutlass.Float8E4M3FN,
+            cutlass.Float6E3M2FN,
+            cutlass.Float6E2M3FN,
+        ):
             return False
         # Current target MMA constraints:
         #   sf_vec_size=16 requires sf_dtype=Float8E4M3FN
@@ -1559,6 +1636,8 @@ class DenseGemmKernel:
             return False
         if ab_dtype == cutlass.Float8E4M3FN and sf_vec_size != 32:
             return False
+        if is_mxfp6_ab_dtype(ab_dtype) and sf_vec_size != 32:
+            return False
         # Only 16-bit output types supported for now
         if c_dtype not in (cutlass.Float16, cutlass.BFloat16):
             return False
@@ -1566,7 +1645,10 @@ class DenseGemmKernel:
         if a_major != "k" or b_major != "k":
             return False
         # Alignment: K must be divisible by tile_k
-        tile_k = 128 if ab_dtype == cutlass.Float8E4M3FN else sf_vec_size * 8
+        if ab_dtype == cutlass.Float8E4M3FN or is_mxfp6_ab_dtype(ab_dtype):
+            tile_k = mxfp6_tile_k() if is_mxfp6_ab_dtype(ab_dtype) else 128
+        else:
+            tile_k = sf_vec_size * 8
         if k % tile_k != 0:
             return False
         return True
@@ -1868,9 +1950,10 @@ def _select_default_mma_tiler_mn(
     sm_count: int,
     *,
     is_mxfp8: bool,
+    is_mxfp6: bool = False,
 ) -> Tuple[int, int]:
     coarse_tile = (128, 128)
-    if is_mxfp8 and n > 1536:
+    if (is_mxfp8 or is_mxfp6) and n > 1536:
         # Keep the true single-token decode specialization, but do not let
         # ordinary live prefill tails choose compile-time-only small-M tiles.
         # vLLM warms attention with large prefill shapes and then passes the
@@ -1928,13 +2011,25 @@ def dense_gemm(
     n, _, _ = b_torch.shape
     if ab_dtype == "float4_e2m1fn":
         is_mxfp8 = False
+        is_mxfp6 = False
         k *= 2
         mma_k = 64
         tile_k = sf_vec_size * 8
     elif ab_dtype == "float8_e4m3fn":
         is_mxfp8 = True
+        is_mxfp6 = False
         mma_k = 32
         tile_k = 128
+    elif ab_dtype in ("float6_e3m2fn", "float6_e2m3fn"):
+        is_mxfp8 = False
+        is_mxfp6 = True
+        if sf_vec_size != 32:
+            raise ValueError("MX-FP6 dense_gemm requires sf_vec_size=32")
+        if sf_dtype != "float8_e8m0fnu":
+            raise ValueError("MX-FP6 dense_gemm requires sf_dtype='float8_e8m0fnu'")
+        k = mxfp6_logical_k_from_packed_bytes(k)
+        mma_k = 32
+        tile_k = mxfp6_tile_k(sf_vec_size)
     else:
         raise TypeError(f"dense_gemm unsupported ab_dtype: {ab_dtype}")
 
@@ -1949,6 +2044,7 @@ def dense_gemm(
             n,
             sm_count,
             is_mxfp8=is_mxfp8,
+            is_mxfp6=is_mxfp6,
         )
     if alpha_dtype is None:
         alpha_dtype = "float32" if alpha is None else str(alpha.dtype).split(".")[-1]

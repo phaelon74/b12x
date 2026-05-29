@@ -23,6 +23,7 @@ from b12x.cute.compiler import (
     launch as b12x_launch,
 )
 from b12x.cute.fp4 import get_sm_version
+from b12x.attention.mxfp6_mma import _compute_mxfp6_tile_partials
 from b12x.cute.fp4 import (
     frag_layout_swizzle_16b_to_8b,
     ld_shared_v4_u32,
@@ -617,9 +618,11 @@ class SparseNSAPagedLogitsKernel:
         tiled_output: bool = False,
         tile_block_q: int = _PAGED_TILED_BLOCK_Q,
         tile_block_k: int = _PAGED_TILED_BLOCK_K,
+        index_k_dtype: type = cutlass.Float8E4M3FN,
     ):
         self.persistent_ctas = int(persistent_ctas)
         self.num_heads_static = int(num_heads_static)
+        self.index_k_dtype = index_k_dtype
         self.tiled_output = bool(tiled_output)
         self.tile_block_q = int(tile_block_q)
         self.tile_block_k = int(tile_block_k)
@@ -868,18 +871,37 @@ class SparseNSAPagedLogitsKernel:
                             cute.arch.sync_threads()
                             if token_base < valid_slots:
                                 head_tile_base = head_tile_slot * Int32(_PAGED_Q_HEAD_TILE)
-                                _compute_mxfp8_tile_partials(
-                                    s_q,
-                                    s_w,
-                                    num_heads,
-                                    k_page_perm_base_addr,
-                                    token_base,
-                                    head_tile_base,
-                                    lane,
-                                    s_partial_logits,
-                                    token_group * Int32(_PAGED_TOKENS_PER_GROUP),
-                                    head_tile_slot,
-                                )
+                                if cutlass.const_expr(
+                                    self.index_k_dtype == cutlass.Float6E3M2FN
+                                    or self.index_k_dtype == cutlass.Float6E2M3FN
+                                ):
+                                    _compute_mxfp6_tile_partials(
+                                        s_q,
+                                        s_w,
+                                        num_heads,
+                                        k_page_perm_base_addr,
+                                        token_base,
+                                        head_tile_base,
+                                        lane,
+                                        s_partial_logits,
+                                        token_group * Int32(_PAGED_TOKENS_PER_GROUP),
+                                        head_tile_slot,
+                                        self.index_k_dtype,
+                                        _INDEX_HEAD_DIM,
+                                    )
+                                else:
+                                    _compute_mxfp8_tile_partials(
+                                        s_q,
+                                        s_w,
+                                        num_heads,
+                                        k_page_perm_base_addr,
+                                        token_base,
+                                        head_tile_base,
+                                        lane,
+                                        s_partial_logits,
+                                        token_group * Int32(_PAGED_TOKENS_PER_GROUP),
+                                        head_tile_slot,
+                                    )
                             cute.arch.sync_threads()
                             if (head_tile_slot == Int32(0)) & (lane < Int32(_PAGED_TOKENS_PER_GROUP)):
                                 slot_idx = token_base + lane
@@ -1251,18 +1273,37 @@ class SparseNSAScheduledSingleRowLogitsKernel:
                             cute.arch.sync_threads()
                             if token_base < valid_slots:
                                 head_tile_base = head_tile_slot * Int32(_PAGED_Q_HEAD_TILE)
-                                _compute_mxfp8_tile_partials(
-                                    s_q,
-                                    s_w,
-                                    num_heads,
-                                    k_page_perm_base_addr,
-                                    token_base,
-                                    head_tile_base,
-                                    lane,
-                                    s_partial_logits,
-                                    token_group * Int32(_PAGED_TOKENS_PER_GROUP),
-                                    head_tile_slot,
-                                )
+                                if cutlass.const_expr(
+                                    self.index_k_dtype == cutlass.Float6E3M2FN
+                                    or self.index_k_dtype == cutlass.Float6E2M3FN
+                                ):
+                                    _compute_mxfp6_tile_partials(
+                                        s_q,
+                                        s_w,
+                                        num_heads,
+                                        k_page_perm_base_addr,
+                                        token_base,
+                                        head_tile_base,
+                                        lane,
+                                        s_partial_logits,
+                                        token_group * Int32(_PAGED_TOKENS_PER_GROUP),
+                                        head_tile_slot,
+                                        self.index_k_dtype,
+                                        _INDEX_HEAD_DIM,
+                                    )
+                                else:
+                                    _compute_mxfp8_tile_partials(
+                                        s_q,
+                                        s_w,
+                                        num_heads,
+                                        k_page_perm_base_addr,
+                                        token_base,
+                                        head_tile_base,
+                                        lane,
+                                        s_partial_logits,
+                                        token_group * Int32(_PAGED_TOKENS_PER_GROUP),
+                                        head_tile_slot,
+                                    )
                             cute.arch.sync_threads()
                             if (head_tile_slot == Int32(0)) & (lane < Int32(_PAGED_TOKENS_PER_GROUP)):
                                 slot_idx = token_base + lane
@@ -1544,18 +1585,37 @@ class SparseNSAScheduledMultiRowLogitsKernel:
                                     cute.arch.sync_threads()
                                     if token_base < valid_slots:
                                         head_tile_base = head_tile_slot * Int32(_PAGED_Q_HEAD_TILE)
-                                        _compute_mxfp8_tile_partials(
-                                            s_q,
-                                            s_w,
-                                            num_heads,
-                                            k_page_perm_base_addr,
-                                            token_base,
-                                            head_tile_base,
-                                            lane,
-                                            s_partial_logits,
-                                            token_group * Int32(_PAGED_TOKENS_PER_GROUP),
-                                            head_tile_slot,
-                                        )
+                                        if cutlass.const_expr(
+                                            self.index_k_dtype == cutlass.Float6E3M2FN
+                                            or self.index_k_dtype == cutlass.Float6E2M3FN
+                                        ):
+                                            _compute_mxfp6_tile_partials(
+                                                s_q,
+                                                s_w,
+                                                num_heads,
+                                                k_page_perm_base_addr,
+                                                token_base,
+                                                head_tile_base,
+                                                lane,
+                                                s_partial_logits,
+                                                token_group * Int32(_PAGED_TOKENS_PER_GROUP),
+                                                head_tile_slot,
+                                                self.index_k_dtype,
+                                                _INDEX_HEAD_DIM,
+                                            )
+                                        else:
+                                            _compute_mxfp8_tile_partials(
+                                                s_q,
+                                                s_w,
+                                                num_heads,
+                                                k_page_perm_base_addr,
+                                                token_base,
+                                                head_tile_base,
+                                                lane,
+                                                s_partial_logits,
+                                                token_group * Int32(_PAGED_TOKENS_PER_GROUP),
+                                                head_tile_slot,
+                                            )
                                     cute.arch.sync_threads()
                                     if (
                                         head_tile_slot == Int32(0)

@@ -7,7 +7,7 @@ import logging
 import time
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Tuple
 
 import cuda.bindings.driver as cuda
@@ -19,11 +19,15 @@ from torch.profiler import record_function
 
 from b12x.cute.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x.cute.fp4 import align_up, as_grouped_scale_view
+from b12x.cute.fp6 import as_grouped_mxfp6_scale_view
 from b12x.cute.utils import (
+    MXFP6_SF_VEC_SIZE,
     current_cuda_stream,
     get_max_active_clusters,
     get_num_sm,
     make_ptr,
+    mxfp6_logical_k_from_packed_bytes,
+    mxfp6_packed_k_bytes,
 )
 from cutlass.cutlass_dsl import Int32
 from b12x.integration.triton_route import route_topk as triton_route_topk
@@ -58,6 +62,7 @@ _B12X_TIMING_THRESHOLD_MS = float(
 )
 
 _NVFP4_BLOCK_SIZE = 16
+_MXFP6_BLOCK_SIZE = MXFP6_SF_VEC_SIZE
 _RUNTIME_MEMREF_LIMIT = (1 << 31) - 1
 _LEVEL_TILE_M = 128
 _LEVEL_TILE_N = 128
@@ -68,6 +73,13 @@ _FP4_SOURCE_FORMATS = {
     "modelopt_nvfp4": "modelopt_nvfp4",
     "fp4_e8m0_k32": "fp4_e8m0_k32",
     "compressed_tensors": "compressed_tensors",
+}
+# Default W6A6 contract: E2M3 weights, E3M2 activations (compile-time per operand).
+_FP6_SOURCE_FORMATS = {
+    "mxfp6_default": "mxfp6_default",
+    "mxfp6_mixed": "mxfp6_mixed",
+    "mxfp6_e3m2": "mxfp6_e3m2",
+    "mxfp6_e2m3": "mxfp6_e2m3",
 }
 _W4A16_SCALE_FORMATS = {
     "e4m3_k16": "e4m3_k16",
@@ -284,6 +296,30 @@ class B12XFP4ExpertWeights:
 
 
 @dataclass(frozen=True, kw_only=True)
+class B12XFP6ExpertWeights:
+    """Packaged MX-FP6 expert tensors for routed-expert W6A6 MoE entrypoints."""
+
+    a1_gscale: torch.Tensor
+    w1_fp6: torch.Tensor
+    w1_blockscale: torch.Tensor
+    w1_alphas: torch.Tensor
+    a2_gscale: torch.Tensor
+    w2_fp6: torch.Tensor
+    w2_blockscale: torch.Tensor
+    w2_alphas: torch.Tensor
+    source_format: str = "mxfp6_default"
+    w13_layout: str = "w13"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "source_format",
+            _normalize_fp6_source_format(self.source_format),
+        )
+        object.__setattr__(self, "w13_layout", _normalize_w13_layout(self.w13_layout))
+
+
+@dataclass(frozen=True, kw_only=True)
 class B12XPreparedFP4MoEWeights:
     """Derived FP4 MoE weight representations prepared from a source contract."""
 
@@ -298,6 +334,26 @@ class B12XPreparedFP4MoEWeights:
             self,
             "source_format",
             _normalize_fp4_source_format(self.source_format),
+        )
+        object.__setattr__(self, "w13_layout", _normalize_w13_layout(self.w13_layout))
+
+
+@dataclass(frozen=True, kw_only=True)
+class B12XPreparedFP6MoEWeights:
+    """Derived MX-FP6 MoE weight representations prepared from a source contract."""
+
+    source_format: str
+    w13_layout: str = "w13"
+    activation_dtype: str
+    weight_dtype: str
+    w1_runtime_alphas: torch.Tensor | None = None
+    w2_runtime_alphas: torch.Tensor | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "source_format",
+            _normalize_fp6_source_format(self.source_format),
         )
         object.__setattr__(self, "w13_layout", _normalize_w13_layout(self.w13_layout))
 
@@ -424,11 +480,18 @@ class TPMoEScratchCaps:
                 max(int(self.route_num_experts), 0),
             )
         object.__setattr__(self, "quant_mode", _normalize_quant_mode(self.quant_mode))
-        object.__setattr__(
-            self,
-            "source_format",
-            _normalize_fp4_source_format(self.source_format),
-        )
+        if _is_w6a6_quant_mode(self.quant_mode):
+            object.__setattr__(
+                self,
+                "source_format",
+                _normalize_fp6_source_format(self.source_format),
+            )
+        else:
+            object.__setattr__(
+                self,
+                "source_format",
+                _normalize_fp4_source_format(self.source_format),
+            )
         object.__setattr__(self, "w13_layout", _normalize_w13_layout(self.w13_layout))
         object.__setattr__(self, "frozen", bool(self.frozen))
 
@@ -716,9 +779,73 @@ def _normalize_quant_mode(quant_mode: str | None) -> str:
     if quant_mode is None:
         return default_moe_quant_mode()
     normalized = quant_mode.lower()
-    if normalized not in {"nvfp4", "w4a16"}:
+    if normalized not in {"nvfp4", "w4a16", "w6a6"}:
         raise ValueError(f"unsupported quant_mode {quant_mode!r}")
     return normalized
+
+
+def _is_w6a6_quant_mode(quant_mode: str) -> bool:
+    return _normalize_quant_mode(quant_mode) == "w6a6"
+
+
+def _moe_block_size(quant_mode: str) -> int:
+    return _MXFP6_BLOCK_SIZE if _is_w6a6_quant_mode(quant_mode) else _NVFP4_BLOCK_SIZE
+
+
+def _packed_moe_cols(dim: int, *, quant_mode: str) -> int:
+    if _is_w6a6_quant_mode(quant_mode):
+        return mxfp6_packed_k_bytes(dim)
+    return dim // 2
+
+
+def _logical_moe_dim(packed_cols: int, *, quant_mode: str) -> int:
+    if _is_w6a6_quant_mode(quant_mode):
+        return mxfp6_logical_k_from_packed_bytes(packed_cols)
+    return packed_cols * 2
+
+
+def _cols_pad_sf(k: int, *, quant_mode: str) -> int:
+    return align_up(k // _moe_block_size(quant_mode), 4)
+
+
+def _normalize_fp6_source_format(source_format: str) -> str:
+    try:
+        return _FP6_SOURCE_FORMATS[source_format.lower()]
+    except KeyError as exc:
+        raise ValueError(
+            "source_format must be one of "
+            f"{sorted(_FP6_SOURCE_FORMATS)}, got {source_format!r}"
+        ) from exc
+
+
+def _mxfp6_cutlass_dtypes(
+    source_format: str,
+) -> tuple[object, object, object]:
+    """Return (activation_dtype, weight_dtype, sf_dtype) for MX-FP6 MoE."""
+    source_format = _normalize_fp6_source_format(source_format)
+    sf_dtype = cutlass.Float8E8M0FNU
+    if source_format in ("mxfp6_e3m2",):
+        act = cutlass.Float6E3M2FN
+        return act, act, sf_dtype
+    if source_format in ("mxfp6_e2m3",):
+        act = cutlass.Float6E2M3FN
+        return act, act, sf_dtype
+    # mxfp6_default / mxfp6_mixed: E3M2 activations, E2M3 weights.
+    return cutlass.Float6E3M2FN, cutlass.Float6E2M3FN, sf_dtype
+
+
+def _moe_activation_gptr_dtype(*, quant_mode: str, source_format: str):
+    if _is_w6a6_quant_mode(quant_mode):
+        activation_dtype, _, _ = _mxfp6_cutlass_dtypes(source_format)
+        return activation_dtype
+    return cutlass.Float4E2M1FN
+
+
+def _moe_weight_gptr_dtype(*, quant_mode: str, source_format: str):
+    if _is_w6a6_quant_mode(quant_mode):
+        _, weight_dtype, _ = _mxfp6_cutlass_dtypes(source_format)
+        return weight_dtype
+    return cutlass.Float4E2M1FN
 
 
 def _normalize_fp4_source_format(source_format: str) -> str:
@@ -814,6 +941,19 @@ def _validate_fp4_source_format_for_quant_mode(
             "quant_mode='w4a16'; the NVFP4 kernels currently support only "
             "source_format='modelopt_nvfp4'"
         )
+
+
+def _validate_source_format_for_quant_mode(
+    *, source_format: str, quant_mode: str
+) -> None:
+    quant_mode = _normalize_quant_mode(quant_mode)
+    if quant_mode == "w6a6":
+        _normalize_fp6_source_format(source_format)
+        return
+    _validate_fp4_source_format_for_quant_mode(
+        source_format=_normalize_fp4_source_format(source_format),
+        quant_mode=quant_mode,
+    )
 
 
 def _assert_reciprocal_input_scale_contract(
@@ -1110,11 +1250,14 @@ def _prepare_expert_scale_vector(
         return scale.reshape(weight_E).to(torch.float32).contiguous()
 
 
-def _safe_max_rows_per_launch(E: int, k: int, n: int) -> int:
+def _safe_max_rows_per_launch(
+    E: int, k: int, n: int, *, quant_mode: str = "nvfp4"
+) -> int:
     """Largest padded row count that fits within CuTe runtime memref limits."""
-    cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
+    cols_pad_k = _cols_pad_sf(k, quant_mode=quant_mode)
+    packed_k_cols = _packed_moe_cols(k, quant_mode=quant_mode)
     limits = [
-        _RUNTIME_MEMREF_LIMIT // max(1, E * (k // 2)),
+        _RUNTIME_MEMREF_LIMIT // max(1, E * packed_k_cols),
         _RUNTIME_MEMREF_LIMIT // max(1, E * cols_pad_k),
         _RUNTIME_MEMREF_LIMIT // max(1, E * n),
         _RUNTIME_MEMREF_LIMIT // max(1, E),
@@ -1123,9 +1266,11 @@ def _safe_max_rows_per_launch(E: int, k: int, n: int) -> int:
     return max_rows - (max_rows % 128)
 
 
-def _safe_token_chunk(E: int, k: int, n: int, num_topk: int) -> int:
+def _safe_token_chunk(
+    E: int, k: int, n: int, num_topk: int, *, quant_mode: str = "nvfp4"
+) -> int:
     """Largest token chunk that keeps all per-launch work buffers in range."""
-    safe_rows = _safe_max_rows_per_launch(E, k, n)
+    safe_rows = _safe_max_rows_per_launch(E, k, n, quant_mode=quant_mode)
     if safe_rows <= 0:
         return 1
     max_tokens = max(1, safe_rows // max(1, num_topk))
@@ -1159,8 +1304,14 @@ def _safe_dynamic_max_rows_per_launch(
 
 def _dynamic_rows_padded_limit(k: int, *, quant_mode: str = "nvfp4") -> int:
     tile_m = _dynamic_tile_m(quant_mode)
-    cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
-    input_cols = k if _normalize_quant_mode(quant_mode) == "w4a16" else k // 2
+    quant_mode = _normalize_quant_mode(quant_mode)
+    cols_pad_k = _cols_pad_sf(k, quant_mode=quant_mode)
+    if quant_mode == "w4a16":
+        input_cols = k
+    elif quant_mode == "w6a6":
+        input_cols = _packed_moe_cols(k, quant_mode=quant_mode)
+    else:
+        input_cols = k // 2
     rows_padded_limit = min(
         _RUNTIME_MEMREF_LIMIT // max(1, input_cols),
         _RUNTIME_MEMREF_LIMIT // max(1, cols_pad_k),
@@ -1268,9 +1419,12 @@ def _refresh_dynamic_workspace_scales(
 
 
 def _finalize_workspace_views(workspace: TPMoEWorkspace) -> None:
-    sf_dtype = cutlass.Float8E4M3FN
-    # Keep as uint8 — the float4 element type is conveyed to CUTLASS via
-    # _gptr / compile-time dtype, and dlpack does not support float4.
+    if _is_w6a6_quant_mode(workspace.quant_mode):
+        sf_dtype = cutlass.Float8E8M0FNU
+    else:
+        sf_dtype = cutlass.Float8E4M3FN
+    # Keep as uint8 — the MX/FP4 element type is conveyed to CUTLASS via
+    # _gptr / compile-time dtype, and dlpack does not support float4/float6.
     workspace.packed_a_view = workspace.packed_input.permute(1, 2, 0)
     workspace.packed_a_flat = workspace.packed_input.view(-1)
     workspace.scale_flat = workspace.packed_input_scale.view(-1)
@@ -1407,7 +1561,8 @@ def _plan_core_workspace(
 
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
 
-    cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
+    cols_pad_k = _cols_pad_sf(k, quant_mode=quant_mode)
+    packed_k_cols = _packed_moe_cols(k, quant_mode=quant_mode)
     direct_micro_tokens = max(1, routed_rows // max(1, num_topk))
     direct_micro_k_supported = (
         k > 0
@@ -1418,6 +1573,7 @@ def _plan_core_workspace(
     direct_micro_token_supported = direct_micro_tokens in (1, 2, 4, 8)
     direct_micro_candidate = (
         implementation == "static"
+        and not _is_w6a6_quant_mode(quant_mode)
         and n % _NVFP4_BLOCK_SIZE == 0
         and direct_micro_k_supported
         and 0 < num_topk <= 32
@@ -1435,7 +1591,7 @@ def _plan_core_workspace(
     )
     if implementation == "static":
         static_rows_pad_k = align_up(max_rows, 128)
-        packed_input_shape = (state_E, max_rows, k // 2)
+        packed_input_shape = (state_E, max_rows, packed_k_cols)
         packed_input_dtype = torch.uint8
         micro_intermediate_elements = state_E * n
         if direct_micro_candidate:
@@ -1505,7 +1661,7 @@ def _plan_core_workspace(
         dynamic_max_tasks = dynamic_task_capacity
         dynamic_tile_m = _dynamic_tile_m(quant_mode)
     dynamic_rows_padded = dynamic_tiles * dynamic_tile_m
-    packed_input_shape = (1, dynamic_rows_padded, k // 2)
+    packed_input_shape = (1, dynamic_rows_padded, packed_k_cols)
     packed_input_dtype = torch.uint8
     return _TPCoreWorkspacePlan(
         implementation=implementation,
@@ -1923,6 +2079,116 @@ def _get_weight_views(
     return views
 
 
+def _get_weight_views_mxfp6(
+    w1_fp6: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w2_fp6: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w1_alphas: torch.Tensor,
+    w2_alphas: torch.Tensor,
+    n: int,
+    k: int,
+    *,
+    activation_spec: _ActivationKernelSpec,
+    source_format: str,
+) -> _WeightViews:
+    """Create MX-FP6 weight views from the expert-weight layout."""
+    global _LAST_WEIGHTS
+    source_format = _normalize_fp6_source_format(source_format)
+    key = (
+        w1_fp6.data_ptr(),
+        w1_blockscale.data_ptr(),
+        w2_fp6.data_ptr(),
+        w2_blockscale.data_ptr(),
+        w1_alphas.data_ptr(),
+        w2_alphas.data_ptr(),
+        activation_spec.activation,
+        source_format,
+        "w6a6",
+    )
+    last_wkey, last_wval = _LAST_WEIGHTS
+    if last_wkey == key:
+        return last_wval
+    cached = _WEIGHT_CACHE.get(key)
+    if cached is not None:
+        _LAST_WEIGHTS = (key, cached)
+        return cached
+
+    w13 = w1_fp6.permute(1, 2, 0)
+    down = w2_fp6.permute(1, 2, 0)
+    w1_n = activation_spec.w1_rows(n)
+    bs_u8 = w1_blockscale.view(torch.uint8)
+    w13_sf = as_grouped_mxfp6_scale_view(bs_u8, w1_n, k)
+    down_sf = as_grouped_mxfp6_scale_view(w2_blockscale.view(torch.uint8), k, n)
+    if not w1_alphas.is_contiguous() or not w2_alphas.is_contiguous():
+        raise ValueError("w1_alphas and w2_alphas must be contiguous")
+
+    _, weight_dtype, sf_dtype = _mxfp6_cutlass_dtypes(source_format)
+    views = _WeightViews(
+        w13=w13,
+        down=down,
+        w13_sf=w13_sf,
+        down_sf=down_sf,
+        w1_alpha=w1_alphas,
+        w2_alpha=w2_alphas,
+        w1_storage=w1_fp6,
+        w1_scale_storage=w1_blockscale,
+        w2_storage=w2_fp6,
+        w2_scale_storage=w2_blockscale,
+    )
+    views.w13_fp4 = w13.view(torch.uint8)
+    views.down_fp4 = down.view(torch.uint8)
+    views.sfb_w13_ptr = make_ptr(
+        sf_dtype, w13_sf.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+    )
+    views.sfb_down_ptr = make_ptr(
+        sf_dtype, down_sf.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+    )
+    _WEIGHT_CACHE[key] = views
+    _LAST_WEIGHTS = (key, views)
+    return views
+
+
+def _get_moe_weight_views(
+    w1: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w1_alphas: torch.Tensor,
+    w2_alphas: torch.Tensor,
+    n: int,
+    k: int,
+    *,
+    activation_spec: _ActivationKernelSpec,
+    quant_mode: str,
+    source_format: str,
+) -> _WeightViews:
+    if _is_w6a6_quant_mode(quant_mode):
+        return _get_weight_views_mxfp6(
+            w1,
+            w1_blockscale,
+            w2,
+            w2_blockscale,
+            w1_alphas,
+            w2_alphas,
+            n,
+            k,
+            activation_spec=activation_spec,
+            source_format=source_format,
+        )
+    return _get_weight_views(
+        w1,
+        w1_blockscale,
+        w2,
+        w2_blockscale,
+        w1_alphas,
+        w2_alphas,
+        n,
+        k,
+        activation_spec=activation_spec,
+    )
+
+
 def _get_w4a16_packed_weights(
     w1_fp4: torch.Tensor,
     w1_blockscale: torch.Tensor,
@@ -2121,6 +2387,59 @@ def prepare_b12x_fp4_moe_weights(
         w1_runtime_alphas=w1_runtime_alphas,
         w2_runtime_alphas=w2_runtime_alphas,
         w4a16=w4a16,
+    )
+
+
+def prepare_b12x_fp6_moe_weights(
+    *,
+    source_format: str = "mxfp6_default",
+    w13_layout: str = "w13",
+    w1_global_scale: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    a1_gscale: torch.Tensor | None = None,
+    a2_gscale: torch.Tensor | None = None,
+    w1_fp6: torch.Tensor | None = None,
+    w1_blockscale: torch.Tensor | None = None,
+    w2_fp6: torch.Tensor | None = None,
+    w2_blockscale: torch.Tensor | None = None,
+    activation: str | None = None,
+    params_dtype: torch.dtype | None = None,
+    prepare_runtime_alphas: bool = False,
+) -> B12XPreparedFP6MoEWeights:
+    """Prepare B12X MX-FP6 (W6A6) MoE runtime representations from a source contract."""
+    source_format = _normalize_fp6_source_format(source_format)
+    w13_layout = _normalize_w13_layout(w13_layout)
+    activation_dtype, weight_dtype, _ = _mxfp6_cutlass_dtypes(source_format)
+    if not prepare_runtime_alphas:
+        return B12XPreparedFP6MoEWeights(
+            source_format=source_format,
+            w13_layout=w13_layout,
+            activation_dtype=str(activation_dtype),
+            weight_dtype=str(weight_dtype),
+        )
+    if a1_gscale is None or a2_gscale is None:
+        raise ValueError(
+            "a1_gscale and a2_gscale are required to prepare MX-FP6 runtime alphas"
+        )
+    weight_E = (
+        int(w1_fp6.shape[0])
+        if w1_fp6 is not None
+        else int(w1_global_scale.numel())
+    )
+    w1_runtime_alphas, w2_runtime_alphas = _prepare_modelopt_nvfp4_runtime_alphas(
+        w1_global_scale,
+        a1_gscale,
+        w2_global_scale,
+        a2_gscale,
+        weight_E=weight_E,
+    )
+    return B12XPreparedFP6MoEWeights(
+        source_format=source_format,
+        w13_layout=w13_layout,
+        activation_dtype=str(activation_dtype),
+        weight_dtype=str(weight_dtype),
+        w1_runtime_alphas=w1_runtime_alphas,
+        w2_runtime_alphas=w2_runtime_alphas,
     )
 
 
@@ -2742,7 +3061,7 @@ def allocate_tp_moe_workspace(
             f"topk_ids batch mismatch: expected {m}, got {topk_ids.shape[0]}"
         )
     weight_E = w1_fp4.shape[0]
-    n = w2_fp4.shape[2] * 2
+    n = _logical_moe_dim(w2_fp4.shape[2], quant_mode=quant_mode)
     num_topk = topk_ids.shape[1]
     plan = _make_workspace_plan(
         num_tokens=m,
@@ -3609,10 +3928,20 @@ def _get_static_kernel(
     share_input_across_experts: bool = False,
     share_expert_scales: bool = False,
     quant_mode: str = "nvfp4",
+    source_format: str = "modelopt_nvfp4",
 ):
     quant_mode = _normalize_quant_mode(quant_mode)
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
-    sf_vec_size = 16
+    if _is_w6a6_quant_mode(quant_mode):
+        sf_vec_size = _MXFP6_BLOCK_SIZE
+        source_format = _normalize_fp6_source_format(source_format)
+        a_scratch_dtype, weight_dtype, sf_dtype = _mxfp6_cutlass_dtypes(source_format)
+    else:
+        sf_vec_size = 16
+        source_format = _normalize_fp4_source_format(source_format)
+        weight_dtype = cutlass.Float4E2M1FN
+        a_scratch_dtype = weight_dtype
+        sf_dtype = cutlass.Float8E4M3FN
     mac = mac_override if mac_override is not None else _get_impl_mac("static")
     routed_rows = m * num_topk
     mma_tiler_mn = (128, 128)
@@ -3637,6 +3966,7 @@ def _get_static_kernel(
         share_input_across_experts,
         share_expert_scales,
         dynamic_down_scale,
+        source_format,
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
@@ -3648,9 +3978,6 @@ def _get_static_kernel(
             _LAST_KERNEL = (cache_key, cached)
             return cached, mac
 
-    weight_dtype = cutlass.Float4E2M1FN
-    a_scratch_dtype = weight_dtype
-    sf_dtype = cutlass.Float8E4M3FN
     a_dtype = cutlass.BFloat16
     alpha_dtype = cutlass.Float32
 
@@ -4268,13 +4595,23 @@ def _get_dynamic_kernel(
     activation: str = "silu",
     quant_mode: str = "nvfp4",
     share_input_across_experts: bool = False,
+    source_format: str = "modelopt_nvfp4",
 ):
     quant_mode = _normalize_quant_mode(quant_mode)
     share_input_across_experts = bool(
         share_input_across_experts and quant_mode == "nvfp4"
     )
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
-    sf_vec_size = 16
+    if _is_w6a6_quant_mode(quant_mode):
+        sf_vec_size = _MXFP6_BLOCK_SIZE
+        source_format = _normalize_fp6_source_format(source_format)
+        a_scratch_dtype, weight_dtype, sf_dtype = _mxfp6_cutlass_dtypes(source_format)
+    else:
+        sf_vec_size = 16
+        source_format = _normalize_fp4_source_format(source_format)
+        weight_dtype = cutlass.Float4E2M1FN
+        a_scratch_dtype = weight_dtype
+        sf_dtype = cutlass.Float8E4M3FN
     mac = mac_override if mac_override is not None else _get_impl_mac("dynamic")
     dynamic_down_scale = _dynamic_down_scale_enabled()
     mma_tiler_mn = (
@@ -4296,6 +4633,7 @@ def _get_dynamic_kernel(
         activation,
         dynamic_down_scale,
         share_input_across_experts,
+        source_format,
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
@@ -4312,9 +4650,6 @@ def _get_dynamic_kernel(
             _LAST_KERNEL = (cache_key, cached)
             return cached, mac
 
-    weight_dtype = cutlass.Float4E2M1FN
-    a_scratch_dtype = weight_dtype
-    sf_dtype = cutlass.Float8E4M3FN
     a_dtype = cutlass.BFloat16
     alpha_dtype = cutlass.Float32
 
@@ -4789,6 +5124,7 @@ def _launch_dynamic(
     activation: str = "silu",
     quant_mode: str = "nvfp4",
     share_input_across_experts: bool = False,
+    source_format: str = "modelopt_nvfp4",
 ) -> None:
     quant_mode = _normalize_quant_mode(quant_mode)
     effective_mac = _get_impl_mac("dynamic", routed_rows=routed_rows)
@@ -4807,6 +5143,13 @@ def _launch_dynamic(
         activation=activation,
         quant_mode=quant_mode,
         share_input_across_experts=share_input_across_experts,
+        source_format=source_format,
+    )
+    act_gptr_dtype = _moe_activation_gptr_dtype(
+        quant_mode=quant_mode, source_format=source_format
+    )
+    wt_gptr_dtype = _moe_weight_gptr_dtype(
+        quant_mode=quant_mode, source_format=source_format
     )
     _reset_volatile_launch_state(workspace)
     def _gptr(dtype, t, align=16):
@@ -4821,7 +5164,7 @@ def _launch_dynamic(
         _gptr(cutlass.BFloat16, a),
         _gptr(ids_cutlass_dtype, flat_ids, ids_align),
         _gptr(cutlass.Float32, flat_weights, 4),
-        _gptr(cutlass.Float4E2M1FN, workspace.packed_a_view),
+        _gptr(act_gptr_dtype, workspace.packed_a_view),
         workspace.sfa_ptr,
         _gptr(cutlass.Uint8, workspace.packed_a_flat),
         _gptr(cutlass.Uint8, workspace.scale_flat),
@@ -4839,9 +5182,9 @@ def _launch_dynamic(
         _gptr(cutlass.Int32, workspace.task_slice_count, 4),
         _gptr(cutlass.Int32, workspace.task_valid_rows, 4),
         _gptr(cutlass.Int32, workspace.tile_write_count, 4),
-        weights.w13_fp4,
+        _gptr(wt_gptr_dtype, weights.w13_fp4),
         weights.sfb_w13_ptr,
-        weights.down_fp4,
+        _gptr(wt_gptr_dtype, weights.down_fp4),
         weights.sfb_down_ptr,
         workspace.row_counts,
         workspace.expert_write_rows,
@@ -4887,6 +5230,7 @@ def _launch_compact_static(
     activation: str = "silu",
     quant_mode: str = "nvfp4",
     unit_scale_contract: bool = False,
+    source_format: str = "modelopt_nvfp4",
 ) -> None:
     quant_mode = _normalize_quant_mode(quant_mode)
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
@@ -4970,6 +5314,13 @@ def _launch_compact_static(
         share_input_across_experts=share_input_across_experts,
         share_expert_scales=share_expert_scales,
         quant_mode=quant_mode,
+        source_format=source_format,
+    )
+    act_gptr_dtype = _moe_activation_gptr_dtype(
+        quant_mode=quant_mode, source_format=source_format
+    )
+    wt_gptr_dtype = _moe_weight_gptr_dtype(
+        quant_mode=quant_mode, source_format=source_format
     )
     launch_ids = flat_ids
     _reset_volatile_launch_state(workspace)
@@ -4985,15 +5336,15 @@ def _launch_compact_static(
         _gptr(cutlass.BFloat16, a),
         _gptr(ids_cutlass_dtype, launch_ids, ids_align),
         _gptr(cutlass.Float32, flat_weights, 4),
-        _gptr(cutlass.Float4E2M1FN, workspace.packed_a_view),
+        _gptr(act_gptr_dtype, workspace.packed_a_view),
         workspace.sfa_ptr,
         _gptr(cutlass.Uint8, workspace.packed_a_flat),
         _gptr(cutlass.Uint8, workspace.scale_flat),
         workspace.barrier_count,
         workspace.barrier_epoch,
-        weights.w13_fp4,
+        _gptr(wt_gptr_dtype, weights.w13_fp4),
         weights.sfb_w13_ptr,
-        weights.down_fp4,
+        _gptr(wt_gptr_dtype, weights.down_fp4),
         weights.sfb_down_ptr,
         workspace.row_counts,
         workspace.active_expert_count,
@@ -5134,9 +5485,12 @@ def b12x_moe_fp4(
     _assert_reciprocal_input_scale_contract(input_scales_are_reciprocal)
     quant_mode_arg = quant_mode
     quant_mode = _normalize_quant_mode(quant_mode_arg)
-    source_format = _normalize_fp4_source_format(source_format)
     w13_layout = _normalize_w13_layout(w13_layout)
-    _validate_fp4_source_format_for_quant_mode(
+    if _is_w6a6_quant_mode(quant_mode):
+        source_format = _normalize_fp6_source_format(source_format)
+    else:
+        source_format = _normalize_fp4_source_format(source_format)
+    _validate_source_format_for_quant_mode(
         source_format=source_format,
         quant_mode=quant_mode,
     )
@@ -5160,12 +5514,29 @@ def b12x_moe_fp4(
         n = int(getattr(prepared_w4a16, "intermediate_size"))
     else:
         weight_E = w1_fp4.shape[0]
-        n = w2_fp4.shape[2] * 2  # intermediate_size
+        packed_k = _packed_moe_cols(k, quant_mode=quant_mode)
+        if _is_w6a6_quant_mode(quant_mode):
+            if k % _MXFP6_BLOCK_SIZE != 0 or k % 128 != 0:
+                raise ValueError(
+                    "W6A6 MoE requires hidden size K divisible by 128 "
+                    f"(sf_vec_size={_MXFP6_BLOCK_SIZE}), got K={k}"
+                )
+            n = _logical_moe_dim(w2_fp4.shape[2], quant_mode=quant_mode)
+            if w2_fp4.shape[1] != packed_k:
+                raise ValueError(
+                    f"expected w2 packed K dim == {packed_k}, got {w2_fp4.shape[1]}"
+                )
+        else:
+            n = w2_fp4.shape[2] * 2  # intermediate_size
         expected_w1_rows = _activation_w1_rows(activation, n)
         if w1_fp4.shape[1] != expected_w1_rows:
             raise ValueError(
                 f"expected w1_fp4.shape[1] == {expected_w1_rows} for activation "
                 f"{activation!r}, got {w1_fp4.shape[1]}"
+            )
+        if w1_fp4.shape[2] != packed_k:
+            raise ValueError(
+                f"expected w1 packed K dim == {packed_k}, got {w1_fp4.shape[2]}"
             )
     routed_rows = m * num_topk
     if apply_router_weight_on_input and quant_mode != "w4a16":
@@ -5374,6 +5745,7 @@ def b12x_moe_fp4(
                 quant_mode=quant_mode,
                 unit_scale_contract=unit_scale_contract,
                 swiglu_limit=swiglu_limit,
+                source_format=source_format,
             )
         return chunk_output
 
@@ -5394,7 +5766,7 @@ def b12x_moe_fp4(
         flat_ids = _flatten_routing_ids(topk_ids)
         flat_weights = _flatten_routing_weights(topk_weights)
 
-        wv = _get_weight_views(
+        wv = _get_moe_weight_views(
             w1_fp4,
             w1_blockscale,
             w2_fp4,
@@ -5404,12 +5776,14 @@ def b12x_moe_fp4(
             n,
             k,
             activation_spec=activation_spec,
+            quant_mode=quant_mode,
+            source_format=source_format,
         )
         input_gs = _prepare_expert_scale(a1_gscale, weight_E)
         down_input_scale = _prepare_expert_scale(a2_gscale, weight_E)
     else:
         assert isinstance(s, TPDynamicWorkspace)
-        wv = _get_weight_views(
+        wv = _get_moe_weight_views(
             w1_fp4,
             w1_blockscale,
             w2_fp4,
@@ -5419,6 +5793,8 @@ def b12x_moe_fp4(
             n,
             k,
             activation_spec=activation_spec,
+            quant_mode=quant_mode,
+            source_format=source_format,
         )
         input_gs = s.input_gs
         down_input_scale = s.down_input_scale
@@ -5469,6 +5845,7 @@ def b12x_moe_fp4(
             share_input_across_experts=(
                 quant_mode == "nvfp4" and a1_gscale.numel() == 1
             ),
+            source_format=source_format,
         )
     else:
         _launch_compact_static(
@@ -5503,8 +5880,78 @@ def b12x_moe_fp4(
             activation=activation,
             quant_mode=quant_mode,
             unit_scale_contract=unit_scale_contract,
+            source_format=source_format,
         )
     return scatter_output
+
+
+@torch._dynamo.disable
+def b12x_moe_fp6(
+    a: torch.Tensor | None = None,
+    a1_gscale: torch.Tensor | None = None,
+    w1_fp6: torch.Tensor | None = None,
+    w1_blockscale: torch.Tensor | None = None,
+    w1_alphas: torch.Tensor | None = None,
+    a2_gscale: torch.Tensor | None = None,
+    w2_fp6: torch.Tensor | None = None,
+    w2_blockscale: torch.Tensor | None = None,
+    w2_alphas: torch.Tensor | None = None,
+    topk_weights: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
+    apply_router_weight_on_input: bool = False,
+    *,
+    workspace: TPMoEWorkspace | TPMoEWorkspacePool | None = None,
+    output: torch.Tensor | None = None,
+    input_scales_are_reciprocal: bool | None = None,
+    input_scales_static: bool = False,
+    fast_math: bool | None = None,
+    activation: str = "silu",
+    unit_scale_contract: bool = False,
+    source_format: str = "mxfp6_default",
+    w13_layout: str = "w13",
+    binding: TPMoEFP4Binding | None = None,
+) -> torch.Tensor:
+    """MX-FP6 (W6A6) MoE using fused static/dynamic kernels.
+
+    Per-operand E3M2/E2M3 formats are chosen at compile time via ``source_format``
+    (default mixed: E2M3 weights, E3M2 activations). Packed K uses ``3K/4`` bytes
+    with UE8M0 scales (``sf_vec_size=32``).
+    """
+    if binding is not None:
+        if binding.quant_mode is not None and not _is_w6a6_quant_mode(
+            binding.quant_mode
+        ):
+            raise ValueError(
+                "b12x_moe_fp6 requires a W6A6 binding; got "
+                f"quant_mode={binding.quant_mode!r}"
+            )
+        if binding.quant_mode is None:
+            binding = replace(binding, quant_mode="w6a6")
+        return b12x_moe_fp4(binding=binding)
+    return b12x_moe_fp4(
+        a=a,
+        a1_gscale=a1_gscale,
+        w1_fp4=w1_fp6,
+        w1_blockscale=w1_blockscale,
+        w1_alphas=w1_alphas,
+        a2_gscale=a2_gscale,
+        w2_fp4=w2_fp6,
+        w2_blockscale=w2_blockscale,
+        w2_alphas=w2_alphas,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+        workspace=workspace,
+        output=output,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        input_scales_static=input_scales_static,
+        fast_math=fast_math,
+        activation=activation,
+        quant_mode="w6a6",
+        unit_scale_contract=unit_scale_contract,
+        source_format=source_format,
+        w13_layout=w13_layout,
+    )
 
 
 def _validate_sparse_routing(

@@ -17,6 +17,7 @@ from cutlass.cute.runtime import from_dlpack
 
 from b12x.attention._cute import ops as attention_ops
 from b12x.cute.compiler import KernelCompileSpec, launch as b12x_launch
+from b12x.attention.mxfp6_mma import _literal_qk_mma_into_sfrag_mxfp6_raw_mla
 from b12x.cute.fp4 import (
     bf16_mma_m16n16k16_f32,
     bfloat2_habs2,
@@ -2888,6 +2889,7 @@ def _compute_score_tile_scaled_from_staged_nope(
     sm_scale_log2: Float32,
     lane: Int32,
     identity_page_table: cutlass.Constexpr[bool],
+    kv_nope_dtype,
 ):
     lane_group = lane // Int32(4)
     lane_pair_base = Int32(2) * (lane % Int32(4))
@@ -2933,18 +2935,36 @@ def _compute_score_tile_scaled_from_staged_nope(
         # Compute current nope group
         frag_tmp = cute.make_rmem_tensor(frag_layout, Float32)
         _zero_score_frag(frag_tmp)
-        _literal_qk_mma_into_sfrag_mxfp8_raw(
-            frag_tmp,
-            q_base_addr,
-            kv_base_addr,
-            lane,
-            Int32(0),
-            Int32(1),
-            Int32(_MLA_NUM_MMA_KV),
-            Int32(_MLA_NOPE_QK_NUM_MMA_D),
-            Int32(_MLA_NOPE_GROUP_Q_VECS),
-            Int32(_MLA_NOPE_GROUP_KV_VECS),
-        )
+        if cutlass.const_expr(
+            kv_nope_dtype == cutlass.Float6E3M2FN
+            or kv_nope_dtype == cutlass.Float6E2M3FN
+        ):
+            _literal_qk_mma_into_sfrag_mxfp6_raw_mla(
+                frag_tmp,
+                q_base_addr,
+                kv_base_addr,
+                lane,
+                Int32(0),
+                Int32(1),
+                Int32(_MLA_NUM_MMA_KV),
+                Int32(_MLA_NOPE_QK_NUM_MMA_D),
+                Int32(_MLA_NOPE_GROUP_Q_VECS),
+                Int32(_MLA_NOPE_GROUP_KV_VECS),
+                kv_nope_dtype,
+            )
+        else:
+            _literal_qk_mma_into_sfrag_mxfp8_raw(
+                frag_tmp,
+                q_base_addr,
+                kv_base_addr,
+                lane,
+                Int32(0),
+                Int32(1),
+                Int32(_MLA_NUM_MMA_KV),
+                Int32(_MLA_NOPE_QK_NUM_MMA_D),
+                Int32(_MLA_NOPE_GROUP_Q_VECS),
+                Int32(_MLA_NOPE_GROUP_KV_VECS),
+            )
         _accumulate_scaled_score_frag(
             score_frag,
             frag_tmp,
@@ -4042,6 +4062,7 @@ def _run_one_pass_sparse_mla_tile(
     out_chunk_idx: Int32,
     lse_tensor: cute.Tensor | None,
     identity_page_table: cutlass.Constexpr[bool],
+    kv_nope_dtype,
 ):
     md_layout = cute.make_layout((1, 2), stride=(2, 1))
     frag_layout = cute.make_layout((1, _MLA_NUM_MMA_KV, 8), stride=(16, 8, 1))
@@ -4112,6 +4133,7 @@ def _run_one_pass_sparse_mla_tile(
                 sm_scale_log2,
                 lane,
                 identity_page_table,
+                kv_nope_dtype,
             )
         if has_second_head_slot:
             _update_softmax_stats_b2(score_frag, m_frag, d_frag, o_rescale_frag)
@@ -4202,6 +4224,7 @@ def _run_one_pass_sparse_mla_tile(
                     sm_scale_log2,
                     lane,
                     identity_page_table,
+                    kv_nope_dtype,
                 )
 
             # Fused softmax-stats + O-rescale + P-norm
@@ -4515,9 +4538,15 @@ def get_sparse_mla_shared_storage_cls():
 class SparseMLAKernel:
     """Single-pass sparse MLA kernel using MXFP8 MMA for nope and BF16 MMA for rope."""
 
-    def __init__(self, head_tiles: int, identity_page_table: bool = False):
+    def __init__(
+        self,
+        head_tiles: int,
+        identity_page_table: bool = False,
+        kv_nope_dtype: type = cutlass.Float8E4M3FN,
+    ):
         self.head_tiles = int(head_tiles)
         self.identity_page_table = bool(identity_page_table)
+        self.kv_nope_dtype = kv_nope_dtype
 
     @cute.jit
     def __call__(
@@ -4591,6 +4620,7 @@ class SparseMLAKernel:
             Int32(0),
             None,
             self.identity_page_table,
+            self.kv_nope_dtype,
         )
 
 @lru_cache(maxsize=16)
