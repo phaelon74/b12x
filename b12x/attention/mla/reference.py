@@ -206,6 +206,7 @@ def pack_mla_kv_cache_fp6_reference(
                     float(normalized[row, col].item()),
                     fmt,
                 )
+        # One 6-bit code per byte in the 128-byte NSA group slot (same width as FP8).
         quant_bytes.append(codes)
         scale_bytes.append(scale.view(torch.uint8).reshape(num_tokens, 4))
 

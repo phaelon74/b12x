@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import cutlass
 import pytest
 import torch
@@ -92,7 +94,8 @@ def _launch_sparse_mla_kernel_fp6(
     active_token_counts: torch.Tensor,
     output: torch.Tensor,
     kv_nope_dtype: type,
-    identity_page_table: bool = True,
+    identity_page_table: bool = False,
+    debug_qk_bf16: bool = False,
 ) -> None:
     clear_sparse_mla_kernel_cache()
     clear_compile_cache()
@@ -121,12 +124,21 @@ def _launch_sparse_mla_kernel_fp6(
         identity_page_table,
         str(kv_nope_dtype),
         str(output.dtype),
+        "1" if debug_qk_bf16 else "0",
+        os.environ.get("B12X_MLA_DEBUG_PV_BF16", "0"),
     )
     compile_spec = KernelCompileSpec.from_key(
         "attention.mla.sparse.fp6_direct",
         1,
         cache_key,
-        labels=("head_tiles", "identity_page_table", "kv_nope_dtype", "output_dtype"),
+        labels=(
+            "head_tiles",
+            "identity_page_table",
+            "kv_nope_dtype",
+            "output_dtype",
+            "debug_qk_bf16",
+            "debug_pv_bf16",
+        ),
     )
     b12x_launch(
         kernel,
@@ -147,14 +159,14 @@ def _run_fp6_case(
         device,
         seed=42 if fmt == "e3m2" else 43,
     )
-    kv_cache = pack_mla_kv_cache_fp6_reference(k_nope, k_rope, fmt=fmt)
+    kv_cache = pack_mla_kv_cache_fp6_reference(k_nope, k_rope, fmt=fmt).view(
+        torch.float8_e4m3fn
+    )
     output = torch.empty(
         (1, q_all.shape[1], _MLA_V_DIM),
         device=device,
         dtype=torch.bfloat16,
     )
-
-    import os
 
     if debug_qk_bf16:
         os.environ["B12X_MLA_DEBUG_QK_BF16"] = "1"
@@ -162,15 +174,20 @@ def _run_fp6_case(
         os.environ.pop("B12X_MLA_DEBUG_QK_BF16", None)
     os.environ.pop("B12X_MLA_DEBUG_PV_BF16", None)
 
-    _launch_sparse_mla_kernel_fp6(
-        q_all=q_all,
-        kv_cache=kv_cache,
-        page_table_1=page_table_1,
-        active_token_counts=active_token_counts,
-        output=output,
-        kv_nope_dtype=kv_nope_dtype,
-    )
-    torch.cuda.synchronize(device)
+    try:
+        _launch_sparse_mla_kernel_fp6(
+            q_all=q_all,
+            kv_cache=kv_cache,
+            page_table_1=page_table_1,
+            active_token_counts=active_token_counts,
+            output=output,
+            kv_nope_dtype=kv_nope_dtype,
+            debug_qk_bf16=debug_qk_bf16,
+        )
+        torch.cuda.synchronize(device)
+    except Exception:
+        torch.cuda.synchronize()
+        raise
 
     expected = sparse_mla_fp6_reference(
         q_all=q_all,

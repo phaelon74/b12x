@@ -16,6 +16,7 @@ from b12x.cute.fp4 import (
     bfloat2_hmax_to_f32,
     bfloat2_mul,
     broadcast_f32_to_bfloat2,
+    byte_perm,
     cvt_f32_to_ue8m0,
     frag_layout_swizzle_16b_to_8b,
     frag_layout_swizzle_16b_to_8b_trans,
@@ -592,6 +593,11 @@ def _literal_pv_mma_into_ofrag_mxfp6_scaled_mla(
         b1_k0 = frag_layout_swizzle_16b_to_8b_trans(b1_k0)
         b0_k1 = frag_layout_swizzle_16b_to_8b_trans(b0_k1)
         b1_k1 = frag_layout_swizzle_16b_to_8b_trans(b1_k1)
+        # MLA smem V layout matches mxfp8 PV (byte_perm), not the paged-attention path.
+        b01_k0 = byte_perm(b0_k0, b1_k0, Int32(0x5410))
+        b23_k0 = byte_perm(b0_k0, b1_k0, Int32(0x7632))
+        b01_k1 = byte_perm(b0_k1, b1_k1, Int32(0x5410))
+        b23_k1 = byte_perm(b0_k1, b1_k1, Int32(0x7632))
 
         if cutlass.const_expr(kv_dtype == cutlass.Float6E3M2FN):
             d0, d1, d2, d3 = mxfp6_mma_m16n8k32_f32_e3m2_e3m2(
@@ -603,8 +609,8 @@ def _literal_pv_mma_into_ofrag_mxfp6_scaled_mla(
                 a_regs[0, 1],
                 a_regs[0, 2],
                 a_regs[0, 3],
-                b0_k0,
-                b0_k1,
+                b01_k0,
+                b01_k1,
                 sfa,
                 unit_scale,
             )
@@ -617,8 +623,8 @@ def _literal_pv_mma_into_ofrag_mxfp6_scaled_mla(
                 a_regs[0, 1],
                 a_regs[0, 2],
                 a_regs[0, 3],
-                b1_k0,
-                b1_k1,
+                b23_k0,
+                b23_k1,
                 sfa,
                 unit_scale,
             )
@@ -632,8 +638,8 @@ def _literal_pv_mma_into_ofrag_mxfp6_scaled_mla(
                 a_regs[0, 1],
                 a_regs[0, 2],
                 a_regs[0, 3],
-                b0_k0,
-                b0_k1,
+                b01_k0,
+                b01_k1,
                 sfa,
                 unit_scale,
             )
@@ -646,8 +652,8 @@ def _literal_pv_mma_into_ofrag_mxfp6_scaled_mla(
                 a_regs[0, 1],
                 a_regs[0, 2],
                 a_regs[0, 3],
-                b1_k0,
-                b1_k1,
+                b23_k0,
+                b23_k1,
                 sfa,
                 unit_scale,
             )
