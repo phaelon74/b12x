@@ -55,8 +55,9 @@ _SMALL_M_QUANT_MAX = 16
 # (q/k/v views, residual chains), and during CUDA-graph capture a fresh
 # allocation lands in the graph's private pool — exactly where per-graph
 # output buffers belong. Kill-switch for A/B runs: SPARKINFER_DENSE_PERSISTENT_SCRATCH=0.
-# SPARKINFER_DENSE_PER_ROW_GS=0 disables per-row activation global scale (m>1 unfused
-# paths) for A/B against the legacy per-tensor path. Default on.
+# SPARKINFER_DENSE_PER_ROW_GS=0 disables per-row activation global scale
+# (all unfused paths plus the fused m=1 prologue) for A/B against the legacy
+# per-tensor path. Default on.
 _DENSE_PER_ROW_GS = os.getenv("SPARKINFER_DENSE_PER_ROW_GS", "1").lower() not in (
     "0",
     "false",
@@ -442,7 +443,22 @@ def dense_fp6_linear_expanded(
     # 3. Quantize with a unit activation global scale (1.0)
     # 4. GEMM (alpha accounts only for the quantizer's internal gs and w_gs)
     # 5. Post-multiply by per-row correction to undo the pre-scaling
-    _per_row = _DENSE_PER_ROW_GS and not _fused_quant and m > 1
+    #
+    # m == 1 MUST take this path too (for one row per-row == per-tensor in
+    # scope, but NOT in rounding): the pre-scale rounds ``x * gs`` through
+    # BF16 and undoes it with a BF16 post-multiply, while the small-M
+    # kernel's fused per-tensor gs is applied directly in FP32. The two
+    # rounding chains are not bit-equivalent, so an exempted m=1 breaks the
+    # bit-exact row-independence contract vs the m=128 rows
+    # (test_small_m_linear_end_to_end_bit_exact / test_small_m_matches_
+    # padded_rows). With the pre-scale, the row amax becomes exactly
+    # mx_gs_numerator (a BF16-representable value), the small-M kernel's
+    # in-kernel gs collapses to exactly 1.0, and its alpha equals the
+    # unfused torch.reciprocal(1 * w_gs) — bit-identical end to end.
+    # The fused m=1 prologue quantizes the (pre-scaled) x_bf16 with the
+    # same in-kernel per-tensor gs (== 1.0), so it stays bit-identical to
+    # the unfused small-M path as well.
+    _per_row = _DENSE_PER_ROW_GS and m > 0 and (not _fused_quant or m == 1)
     if _per_row:
         _num = mx_gs_numerator(a_fmt)
         a_amax_pr = x.abs().amax(dim=1, keepdim=True).float()      # (m, 1)
@@ -453,8 +469,12 @@ def dense_fp6_linear_expanded(
         a_gs_pr = None
 
     if _fused_quant:
-        # Phase 4.1 fused path — still per-tensor (producer warp quantises
-        # directly in smem; per-row would require a kernel change).
+        # Phase 4.1 fused path — the producer warp quantises directly in
+        # smem with an in-kernel per-tensor gs. At m=1 with per-row GS the
+        # host pre-scale above already ran, so the kernel's amax scan sees
+        # exactly mx_gs_numerator and its gs/alpha collapse to 1.0 / 1/w_gs
+        # — same math as the unfused per-row m=1 path. For m>1 fused stays
+        # per-tensor (per-row would require a kernel change).
         a_amax = x.float().abs().amax().reshape(1)
         a_gs = mx_gs_numerator(a_fmt) / a_amax.clamp_min_(1e-6)
         w_gs = global_scale.to(torch.float32).reshape(1)
@@ -471,9 +491,12 @@ def dense_fp6_linear_expanded(
                 m_pad * k // 32, dtype=torch.uint8, device=device
             )
     elif m <= _SMALL_M_QUANT_MAX:
-        # For _per_row: x is already pre-scaled, kernel's gs ≈ 1.0.
-        # For m=1: single row, no batch-composition dependence; unchanged.
-        # Both pass global_scale so alpha = 1/(gs * w_gs) is correct.
+        # For _per_row (m >= 1): x is already pre-scaled, so the kernel's
+        # in-kernel gs is exactly 1.0 (the pre-scaled row amax is exactly
+        # mx_gs_numerator) and its alpha = 1/(1 * w_gs) matches the padded
+        # TMA branch's torch.reciprocal(gs_unit * global_scale) bit-for-bit.
+        # Passing global_scale keeps alpha = 1/(gs * w_gs) correct on the
+        # per-row-disabled A/B path as well.
         a_codes, a_scale, alpha = _quantize_matrix_fp6_bytes_small_m(
             x, a_fmt, global_scale, m_pad
         )
