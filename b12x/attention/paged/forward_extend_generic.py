@@ -50,6 +50,11 @@ from b12x.cute.fp4 import (
     st_shared_v4_u32,
 )
 
+from b12x.attention.mxfp6_mma import (
+    _literal_pv_mma_into_ofrag_mxfp6_raw_paged,
+    _literal_qk_mma_into_sfrag_mxfp6_raw_paged,
+)
+
 from .traits import PagedForwardTraits
 
 
@@ -2220,6 +2225,11 @@ class PagedForwardKernel:
         self.window_left = int(window_left)
         self.has_attention_sink_bias = bool(has_attention_sink_bias)
         self.kv_is_fp8 = dtype_kv == cutlass.Float8E4M3FN
+        self.kv_is_fp6 = dtype_kv in (
+            cutlass.Float6E3M2FN,
+            cutlass.Float6E2M3FN,
+        )
+        self.kv_is_mx_quantized = self.kv_is_fp8 or self.kv_is_fp6
         self.vec_size = traits.head_dim_vo // 32
         self.total_warps = traits.num_warps_q * traits.num_warps_kv
         self.stage_tile_rows = traits.cta_tile_kv
@@ -2229,7 +2239,7 @@ class PagedForwardKernel:
         ) * (dtype_kv_storage.width // 8)
         self.num_stages = (
             1
-            if traits.num_warps_kv > 1 or self.kv_is_fp8
+            if traits.num_warps_kv > 1 or self.kv_is_mx_quantized
             else (2 if q_stage_bytes + 2 * kv_stage_bytes <= traits.max_smem_per_threadblock else 1)
         )
         base_use_paged_kv_tma_extend = (
@@ -2360,9 +2370,23 @@ class PagedForwardKernel:
             and traits.head_dim_qk % 32 == 0
             and traits.num_mma_d_qk % 2 == 0
         )
+        self.use_native_fp6_qk_mma = (
+            use_native_fp8_qk
+            and self.kv_is_fp6
+            and dtype_q == cutlass.BFloat16
+            and traits.head_dim_qk % 32 == 0
+            and traits.num_mma_d_qk % 2 == 0
+        )
         self.use_native_fp8_pv_mma = (
             use_native_fp8_pv
             and self.kv_is_fp8
+            and dtype_q == cutlass.BFloat16
+            and traits.num_warps_kv == 1
+            and traits.num_mma_kv % 2 == 0
+        )
+        self.use_native_fp6_pv_mma = (
+            use_native_fp8_pv
+            and self.kv_is_fp6
             and dtype_q == cutlass.BFloat16
             and traits.num_warps_kv == 1
             and traits.num_mma_kv % 2 == 0
@@ -2689,7 +2713,13 @@ class PagedForwardKernel:
         del split_kv
         if dtype_q not in (cutlass.Float16, cutlass.BFloat16):
             return False
-        if dtype_kv not in (cutlass.Float16, cutlass.BFloat16, cutlass.Float8E4M3FN):
+        if dtype_kv not in (
+            cutlass.Float16,
+            cutlass.BFloat16,
+            cutlass.Float8E4M3FN,
+            cutlass.Float6E3M2FN,
+            cutlass.Float6E2M3FN,
+        ):
             return False
         if dtype_kv_storage not in (cutlass.Float16, cutlass.BFloat16, cutlass.Uint8):
             return False
@@ -3995,7 +4025,32 @@ class PagedForwardKernel:
             subtile_base = Int32(0) if const_expr(self.traits.num_warps_kv == 1) else warp_kv_base
             for _ in cutlass.range_constexpr(1):
                 p_frag.fill(Uint32(0))
-                if const_expr(self.use_native_fp8_qk_mma):
+                if const_expr(self.use_native_fp6_qk_mma):
+                    k_smem_base_addr = shared_ptr_to_u32(sKStageBytes.iterator + Int32(consume_stage_idx * k_stage_bytes))
+                    frag_S = cute.make_rmem_tensor(
+                        cute.make_layout(
+                            (num_mma_q, num_mma_kv, 8),
+                            stride=(num_mma_kv * 8, 8, 1),
+                        ),
+                        Float32,
+                    )
+                    frag_S.fill(0.0)
+                    _literal_qk_mma_into_sfrag_mxfp6_raw_paged(
+                        frag_S,
+                        q_smem_base_addr,
+                        k_smem_base_addr,
+                        lane,
+                        warp_q_idx,
+                        warp_kv_idx,
+                        Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
+                        num_mma_q,
+                        num_mma_kv,
+                        self.traits.num_mma_d_qk,
+                        tc_upcast_stride_qk,
+                        self.traits.upcast_stride_k,
+                        self.dtype_kv,
+                    )
+                elif const_expr(self.use_native_fp8_qk_mma):
                     k_smem_base_addr = shared_ptr_to_u32(sKStageBytes.iterator + Int32(consume_stage_idx * k_stage_bytes))
                     frag_S = cute.make_rmem_tensor(
                         cute.make_layout(
@@ -4555,7 +4610,25 @@ class PagedForwardKernel:
                         )
                     _exit_thread()
 
-                if const_expr(self.use_native_fp8_pv_mma):
+                if const_expr(self.use_native_fp6_pv_mma):
+                    v_smem_base_addr = shared_ptr_to_u32(
+                        sVStageBytes.iterator + Int32(consume_stage_idx * v_stage_bytes)
+                    )
+                    _literal_pv_mma_into_ofrag_mxfp6_raw_paged(
+                        o_frag,
+                        p_frag,
+                        v_smem_base_addr,
+                        lane,
+                        warp_kv_idx,
+                        Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
+                        num_mma_q,
+                        num_mma_kv,
+                        num_mma_d_vo,
+                        self.traits.upcast_stride_v,
+                        v_scale,
+                        self.dtype_kv,
+                    )
+                elif const_expr(self.use_native_fp8_pv_mma):
                     v_smem_base_addr = shared_ptr_to_u32(sVStageBytes.iterator + Int32(consume_stage_idx * v_stage_bytes))
                     _literal_pv_mma_into_ofrag_mxfp8_raw(
                         o_frag,

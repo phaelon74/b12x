@@ -291,6 +291,24 @@ def ld_global_v4_u32(
     return Uint32(v0), Uint32(v1), Uint32(v2), Uint32(v3)
 
 
+@dsl_user_op
+def u32_as_f32(value: Uint32, *, loc=None, ip=None) -> Float32:
+    """Bitcast a uint32 to float32 (mov.b32; no numeric conversion)."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Uint32(value).ir_value(loc=loc, ip=ip)],
+            "mov.b32 $0, $1;",
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
 # =============================================================================
 # PTX Intrinsics - Non-Coherent Global Loads
 # =============================================================================
@@ -822,6 +840,24 @@ def st_shared_u8(smem_addr: Int32, value: Uint8, *, loc=None, ip=None):
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def ld_shared_u8(smem_addr: Int32, *, loc=None, ip=None) -> Uint8:
+    """Load 8 bits from shared memory. smem_addr is a u32 shared-memory address."""
+    return Uint8(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+            "ld.shared.u8 $0, [$1];",
+            "=r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
     )
 
 
@@ -1397,6 +1433,51 @@ def scatter_add_bf16x2(addr: Int64, val0_f32, val1_f32, *, loc=None, ip=None):
         ],
         "{ .reg .b32 packed; cvt.rn.satfinite.bf16x2.f32 packed, $2, $1; red.relaxed.gpu.global.add.noftz.bf16x2 [$0], packed; }",
         "l,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def store_bf16x2(addr: Int64, val0_f32, val1_f32, *, loc=None, ip=None):
+    """Non-atomic BF16x2 store: packs two f32 → bf16x2, plain store."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            val0_f32.ir_value(loc=loc, ip=ip),
+            val1_f32.ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .b32 packed;"
+        " cvt.rn.satfinite.bf16x2.f32 packed, $2, $1;"
+        " st.global.b32 [$0], packed; }",
+        "l,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def store_v4_bf16x2(addr: Int64, v0, v1, v2, v3, v4, v5, v6, v7, *, loc=None, ip=None):
+    """Non-atomic vectorized BF16x2 store: 8 bf16 values (16 bytes), plain store."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            v0.ir_value(loc=loc, ip=ip), v1.ir_value(loc=loc, ip=ip),
+            v2.ir_value(loc=loc, ip=ip), v3.ir_value(loc=loc, ip=ip),
+            v4.ir_value(loc=loc, ip=ip), v5.ir_value(loc=loc, ip=ip),
+            v6.ir_value(loc=loc, ip=ip), v7.ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .b32 p0,p1,p2,p3;"
+        " cvt.rn.satfinite.bf16x2.f32 p0, $2, $1;"
+        " cvt.rn.satfinite.bf16x2.f32 p1, $4, $3;"
+        " cvt.rn.satfinite.bf16x2.f32 p2, $6, $5;"
+        " cvt.rn.satfinite.bf16x2.f32 p3, $8, $7;"
+        " st.global.v4.b32 [$0], {p0, p1, p2, p3}; }",
+        "l,f,f,f,f,f,f,f,f",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,

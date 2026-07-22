@@ -50,6 +50,12 @@ from b12x.cute.fp4 import (
     warp_reduce,
 )
 from b12x.cute.fp4 import scatter_add_bf16x2
+from b12x.cute.warp_mma_compat import MmaMXF8Op as _MmaMXF8Op
+from b12x.moe.fused.mxfp6_moe import (
+    moe_emit_mma_k_block,
+    moe_mxfp6_quantize_input_block_containers,
+    moe_mxfp6_store_expanded_global,
+)
 
 
 _SF_VEC_SIZE = 16
@@ -68,10 +74,20 @@ class _MoEStaticKernelBase:
         fast_math: bool = False,
         activation: str = "silu",
         dynamic_down_scale: bool = False,
+        mxfp6_fmt_a: str | None = None,
+        mxfp6_fmt_b: str | None = None,
+        deterministic_scatter: bool = False,
     ):
         if activation not in {"silu", "relu2"}:
             raise ValueError(f"unsupported activation {activation!r}")
         self._dense_cls = DenseGemmKernel
+        # When set ("e3m2"/"e2m3") the A/B operands are MX-FP6 codes carried in
+        # Float8E4M3FN byte-containers: the kernel runs the MXFP8 smem/TMA/
+        # ldmatrix machinery and only the mainloop MMA is emitted as the inline
+        # ``mxf8f6f4`` FP6 instruction (cutlass has no working 6-bit smem layout).
+        # fmt_a/fmt_b may differ (mxfp6_default => e3m2 activations, e2m3 weights).
+        self.mxfp6_fmt_a = mxfp6_fmt_a
+        self.mxfp6_fmt_b = mxfp6_fmt_b
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
         self.exact_mma_m_tiles = exact_mma_m_tiles
@@ -79,6 +95,8 @@ class _MoEStaticKernelBase:
         self.activation = activation
         self.is_gated = activation == "silu"
         self.dynamic_down_scale = dynamic_down_scale
+        self.deterministic_scatter = deterministic_scatter
+        self._mma_tiler_mn = mma_tiler_mn
         tile_k = sf_vec_size * 8
         self.tile_shape_mnk = (mma_tiler_mn[0], mma_tiler_mn[1], tile_k)
         self.sa_tile_shape_mk = (max(128, mma_tiler_mn[0]), tile_k)
@@ -207,18 +225,61 @@ class _MoEStaticKernelBase:
         return offset
 
     def _setup_attributes(self):
-        import cutlass.utils.blackwell_helpers as sm120_utils
+        import b12x.cute.sm120_compat as sm120_utils
 
-        mma_op = cute.nvgpu.warp.MmaMXF4NVF4Op(
-            self.a_dtype,
-            self.acc_dtype,
-            self.sf_dtype,
-        )
-        atom_layout = cute.make_layout((2, 2, 1))
+        if cutlass.const_expr(self.mxfp6_fmt_a is not None):
+            tile_k = self.sf_vec_size * 4
+            self.tile_shape_mnk = (
+                self._mma_tiler_mn[0],
+                self._mma_tiler_mn[1],
+                tile_k,
+            )
+            self.sa_tile_shape_mk = (max(128, self._mma_tiler_mn[0]), tile_k)
+            self.sfa_tile_shape_mk = (max(128, self._mma_tiler_mn[0]), tile_k)
+            self.sfb_tile_shape_nk = (max(128, self._mma_tiler_mn[1]), tile_k)
+            mma_op = _MmaMXF8Op(
+                cutlass.Float8E4M3FN,
+                self.acc_dtype,
+                self.sf_dtype,
+            )
+            # 4 MMA warps in a 2x2 (M,N) quadrant split (see warp_m_base/
+            # warp_n_base), so the tiled MMA atom layout must be (2,2,1) = 4 atom
+            # positions. The previous (4,2,1) describes 8 atom positions (the
+            # dense path uses it WITH 8 warps); with only 4 warps it left each
+            # thread's accumulator half-sized -> only half the N columns of FC1/
+            # FC2 were ever computed (16-on/16-off output). num_m_tiles must then
+            # be M//(16*2) so num_m_tiles*atom_m*16 == tile_M (matches FP4).
+            atom_layout = cute.make_layout((2, 2, 1))
+            use_perm_k = True
+            self.num_m_tiles = self.tile_shape_mnk[0] // (16 * 2)
+            self.num_n_tiles = self.tile_shape_mnk[1] // (8 * 2)
+            self.num_k_blocks = self.tile_shape_mnk[2] // 32
+        else:
+            tile_k = self.sf_vec_size * 8
+            self.tile_shape_mnk = (
+                self._mma_tiler_mn[0],
+                self._mma_tiler_mn[1],
+                tile_k,
+            )
+            self.sa_tile_shape_mk = (max(128, self._mma_tiler_mn[0]), tile_k)
+            self.sfa_tile_shape_mk = (max(128, self._mma_tiler_mn[0]), tile_k)
+            self.sfb_tile_shape_nk = (max(128, self._mma_tiler_mn[1]), tile_k)
+            mma_op = cute.nvgpu.warp.MmaMXF4NVF4Op(
+                self.a_dtype,
+                self.acc_dtype,
+                self.sf_dtype,
+            )
+            atom_layout = cute.make_layout((2, 2, 1))
+            use_perm_k = False
+            m_tile_divisor = 2 if self.exact_mma_m_tiles else 4
+            self.num_m_tiles = self.tile_shape_mnk[0] // (16 * m_tile_divisor)
+            self.num_n_tiles = self.tile_shape_mnk[1] // (8 * 2)
+            self.num_k_blocks = self.tile_shape_mnk[2] // 64
+
         permutation_mnk = sm120_utils.get_permutation_mnk(
             self.tile_shape_mnk,
             self.sf_vec_size,
-            False,
+            use_perm_k,
         )
         self.tiled_mma = cute.make_tiled_mma(
             mma_op,
@@ -226,11 +287,11 @@ class _MoEStaticKernelBase:
             permutation_mnk=permutation_mnk,
         )
         self.mma_atom = cute.make_mma_atom(mma_op)
+        # Op descriptor kept for per-emission fresh-atom creation in the FP4
+        # MMA path (see moe_emit_fp4_mma) — avoids threading a single atom's
+        # SSA value across dynamic scf regions (MLIR dominance ICE).
+        self.mma_op = mma_op
         self.cta_layout_mnk = cute.make_layout(self.cluster_shape_mnk)
-        m_tile_divisor = 2 if self.exact_mma_m_tiles else 4
-        self.num_m_tiles = self.tile_shape_mnk[0] // (16 * m_tile_divisor)
-        self.num_n_tiles = self.tile_shape_mnk[1] // (8 * 2)
-        self.num_k_blocks = self.tile_shape_mnk[2] // 64
 
         sfa_smem = sm120_make_smem_layout_sfa(
             self.tiled_mma,
@@ -363,6 +424,9 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
         share_input_across_experts: bool = False,
         share_expert_scales: bool = False,
         dynamic_down_scale: bool = False,
+        mxfp6_fmt_a: str | None = None,
+        mxfp6_fmt_b: str | None = None,
+        deterministic_scatter: bool = False,
     ):
         super().__init__(
             sf_vec_size,
@@ -372,6 +436,9 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
             fast_math=fast_math,
             activation=activation,
             dynamic_down_scale=dynamic_down_scale,
+            mxfp6_fmt_a=mxfp6_fmt_a,
+            mxfp6_fmt_b=mxfp6_fmt_b,
+            deterministic_scatter=deterministic_scatter,
         )
         self.single_token = single_token
         self.share_input_across_experts = share_input_across_experts
@@ -536,8 +603,6 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
         token_weights: cute.Tensor,
     ):
         """Kernel entry point."""
-        from cutlass.cute.nvgpu.warp.mma import Field as WarpField
-
         tidx, _, _ = cute.arch.thread_idx()
         bidx, bidy, bidz = cute.arch.block_idx()
         _, _, gdim_z = cute.arch.grid_dim()
@@ -678,7 +743,6 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
 
         sA = storage.sA.get_tensor(a_smem_staged.outer, swizzle=a_smem_staged.inner)
         sB = storage.sB.get_tensor(b_smem_staged.outer, swizzle=b_smem_staged.inner)
-        sA_in_u8 = cute.recast_tensor(sA, cutlass.Uint8)
         sB_u8 = cute.recast_tensor(sB, cutlass.Uint8)
         sSFA = storage.sSFA.get_tensor(sfa_smem_staged)
         sSFB = storage.sSFB.get_tensor(sfb_smem_staged)
@@ -696,6 +760,7 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
             epi_smem_staged.outer, swizzle=epi_smem_staged.inner,
         )
         sfa_base_addr = shared_ptr_to_u32(storage.sSFA.data_ptr())
+        sa_base_addr = shared_ptr_to_u32(storage.sA.data_ptr())
         reduce_scratch_addr = shared_ptr_to_u32(storage.reduce_scratch.data_ptr())
         ctrl_base_addr = shared_ptr_to_u32(storage.ctrl.data_ptr())
         scatter_tok_base_addr = shared_ptr_to_u32(storage.scatter_tok_cache.data_ptr())
@@ -704,9 +769,22 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
         num_tokens = Int32(a_input.shape[0])
         cols = Int32(a_input.shape[1])
         num_experts = Int32(row_counts.shape[0])
-        sf_blocks_per_row = cols // Int32(16)
+        if cutlass.const_expr(self.mxfp6_fmt_a is not None):
+            sf_blocks_per_row = cols // Int32(32)
+            quant_block_elems = Int32(32)
+            # Expanded byte-container layout: one FP6 code per byte, so a 32-elem
+            # block occupies 32 bytes and a row occupies K bytes (mirrors the
+            # dense Float8E4M3FN container store), not the 3:4-packed 24/96.
+            packed_bytes_per_sf_block = Int32(32)
+            output_bytes_per_row = cols
+            num_k_tiles = (cols + Int32(127)) // Int32(128)
+        else:
+            sf_blocks_per_row = cols // Int32(16)
+            quant_block_elems = Int32(16)
+            packed_bytes_per_sf_block = Int32(8)
+            output_bytes_per_row = cols // Int32(2)
+            num_k_tiles = (cols + Int32(63)) // Int32(64)
         padded_sf_cols = ((cols + Int32(63)) // Int32(64)) * Int32(4)
-        output_bytes_per_row = cols // Int32(2)
         max_rows = Int32(token_map.shape[1])
         total_pairs = Int32(topk_ids.shape[0])
         num_topk = total_pairs // num_tokens
@@ -714,7 +792,6 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
         num_global_experts = Int32(global_to_local_expert.shape[0])
         flat_tid = Int32(bidz) * Int32(self.threads_per_cta) + Int32(tidx)
         flat_stride = Int32(gdim_z) * Int32(self.threads_per_cta)
-        num_k_tiles = (cols + Int32(63)) // Int32(64)
 
         # Phase 0: cooperative init — zero row_counts and scatter_output
         if cutlass.const_expr(not self.single_token):
@@ -789,7 +866,17 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
                         Int32(1),
                     )
                     map_idx = local_expert_id * max_rows + row
-                    st_global_i32(get_ptr_as_int64(token_map, map_idx), token_idx)
+                    # Deterministic mode records the routed PAIR index (token *
+                    # num_topk + slot) instead of the token: the host combine
+                    # then places each staging row into a canonical (token,
+                    # slot) position and sums slots in fixed order. Physical
+                    # row assignment races (atomic row/local-expert counters)
+                    # permute rows run-to-run; a canonical summation order is
+                    # required for bit-identical FP32 accumulation.
+                    if cutlass.const_expr(self.deterministic_scatter):
+                        st_global_i32(get_ptr_as_int64(token_map, map_idx), pair_idx)
+                    else:
+                        st_global_i32(get_ptr_as_int64(token_map, map_idx), token_idx)
                     st_global_f32(get_ptr_as_int64(token_weights, map_idx), weight)
                     st_shared_i32(ctrl_base_addr + Int32(0), local_expert_id)
                     st_shared_i32(ctrl_base_addr + Int32(4), row)
@@ -814,29 +901,59 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
                 gs_value = input_global_scale[scale_idx].to(cutlass.Float32)
                 sf_idx = Int32(tidx)
                 while sf_idx < sf_blocks_per_row:
-                    block_start = sf_idx * Int32(16)
-                    values = cute.make_rmem_tensor((16,), cutlass.Float32)
-                    block_max = cutlass.Float32(0.0)
-                    for elem_idx in cutlass.range_constexpr(16):
-                        value = cutlass.Float32(a_input[token_idx, block_start + Int32(elem_idx)])
-                        values[elem_idx] = value
-                        block_max = fmax_f32(block_max, fabs_f32(value))
-                    packed64 = Uint64(0)
-                    scale_byte = Uint8(0)
-                    if cutlass.const_expr(self.is_gated):
-                        if self.fast_math:
-                            packed64, scale_byte = quantize_block_fp4_fast(values, block_max, gs_value)
-                        else:
-                            packed64, scale_byte = quantize_block_fp4(values, block_max, gs_value)
+                    block_start = sf_idx * quant_block_elems
+                    if cutlass.const_expr(self.mxfp6_fmt_a is not None):
+                        values = cute.make_rmem_tensor((32,), cutlass.Float32)
+                        block_max = cutlass.Float32(0.0)
+                        for elem_idx in cutlass.range_constexpr(32):
+                            value = cutlass.Float32(
+                                a_input[token_idx, block_start + Int32(elem_idx)]
+                            )
+                            values[elem_idx] = value
+                            block_max = fmax_f32(block_max, fabs_f32(value))
+                        containers, scale_byte = moe_mxfp6_quantize_input_block_containers(
+                            values, block_max, gs_value, self.mxfp6_fmt_a,
+                        )
+                        output_offset = (
+                            packed_local_expert_id * max_rows * output_bytes_per_row
+                            + packed_row * output_bytes_per_row
+                            + sf_idx * packed_bytes_per_sf_block
+                        )
+                        moe_mxfp6_store_expanded_global(
+                            packed_a_storage, output_offset, containers,
+                        )
                     else:
-                        packed64, scale_byte = quantize_block_fp4(values, block_max, gs_value)
-
-                    output_offset = (
-                        packed_local_expert_id * max_rows * output_bytes_per_row
-                        + packed_row * output_bytes_per_row
-                        + sf_idx * Int32(8)
-                    )
-                    st_global_u64(get_ptr_as_int64(packed_a_storage, output_offset), packed64)
+                        values = cute.make_rmem_tensor((16,), cutlass.Float32)
+                        block_max = cutlass.Float32(0.0)
+                        for elem_idx in cutlass.range_constexpr(16):
+                            value = cutlass.Float32(
+                                a_input[token_idx, block_start + Int32(elem_idx)]
+                            )
+                            values[elem_idx] = value
+                            block_max = fmax_f32(block_max, fabs_f32(value))
+                        packed64 = Uint64(0)
+                        scale_byte = Uint8(0)
+                        if cutlass.const_expr(self.is_gated):
+                            if self.fast_math:
+                                packed64, scale_byte = quantize_block_fp4_fast(
+                                    values, block_max, gs_value,
+                                )
+                            else:
+                                packed64, scale_byte = quantize_block_fp4(
+                                    values, block_max, gs_value,
+                                )
+                        else:
+                            packed64, scale_byte = quantize_block_fp4(
+                                values, block_max, gs_value,
+                            )
+                        output_offset = (
+                            packed_local_expert_id * max_rows * output_bytes_per_row
+                            + packed_row * output_bytes_per_row
+                            + sf_idx * packed_bytes_per_sf_block
+                        )
+                        st_global_u64(
+                            get_ptr_as_int64(packed_a_storage, output_offset), packed64,
+                        )
 
                     m_tile_idx = packed_row // Int32(32 * 4)
                     k_tile_idx = sf_idx // Int32(4)
@@ -1097,7 +1214,20 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
                         tok = Int32(0)
                         wv = cutlass.Float32(0.0)
                         if cache_row < valid_tile_rows:
-                            tok = token_map[local_expert_idx, tile_m_base + cache_row].to(Int32)
+                            # Deterministic mode scatters each (expert, row,
+                            # intermediate_slice) partial to its own unique
+                            # staging row: FC2 adds one PARTIAL contribution per
+                            # intermediate slice (K-split), so rows must be
+                            # split per slice too — exactly one atomic add per
+                            # location makes the (unchanged) scatter_add
+                            # epilogue bit-deterministic. The host sums slices
+                            # and topk slots in canonical order.
+                            if cutlass.const_expr(self.deterministic_scatter):
+                                tok = (
+                                    local_expert_idx * max_rows + tile_m_base + cache_row
+                                ) * Int32(self.output_tile_count_n) + intermediate_slice
+                            else:
+                                tok = token_map[local_expert_idx, tile_m_base + cache_row].to(Int32)
                             wv = token_weights[local_expert_idx, tile_m_base + cache_row].to(cutlass.Float32)
                         st_shared_i32(scatter_tok_base_addr + cache_row * Int32(4), tok)
                         st_shared_f32(scatter_weight_base_addr + cache_row * Int32(4), wv)
@@ -1132,7 +1262,16 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
                 unique_tok = Int32(0)
                 unique_wv = cutlass.Float32(0.0)
                 if cutlass.const_expr(self.single_token):
-                    unique_tok = local_expert_idx // num_topk
+                    if cutlass.const_expr(self.deterministic_scatter):
+                        # One unique staging row per (expert, intermediate
+                        # slice): FC2 adds one partial per slice, so each
+                        # slice needs its own row. Host sums slices then
+                        # experts in canonical order (m == 1).
+                        unique_tok = (
+                            local_expert_idx * max_rows
+                        ) * Int32(self.output_tile_count_n) + intermediate_slice
+                    else:
+                        unique_tok = local_expert_idx // num_topk
                     unique_wv = topk_weights[local_expert_idx].to(cutlass.Float32)
 
                 epi_rest_m = self.tile_shape_mnk[0] // self.epi_tile[0]
@@ -1180,28 +1319,38 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
                             fz_csSFB_p = cute.filter_zeros(csSFB_p)
                             ml_pipeline.consumer_wait(cons_state, peek)
                         if cutlass.const_expr(self.is_gated):
-                            for _mt in range(self.num_m_tiles):
-                                for _nt in range(self.num_n_tiles):
-                                    mma_atom.set(WarpField.SFA, tCrSFA_tile[None, _mt, k_block_idx].iterator)
-                                    mma_atom.set(WarpField.SFB, tCrSFB_tile[None, _nt, k_block_idx].iterator)
-                                    cute.gemm(
-                                        mma_atom,
-                                        gate_acc[None, _mt, _nt],
-                                        tCrA_tile[None, _mt, k_block_idx],
-                                        tCrB[None, _nt, k_block_idx],
-                                        gate_acc[None, _mt, _nt],
+                            # constexpr (unrolled) like the non-gated path below; the
+                            # FP4 mma_atom.set inside is fragile in dynamic regions.
+                            for _mt in cutlass.range_constexpr(self.num_m_tiles):
+                                for _nt in cutlass.range_constexpr(self.num_n_tiles):
+                                    moe_emit_mma_k_block(
+                                        self.mma_op,
+                                        gate_acc,
+                                        tCrA_tile,
+                                        tCrB,
+                                        tCrSFA_tile,
+                                        tCrSFB_tile,
+                                        _mt,
+                                        _nt,
+                                        k_block_idx,
+                                        self.mxfp6_fmt_a,
+                                        self.mxfp6_fmt_b,
                                     )
                         else:
                             for _mt in cutlass.range_constexpr(fc1_m_tiles):
                                 for _nt in cutlass.range_constexpr(fc1_n_tiles):
-                                    mma_atom.set(WarpField.SFA, tCrSFA_tile[None, _mt, k_block_idx].iterator)
-                                    mma_atom.set(WarpField.SFB, tCrSFB_tile[None, _nt, k_block_idx].iterator)
-                                    cute.gemm(
-                                        mma_atom,
-                                        gate_acc[None, _mt, _nt],
-                                        tCrA_tile[None, _mt, k_block_idx],
-                                        tCrB[None, _nt, k_block_idx],
-                                        gate_acc[None, _mt, _nt],
+                                    moe_emit_mma_k_block(
+                                        self.mma_op,
+                                        gate_acc,
+                                        tCrA_tile,
+                                        tCrB,
+                                        tCrSFA_tile,
+                                        tCrSFB_tile,
+                                        _mt,
+                                        _nt,
+                                        k_block_idx,
+                                        self.mxfp6_fmt_a,
+                                        self.mxfp6_fmt_b,
                                     )
                         cute.copy(smem_copy_A, csA_p[None, None, k_next], crA_tile[None, None, k_next])
                         cute.copy(smem_copy_B, csB_p[None, None, k_next], crB[None, None, k_next])
@@ -1220,28 +1369,36 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
                         cute.copy(smem_copy_SFA, fz_csSFA_p[None, None, k_next], fz_crSFA[None, None, k_next])
                         cute.copy(smem_copy_SFB, fz_csSFB_p[None, None, k_next], fz_crSFB[None, None, k_next])
                     if cutlass.const_expr(self.is_gated):
-                        for _mt in range(self.num_m_tiles):
-                            for _nt in range(self.num_n_tiles):
-                                mma_atom.set(WarpField.SFA, tCrSFA_tile[None, _mt, k_block_idx].iterator)
-                                mma_atom.set(WarpField.SFB, tCrSFB_tile[None, _nt, k_block_idx].iterator)
-                                cute.gemm(
-                                    mma_atom,
-                                    gate_acc[None, _mt, _nt],
-                                    tCrA_tile[None, _mt, k_block_idx],
-                                    tCrB[None, _nt, k_block_idx],
-                                    gate_acc[None, _mt, _nt],
+                        for _mt in cutlass.range_constexpr(self.num_m_tiles):
+                            for _nt in cutlass.range_constexpr(self.num_n_tiles):
+                                moe_emit_mma_k_block(
+                                    self.mma_op,
+                                    gate_acc,
+                                    tCrA_tile,
+                                    tCrB,
+                                    tCrSFA_tile,
+                                    tCrSFB_tile,
+                                    _mt,
+                                    _nt,
+                                    k_block_idx,
+                                    self.mxfp6_fmt_a,
+                                    self.mxfp6_fmt_b,
                                 )
                     else:
                         for _mt in cutlass.range_constexpr(fc1_m_tiles):
                             for _nt in cutlass.range_constexpr(fc1_n_tiles):
-                                mma_atom.set(WarpField.SFA, tCrSFA_tile[None, _mt, k_block_idx].iterator)
-                                mma_atom.set(WarpField.SFB, tCrSFB_tile[None, _nt, k_block_idx].iterator)
-                                cute.gemm(
-                                    mma_atom,
-                                    gate_acc[None, _mt, _nt],
-                                    tCrA_tile[None, _mt, k_block_idx],
-                                    tCrB[None, _nt, k_block_idx],
-                                    gate_acc[None, _mt, _nt],
+                                moe_emit_mma_k_block(
+                                    self.mma_op,
+                                    gate_acc,
+                                    tCrA_tile,
+                                    tCrB,
+                                    tCrSFA_tile,
+                                    tCrSFB_tile,
+                                    _mt,
+                                    _nt,
+                                    k_block_idx,
+                                    self.mxfp6_fmt_a,
+                                    self.mxfp6_fmt_b,
                                 )
                 # Drain the FC1 gate/only pass before the DMA warp reuses the
                 # gate staging buffers, either for the up pass or FC2 prefetch.
@@ -1276,16 +1433,20 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
                                 fz_csSFA_p = cute.filter_zeros(csSFA_p)
                                 fz_csSFB_p = cute.filter_zeros(csSFB_p)
                                 up_pipeline.consumer_wait(up_cons_state, peek)
-                            for _mt in range(self.num_m_tiles):
-                                for _nt in range(self.num_n_tiles):
-                                    mma_atom.set(WarpField.SFA, tCrSFA_tile[None, _mt, k_block_idx].iterator)
-                                    mma_atom.set(WarpField.SFB, tCrSFB_tile[None, _nt, k_block_idx].iterator)
-                                    cute.gemm(
-                                        mma_atom,
-                                        up_acc[None, _mt, _nt],
-                                        tCrA_tile[None, _mt, k_block_idx],
-                                        tCrB[None, _nt, k_block_idx],
-                                        up_acc[None, _mt, _nt],
+                            for _mt in cutlass.range_constexpr(self.num_m_tiles):
+                                for _nt in cutlass.range_constexpr(self.num_n_tiles):
+                                    moe_emit_mma_k_block(
+                                        self.mma_op,
+                                        up_acc,
+                                        tCrA_tile,
+                                        tCrB,
+                                        tCrSFA_tile,
+                                        tCrSFB_tile,
+                                        _mt,
+                                        _nt,
+                                        k_block_idx,
+                                        self.mxfp6_fmt_a,
+                                        self.mxfp6_fmt_b,
                                     )
                             cute.copy(smem_copy_A, csA_p[None, None, k_next], crA_tile[None, None, k_next])
                             cute.copy(smem_copy_B, csB_p[None, None, k_next], crB[None, None, k_next])
@@ -1301,22 +1462,34 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
                             cute.copy(smem_copy_B, csB_p[None, None, k_next], crB[None, None, k_next])
                             cute.copy(smem_copy_SFA, fz_csSFA_p[None, None, k_next], fz_crSFA[None, None, k_next])
                             cute.copy(smem_copy_SFB, fz_csSFB_p[None, None, k_next], fz_crSFB[None, None, k_next])
-                        for _mt in range(self.num_m_tiles):
-                            for _nt in range(self.num_n_tiles):
-                                mma_atom.set(WarpField.SFA, tCrSFA_tile[None, _mt, k_block_idx].iterator)
-                                mma_atom.set(WarpField.SFB, tCrSFB_tile[None, _nt, k_block_idx].iterator)
-                                cute.gemm(
-                                    mma_atom,
-                                    up_acc[None, _mt, _nt],
-                                    tCrA_tile[None, _mt, k_block_idx],
-                                    tCrB[None, _nt, k_block_idx],
-                                    up_acc[None, _mt, _nt],
+                        for _mt in cutlass.range_constexpr(self.num_m_tiles):
+                            for _nt in cutlass.range_constexpr(self.num_n_tiles):
+                                moe_emit_mma_k_block(
+                                    self.mma_op,
+                                    up_acc,
+                                    tCrA_tile,
+                                    tCrB,
+                                    tCrSFA_tile,
+                                    tCrSFB_tile,
+                                    _mt,
+                                    _nt,
+                                    k_block_idx,
+                                    self.mxfp6_fmt_a,
+                                    self.mxfp6_fmt_b,
                                 )
 
                 # Activation + quant into sA
                 sA_u8 = cute.recast_tensor(sA[None, None, 0], cutlass.Uint8)
-                packed_cols = Int32(self.tile_shape_mnk[2] // 2)
-                sf_blocks_per_row = Int32(self.tile_shape_mnk[2] // 16)
+                if cutlass.const_expr(self.mxfp6_fmt_a is not None):
+                    # Float8E4M3FN byte-container A smem: one code per byte, so the
+                    # per-row byte width is the logical K (not the 3:4-packed 3K/4).
+                    packed_cols = Int32(self.tile_shape_mnk[2])
+                    sf_blocks_per_row = Int32(self.tile_shape_mnk[2] // 32)
+                    fc2_quant_block_elems = Int32(32)
+                else:
+                    packed_cols = Int32(self.tile_shape_mnk[2] // 2)
+                    sf_blocks_per_row = Int32(self.tile_shape_mnk[2] // 16)
+                    fc2_quant_block_elems = Int32(16)
                 scale_idx = Int32(0) if cutlass.const_expr(self.share_expert_scales) else weight_expert_idx
                 gs_value = global_scale[scale_idx].to(cutlass.Float32)
                 if cutlass.const_expr(self.dynamic_down_scale):
@@ -1364,15 +1537,39 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
                         epi_rows = Int32(self.epi_tile[0])
                     if epi_rows < Int32(0):
                         epi_rows = Int32(0)
+                    if cutlass.const_expr(self.mxfp6_fmt_a is not None):
+                        # Zero the FP6 intermediate SFA smem before the FC2 scale
+                        # store. The store only covers epi_rows*sf_blocks; any
+                        # position the vec32 MMA reads but the store misses would
+                        # otherwise hold stale FC1 UE8M0 bytes -> 2^huge -> inf/2^32
+                        # blowup (E4M3/FP4 tolerates stale; UE8M0 does not). ue=0 =>
+                        # 2^-127 ~ 0, a harmless contribution for padding rows.
+                        zero_total = Int32(128) * sf_blocks_per_row
+                        zero_idx = Int32(tidx)
+                        while zero_idx < zero_total:
+                            st_shared_u8(sfa_base_addr + zero_idx, Uint8(0))
+                            zero_idx += Int32(self.num_mma_warps * self.num_threads_per_warp)
+                        self.epilog_sync_barrier.arrive_and_wait()
+                        # Zero the FC2 intermediate A-code smem (stage 0) before the
+                        # requant write. The requant only covers epi_rows*cols; any
+                        # padding-row slot the FC2 MMA reads but the store misses
+                        # would otherwise hold stale codes that decode to garbage/
+                        # inf. Zeroed slots decode as code 0 (value 0), harmless.
+                        zero_total_sa = Int32(128) * packed_cols
+                        zsa_idx = Int32(tidx)
+                        while zsa_idx < zero_total_sa:
+                            st_shared_u8(sa_base_addr + zsa_idx, Uint8(0))
+                            zsa_idx += Int32(self.num_mma_warps * self.num_threads_per_warp)
+                        self.epilog_sync_barrier.arrive_and_wait()
                     quant_gs_value = gs_value
                     if cutlass.const_expr(self.dynamic_down_scale):
                         if epi_rows > Int32(0):
                             local_max = cutlass.Float32(0.0)
                             scan_idx = Int32(tidx)
-                            scan_total = epi_rows * sf_blocks_per_row * Int32(16)
+                            scan_total = epi_rows * sf_blocks_per_row * fc2_quant_block_elems
                             while scan_idx < scan_total:
-                                sr = scan_idx // (sf_blocks_per_row * Int32(16))
-                                sc = scan_idx % (sf_blocks_per_row * Int32(16))
+                                sr = scan_idx // (sf_blocks_per_row * fc2_quant_block_elems)
+                                sc = scan_idx % (sf_blocks_per_row * fc2_quant_block_elems)
                                 local_max = fmax_f32(local_max, fabs_f32(
                                     cutlass.Float32(sC[sr, sc, epi_buffer])
                                 ))
@@ -1404,38 +1601,75 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
                         local_row = quant_idx // sf_blocks_per_row
                         row = sa_row_base + rows_offset + local_row
                         sf_block = quant_idx - local_row * sf_blocks_per_row
-                        block_start = sf_block * Int32(16)
+                        block_start = sf_block * fc2_quant_block_elems
 
-                        values = cute.make_rmem_tensor((16,), cutlass.Float32)
-                        block_max = cutlass.Float32(0.0)
-                        for elem_idx in cutlass.range_constexpr(16):
-                            value = cutlass.Float32(
-                                sC[local_row, block_start + elem_idx, epi_buffer]
+                        if cutlass.const_expr(self.mxfp6_fmt_a is not None):
+                            values = cute.make_rmem_tensor((32,), cutlass.Float32)
+                            block_max = cutlass.Float32(0.0)
+                            for elem_idx in cutlass.range_constexpr(32):
+                                value = cutlass.Float32(
+                                    sC[local_row, block_start + elem_idx, epi_buffer]
+                                )
+                                values[elem_idx] = value
+                                block_max = fmax_f32(block_max, fabs_f32(value))
+                            containers, scale_byte = moe_mxfp6_quantize_input_block_containers(
+                                values, block_max, quant_gs_value, self.mxfp6_fmt_a,
                             )
-                            values[elem_idx] = value
-                            block_max = fmax_f32(block_max, fabs_f32(value))
-
-                        packed64 = Uint64(0)
-                        scale_byte = Uint8(0)
-                        if cutlass.const_expr(self.is_gated):
-                            if self.fast_math:
-                                packed64, scale_byte = quantize_block_fp4_fast(values, block_max, quant_gs_value)
-                            else:
-                                packed64, scale_byte = quantize_block_fp4(values, block_max, quant_gs_value)
+                            # Write expanded byte-containers into the SWIZZLED
+                            # Float8 A smem. cute.recast_tensor(sA, Uint8) STRIPS
+                            # the swizzle (confirmed: sA_in_u8[row,col,0] lands at
+                            # the flat offset row*K+col), so the prior composed
+                            # write was un-swizzled and only correct at row 0
+                            # (XOR=0); rows>0 were read scrambled by the FC2
+                            # ldmatrix. The A operand uses the 8-bit K-major SW128
+                            # atom (Sw<3,4,3>): physical = offset ^ (((offset>>7)
+                            # & 7) << 4). For col<K(=128) offset>>7 == row, so the
+                            # swizzle is flat ^ ((row & 7) << 4). Store the byte
+                            # straight to that swizzled smem address.
+                            _row_sw = (row & Int32(7)) << Int32(4)
+                            _row_flat = row * Int32(self.tile_shape_mnk[2])
+                            for elem_idx in cutlass.range_constexpr(32):
+                                _flat = _row_flat + block_start + Int32(elem_idx)
+                                st_shared_u8(
+                                    sa_base_addr + (_flat ^ _row_sw),
+                                    containers[elem_idx],
+                                )
                         else:
-                            packed64, scale_byte = quantize_block_fp4(values, block_max, quant_gs_value)
-                        packed_base = sf_block << Int32(3)
-                        dst_pcol = row & Int32(63)
-                        xor_bits = ((dst_pcol >> Int32(1)) & Int32(0x3)) << Int32(4)
-                        row_high = row >> Int32(6)
-                        for byte_idx in cutlass.range_constexpr(8):
-                            src_pcol = packed_base + Int32(byte_idx)
-                            dst_row = ((src_pcol ^ xor_bits) << Int32(1)) + row_high
-                            dst_flat = dst_row * packed_cols + dst_pcol
-                            byte_val = Uint8(
-                                (packed64 >> Uint64(byte_idx * 8)) & Uint64(0xFF)
-                            )
-                            sA_u8[dst_flat] = byte_val
+                            values = cute.make_rmem_tensor((16,), cutlass.Float32)
+                            block_max = cutlass.Float32(0.0)
+                            for elem_idx in cutlass.range_constexpr(16):
+                                value = cutlass.Float32(
+                                    sC[local_row, block_start + elem_idx, epi_buffer]
+                                )
+                                values[elem_idx] = value
+                                block_max = fmax_f32(block_max, fabs_f32(value))
+                            packed64 = Uint64(0)
+                            scale_byte = Uint8(0)
+                            if cutlass.const_expr(self.is_gated):
+                                if self.fast_math:
+                                    packed64, scale_byte = quantize_block_fp4_fast(
+                                        values, block_max, quant_gs_value,
+                                    )
+                                else:
+                                    packed64, scale_byte = quantize_block_fp4(
+                                        values, block_max, quant_gs_value,
+                                    )
+                            else:
+                                packed64, scale_byte = quantize_block_fp4(
+                                    values, block_max, quant_gs_value,
+                                )
+                            packed_base = sf_block << Int32(3)
+                            dst_pcol = row & Int32(63)
+                            xor_bits = ((dst_pcol >> Int32(1)) & Int32(0x3)) << Int32(4)
+                            row_high = row >> Int32(6)
+                            for byte_idx in cutlass.range_constexpr(8):
+                                src_pcol = packed_base + Int32(byte_idx)
+                                dst_row = ((src_pcol ^ xor_bits) << Int32(1)) + row_high
+                                dst_flat = dst_row * packed_cols + dst_pcol
+                                byte_val = Uint8(
+                                    (packed64 >> Uint64(byte_idx * 8)) & Uint64(0xFF)
+                                )
+                                sA_u8[dst_flat] = byte_val
 
                         outer_m_idx = row % Int32(32)
                         inner_m_idx = row // Int32(32)
@@ -1526,17 +1760,37 @@ class MoEStaticKernelBackend(_MoEStaticKernelBase):
                             f4 = cute.filter_zeros(crSFB_phase2)
                             cute.copy(smem_copy_SFB, f2[None, None, k_next], f4[None, None, k_next])
                         if cutlass.const_expr(self.is_gated):
-                            for _mt in range(self.num_m_tiles):
-                                for _nt in range(self.num_n_tiles):
-                                    mma_atom.set(WarpField.SFA, tCrSFA_tile[None, _mt, k_block_idx].iterator)
-                                    mma_atom.set(WarpField.SFB, tCrSFB_phase2[None, _nt, k_block_idx].iterator)
-                                    cute.gemm(mma_atom, down_acc[None, _mt, _nt], tCrA_tile[None, _mt, k_block_idx], tCrB[None, _nt, k_block_idx], down_acc[None, _mt, _nt])
+                            for _mt in cutlass.range_constexpr(self.num_m_tiles):
+                                for _nt in cutlass.range_constexpr(self.num_n_tiles):
+                                    moe_emit_mma_k_block(
+                                        self.mma_op,
+                                        down_acc,
+                                        tCrA_tile,
+                                        tCrB,
+                                        tCrSFA_tile,
+                                        tCrSFB_phase2,
+                                        _mt,
+                                        _nt,
+                                        k_block_idx,
+                                        self.mxfp6_fmt_a,
+                                        self.mxfp6_fmt_b,
+                                    )
                         else:
                             for _mt in cutlass.range_constexpr(fc2_m_tiles):
                                 for _nt in cutlass.range_constexpr(fc2_n_tiles):
-                                    mma_atom.set(WarpField.SFA, tCrSFA_tile[None, _mt, k_block_idx].iterator)
-                                    mma_atom.set(WarpField.SFB, tCrSFB_phase2[None, _nt, k_block_idx].iterator)
-                                    cute.gemm(mma_atom, down_acc[None, _mt, _nt], tCrA_tile[None, _mt, k_block_idx], tCrB[None, _nt, k_block_idx], down_acc[None, _mt, _nt])
+                                    moe_emit_mma_k_block(
+                                        self.mma_op,
+                                        down_acc,
+                                        tCrA_tile,
+                                        tCrB,
+                                        tCrSFA_tile,
+                                        tCrSFB_phase2,
+                                        _mt,
+                                        _nt,
+                                        k_block_idx,
+                                        self.mxfp6_fmt_a,
+                                        self.mxfp6_fmt_b,
+                                    )
 
                     # Scatter using precomputed metadata (no redundant gmem loads)
                     tile_n_base_cur = output_tile_idx * Int32(self.tile_shape_mnk[1])

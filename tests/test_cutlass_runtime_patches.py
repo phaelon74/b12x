@@ -276,7 +276,7 @@ def test_compile_disk_cache_key_changes_with_toolchain_key(monkeypatch) -> None:
     monkeypatch.setattr(
         cute_compiler,
         "_runtime_toolchain_key",
-        lambda: (("cutlass_dsl", "4.5.0"),),
+        lambda: (("cutlass_dsl", "4.5.2"),),
     )
     key_a = _build_compile_disk_cache_key(
         compile_callable,
@@ -288,7 +288,7 @@ def test_compile_disk_cache_key_changes_with_toolchain_key(monkeypatch) -> None:
     monkeypatch.setattr(
         cute_compiler,
         "_runtime_toolchain_key",
-        lambda: (("cutlass_dsl", "4.5.1"),),
+        lambda: (("cutlass_dsl", "4.5.3"),),
     )
     key_b = _build_compile_disk_cache_key(
         compile_callable,

@@ -9,9 +9,13 @@ license = { text = "Apache-2.0" }
 dependencies = [
   "torch>=2.10.0",
   "cuda-python",
-  "nvidia-cutlass-dsl>=4.5.0",
-  "nvidia-cutlass-dsl-libs-base>=4.5.0",
-  "nvidia-cutlass-dsl-libs-cu13>=4.5.0",
+  # 4.5.2 is the first release with native SM120 MXF8/MXF6 block-scaled warp ops and
+  # is required for the FP6 GEMM smem/TMA path. It historically ICE'd the compressed-MLA
+  # cute-to-nvvm lowering; that regression is addressed in-tree (see b12x/cute/compiler.py
+  # opt-level handling) rather than by pinning back to 4.5.0.
+  "nvidia-cutlass-dsl==4.5.2",
+  "nvidia-cutlass-dsl-libs-base==4.5.2",
+  "nvidia-cutlass-dsl-libs-cu13==4.5.2",
   "apache-tvm-ffi>=0.1.6,!=0.1.8,!=0.1.8.post0,<0.2",
   "rich>=13",
   "transformers>=4.51",
@@ -22,6 +26,11 @@ dependencies = [
 dev = [
   "pytest",
 ]
+
+# vLLM loads entry points in this group in every process (front, engine-core,
+# and TP workers), so the B12X FP6 quantization registers itself on import.
+[project.entry-points."vllm.general_plugins"]
+b12x_fp6 = "b12x.integration.vllm_plugin:register_b12x_fp6"
 
 [build-system]
 requires = ["setuptools>=77", "packaging>=24"]

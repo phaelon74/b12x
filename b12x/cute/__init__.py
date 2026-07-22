@@ -22,4 +22,5 @@ from .runtime_control import (
 )
 from .scratch import B12XScratchBufferSpec, scratch_buffer_spec, scratch_tensor
 from .fp4 import *
+from .fp6 import *
 from .utils import *

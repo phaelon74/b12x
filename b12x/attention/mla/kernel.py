@@ -17,6 +17,10 @@ from cutlass.cute.runtime import from_dlpack
 
 from b12x.attention._cute import ops as attention_ops
 from b12x.cute.compiler import KernelCompileSpec, launch as b12x_launch
+from b12x.attention.mxfp6_mma import (
+    _literal_pv_mma_into_ofrag_mxfp6_scaled_mla,
+    _literal_qk_mma_into_sfrag_mxfp6_raw_mla,
+)
 from b12x.cute.fp4 import (
     bf16_mma_m16n16k16_f32,
     bfloat2_habs2,
@@ -76,8 +80,8 @@ _MLA_Q_STAGE_BYTES = _MLA_SCALE_GROUPS * _MLA_Q_NOPE_STAGE_BYTES + _MLA_Q_ROPE_S
 # Reduces smem ~23KB -> ~9KB, enabling ~11 CTAs/SM (vs 4).
 _MLA_Q_GROUP_STAGE_BYTES = _MLA_Q_NOPE_STAGE_BYTES
 # Per-group streaming: KV stage holds one nope group OR rope at a time.
-# Reduces smem ~38.6KB -> ~22.6KB, enabling 4 CTAs/SM (vs 2).
-_MLA_KV_STAGE_BYTES = _MLA_KV_NOPE_STAGE_BYTES
+# Must be large enough for BF16 debug QK staging (2x vec stride) as well as FP8/FP6 PV u32 layout.
+_MLA_KV_STAGE_BYTES = _MLA_KV_NOPE_QK_STAGE_BYTES
 _MLA_SCALE_STAGE_ELEMS = _MLA_TOKEN_TILE * _MLA_SCALE_GROUPS
 _MLA_SCALE_BYTES = _MLA_SCALE_GROUPS * 4
 _MLA_NOPE_U32_OFFSET = 0
@@ -2764,8 +2768,33 @@ def _run_staged_pv_group_into_target(
     scale_base: Int32,
     tile_pv_scale: Float32,
     lane: Int32,
+    kv_nope_dtype,
 ):
     if cutlass.const_expr(
+        kv_nope_dtype == cutlass.Float6E3M2FN
+        or kv_nope_dtype == cutlass.Float6E2M3FN
+    ):
+        if cutlass.const_expr(os.environ.get("B12X_MLA_DEBUG_PV_BF16", "0") == "1"):
+            _literal_pv_mma_into_ofrag_fp8_raw_scaled(
+                target_frag,
+                p_frag,
+                group_base_addr,
+                sScale,
+                scale_base,
+                lane,
+            )
+        else:
+            _literal_pv_mma_into_ofrag_mxfp6_scaled_mla(
+                target_frag,
+                p_frag,
+                group_base_addr,
+                sScale,
+                scale_base,
+                tile_pv_scale,
+                lane,
+                kv_nope_dtype,
+            )
+    elif cutlass.const_expr(
         os.environ.get("B12X_MLA_ENABLE_MXFP8_PV", "0") != "1"
         or os.environ.get("B12X_MLA_DEBUG_PV_BF16", "0") == "1"
     ):
@@ -2802,6 +2831,7 @@ def _accumulate_pv_groups_from_p_frag(
     sScale: cute.Tensor,
     kv_base_addr: Int32,
     lane: Int32,
+    kv_nope_dtype,
 ):
     for block_offset in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
         group_idx = Int32(block_offset)
@@ -2836,6 +2866,31 @@ def _accumulate_pv_groups_from_p_frag(
         )
         _zero_output_frag(tile_o_frag)
         if cutlass.const_expr(
+            kv_nope_dtype == cutlass.Float6E3M2FN
+            or kv_nope_dtype == cutlass.Float6E2M3FN
+        ):
+            if cutlass.const_expr(os.environ.get("B12X_MLA_DEBUG_PV_BF16", "0") == "1"):
+                _literal_pv_mma_into_ofrag_fp8_raw_scaled(
+                    tile_o_frag,
+                    p_frag,
+                    kv_base_addr,
+                    sScale,
+                    Int32(0),
+                    lane,
+                )
+            else:
+                _literal_pv_mma_into_ofrag_mxfp6_scaled_mla(
+                    tile_o_frag,
+                    p_frag,
+                    kv_base_addr,
+                    sScale,
+                    Int32(0),
+                    tile_pv_scale,
+                    lane,
+                    kv_nope_dtype,
+                )
+            accum_scale = Float32(1.0)
+        elif cutlass.const_expr(
             os.environ.get("B12X_MLA_ENABLE_MXFP8_PV", "0") != "1"
             or os.environ.get("B12X_MLA_DEBUG_PV_BF16", "0") == "1"
         ):
@@ -2888,6 +2943,7 @@ def _compute_score_tile_scaled_from_staged_nope(
     sm_scale_log2: Float32,
     lane: Int32,
     identity_page_table: cutlass.Constexpr[bool],
+    kv_nope_dtype,
 ):
     lane_group = lane // Int32(4)
     lane_pair_base = Int32(2) * (lane % Int32(4))
@@ -2933,18 +2989,36 @@ def _compute_score_tile_scaled_from_staged_nope(
         # Compute current nope group
         frag_tmp = cute.make_rmem_tensor(frag_layout, Float32)
         _zero_score_frag(frag_tmp)
-        _literal_qk_mma_into_sfrag_mxfp8_raw(
-            frag_tmp,
-            q_base_addr,
-            kv_base_addr,
-            lane,
-            Int32(0),
-            Int32(1),
-            Int32(_MLA_NUM_MMA_KV),
-            Int32(_MLA_NOPE_QK_NUM_MMA_D),
-            Int32(_MLA_NOPE_GROUP_Q_VECS),
-            Int32(_MLA_NOPE_GROUP_KV_VECS),
-        )
+        if cutlass.const_expr(
+            kv_nope_dtype == cutlass.Float6E3M2FN
+            or kv_nope_dtype == cutlass.Float6E2M3FN
+        ):
+            _literal_qk_mma_into_sfrag_mxfp6_raw_mla(
+                frag_tmp,
+                q_base_addr,
+                kv_base_addr,
+                lane,
+                Int32(0),
+                Int32(1),
+                Int32(_MLA_NUM_MMA_KV),
+                Int32(_MLA_NOPE_QK_NUM_MMA_D),
+                Int32(_MLA_NOPE_GROUP_Q_VECS),
+                Int32(_MLA_NOPE_GROUP_KV_VECS),
+                kv_nope_dtype,
+            )
+        else:
+            _literal_qk_mma_into_sfrag_mxfp8_raw(
+                frag_tmp,
+                q_base_addr,
+                kv_base_addr,
+                lane,
+                Int32(0),
+                Int32(1),
+                Int32(_MLA_NUM_MMA_KV),
+                Int32(_MLA_NOPE_QK_NUM_MMA_D),
+                Int32(_MLA_NOPE_GROUP_Q_VECS),
+                Int32(_MLA_NOPE_GROUP_KV_VECS),
+            )
         _accumulate_scaled_score_frag(
             score_frag,
             frag_tmp,
@@ -3292,6 +3366,7 @@ def _accumulate_pv_groups_from_p_frag_staged(
     kv_base_addr: Int32,
     num_kv: Int32,
     lane: Int32,
+    kv_nope_dtype,
 ):
     # Pipelined KV streaming: overlap stage of next group with compute of current
     # Prologue: stage nope group 0
@@ -3322,19 +3397,47 @@ def _accumulate_pv_groups_from_p_frag_staged(
         # Compute PV from current buffer
         if cutlass.const_expr(block_offset == 0):
             _run_staged_pv_group_into_target(
-                o_frag0, p_frag, sScale, kv_base_addr, scale_base, tile_pv_scale, lane
+                o_frag0,
+                p_frag,
+                sScale,
+                kv_base_addr,
+                scale_base,
+                tile_pv_scale,
+                lane,
+                kv_nope_dtype,
             )
         elif cutlass.const_expr(block_offset == 1):
             _run_staged_pv_group_into_target(
-                o_frag1, p_frag, sScale, kv_base_addr, scale_base, tile_pv_scale, lane
+                o_frag1,
+                p_frag,
+                sScale,
+                kv_base_addr,
+                scale_base,
+                tile_pv_scale,
+                lane,
+                kv_nope_dtype,
             )
         elif cutlass.const_expr(block_offset == 2):
             _run_staged_pv_group_into_target(
-                o_frag2, p_frag, sScale, kv_base_addr, scale_base, tile_pv_scale, lane
+                o_frag2,
+                p_frag,
+                sScale,
+                kv_base_addr,
+                scale_base,
+                tile_pv_scale,
+                lane,
+                kv_nope_dtype,
             )
         else:
             _run_staged_pv_group_into_target(
-                o_frag3, p_frag, sScale, kv_base_addr, scale_base, tile_pv_scale, lane
+                o_frag3,
+                p_frag,
+                sScale,
+                kv_base_addr,
+                scale_base,
+                tile_pv_scale,
+                lane,
+                kv_nope_dtype,
             )
         cute.arch.sync_threads()
 
@@ -4042,6 +4145,7 @@ def _run_one_pass_sparse_mla_tile(
     out_chunk_idx: Int32,
     lse_tensor: cute.Tensor | None,
     identity_page_table: cutlass.Constexpr[bool],
+    kv_nope_dtype,
 ):
     md_layout = cute.make_layout((1, 2), stride=(2, 1))
     frag_layout = cute.make_layout((1, _MLA_NUM_MMA_KV, 8), stride=(16, 8, 1))
@@ -4112,6 +4216,7 @@ def _run_one_pass_sparse_mla_tile(
                 sm_scale_log2,
                 lane,
                 identity_page_table,
+                kv_nope_dtype,
             )
         if has_second_head_slot:
             _update_softmax_stats_b2(score_frag, m_frag, d_frag, o_rescale_frag)
@@ -4135,6 +4240,7 @@ def _run_one_pass_sparse_mla_tile(
                 sScale,
                 kv_base_addr,
                 lane,
+                kv_nope_dtype,
             )
         else:
             _accumulate_pv_groups_from_p_frag_staged(
@@ -4149,6 +4255,7 @@ def _run_one_pass_sparse_mla_tile(
                 kv_base_addr,
                 Int32(kv_rows_u32.shape[0]),
                 lane,
+                kv_nope_dtype,
             )
     else:
         # Multi-tile: sequential per-group QK+PV (~10KB smem, ~9 CTAs/SM)
@@ -4202,6 +4309,7 @@ def _run_one_pass_sparse_mla_tile(
                     sm_scale_log2,
                     lane,
                     identity_page_table,
+                    kv_nope_dtype,
                 )
 
             # Fused softmax-stats + O-rescale + P-norm
@@ -4232,6 +4340,7 @@ def _run_one_pass_sparse_mla_tile(
                     sScale,
                     kv_base_addr,
                     lane,
+                    kv_nope_dtype,
                 )
             else:
                 _accumulate_pv_groups_from_p_frag_staged(
@@ -4246,6 +4355,7 @@ def _run_one_pass_sparse_mla_tile(
                     kv_base_addr,
                     num_kv,
                     lane,
+                    kv_nope_dtype,
                 )
 
             token_base = tile_end
@@ -4515,9 +4625,15 @@ def get_sparse_mla_shared_storage_cls():
 class SparseMLAKernel:
     """Single-pass sparse MLA kernel using MXFP8 MMA for nope and BF16 MMA for rope."""
 
-    def __init__(self, head_tiles: int, identity_page_table: bool = False):
+    def __init__(
+        self,
+        head_tiles: int,
+        identity_page_table: bool = False,
+        kv_nope_dtype: type = cutlass.Float8E4M3FN,
+    ):
         self.head_tiles = int(head_tiles)
         self.identity_page_table = bool(identity_page_table)
+        self.kv_nope_dtype = kv_nope_dtype
 
     @cute.jit
     def __call__(
@@ -4591,6 +4707,7 @@ class SparseMLAKernel:
             Int32(0),
             None,
             self.identity_page_table,
+            self.kv_nope_dtype,
         )
 
 @lru_cache(maxsize=16)

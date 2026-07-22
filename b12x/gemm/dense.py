@@ -37,7 +37,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
-import cutlass.utils.blackwell_helpers as sm120_utils
+import b12x.cute.sm120_compat as sm120_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 import cutlass.utils.hopper_helpers as sm90_utils
 import functools
@@ -45,23 +45,57 @@ import logging
 import os
 import time
 import torch
-from cutlass import Int32
+from cutlass import Int32, Uint8, Uint32
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.nvgpu.warp.mma import Field as WarpField
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 
 from b12x.cute.compiler import KernelCompileSpec, compile as b12x_compile
+from b12x.cute.fp4 import (
+    fabs_f32,
+    fmax_f32,
+    get_ptr_as_int64,
+    ld_global_v4_u32,
+    ld_shared_v4_u32,
+    shared_ptr_to_u32,
+    st_global_f32,
+    st_shared_u8,
+    st_shared_u64,
+    st_shared_v4_u32,
+    u32_as_f32,
+    warp_reduce,
+)
 from b12x.cute.utils import (
     current_cuda_stream,
     cutlass_to_torch_dtype,
     get_cutlass_dtype,
     get_max_active_clusters,
     get_num_sm,
+    is_mxfp6_ab_dtype,
     make_ptr,
+    mxfp6_logical_k_from_packed_bytes,
+    mxfp6_tile_k,
     sm120_make_smem_layout_sfa,
     sm120_make_smem_layout_sfb,
 )
+from b12x.gemm.dense_mxfp6 import emit_mxfp6_dense_mma_k_block
+from b12x.cute.fp6 import (
+    FLOAT6_E2M3_MAX,
+    FLOAT6_E3M2_MAX,
+    FLOAT8_E4M3_MAX,
+    cvt_f32_to_e2m3x2,
+    cvt_f32_to_e3m2x2,
+    cvt_f32_to_e4m3x2,
+    expand_mxfp6_packed_to_bytes,
+    fp6_block_ue8m0_exact,
+    mx_gs_numerator,
+    quantize_block_fp6_e2m3_bytes,
+    quantize_block_fp6_e3m2_bytes,
+    quantize_block_fp8_e4m3_bytes,
+    ue8m0_output_scale_exact,
+)
 from b12x.cute.runtime_control import raise_if_kernel_resolution_frozen
+from b12x.cute.warp_mma_compat import MmaMXF8Op as _MmaMXF8Op
 
 logger = logging.getLogger(__name__)
 _B12X_TIMING = os.getenv("B12X_TIMING", "0") == "1" or os.getenv(
@@ -151,6 +185,136 @@ def _dense_gemm_policy_for(
     )
 
 
+# Expand-ahead for packed-B: at k_block 0 the MMA warps wait for stage s+1 and
+# expand it in place, overlapping the expansion with ALL of stage s's MMA work
+# instead of putting it on the critical path at the stage boundary. This needs
+# >= 4 pipeline stages of producer slack (it measurably REGRESSED at 3 stages:
+# the consumer stalled on the wait before its MMA work instead of after), so
+# it is gated per-kernel in _setup_attributes. Env kill-switch for A/B runs:
+# B12X_PACKED_B_EXPAND_AHEAD=0 (read once at import).
+_PACKED_B_EXPAND_AHEAD = os.environ.get(
+    "B12X_PACKED_B_EXPAND_AHEAD", "1"
+).lower() not in ("0", "false")
+
+# Phase 4.1: fuse BF16 activation quantization into the GEMM's DMA producer
+# prologue, eliminating the separate quant kernel and the HBM round-trip for
+# activation codes+scales. Currently m=1 only (decode hot path). The GEMM's
+# producer warp does a full-row amax scan, derives gs/alpha, then quantizes
+# each K-tile's 32-element blocks directly into sA/sSFA smem.
+_DENSE_FUSED_QUANT = os.environ.get(
+    "B12X_DENSE_FUSED_QUANT", "0"
+).lower() not in ("0", "false")
+
+
+@cute.jit
+def _spread_fp6_group_u32(g: Uint32) -> Uint32:
+    """Spread 4 packed 6-bit codes (24 bits) into 4 byte lanes (bits[5:0] each).
+
+    Output byte ``i`` holds ``(g >> 6*i) & 0x3F`` — identical per-group math to
+    :func:`b12x.cute.fp6.expand_mxfp6_packed_to_bytes`. Two-step binary spread
+    (12-bit halves to 16-bit lanes, then 6-bit fields to byte lanes): 2 shifts +
+    2 LOP3-fusable mask/or pairs, ~30% fewer ops than masking each field out of
+    ``g`` individually.
+    """
+    a = (g & Uint32(0x00000FFF)) | ((g << Uint32(4)) & Uint32(0x0FFF0000))
+    return (a & Uint32(0x003F003F)) | ((a << Uint32(2)) & Uint32(0x3F003F00))
+
+
+@cute.jit
+def _expand_packed_b_triplet(
+    a: Uint32, b: Uint32, c: Uint32
+) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
+    """Expand 12 packed bytes (3 LE u32 words = 16 FP6 codes) to 4 output words.
+
+    Little-endian regroup into four 24-bit groups of 4 codes, then byte-lane
+    spread per group.
+    """
+    g0 = a & Uint32(0x00FFFFFF)
+    g1 = (a >> Uint32(24)) | ((b & Uint32(0xFFFF)) << Uint32(8))
+    g2 = (b >> Uint32(16)) | ((c & Uint32(0xFF)) << Uint32(16))
+    g3 = c >> Uint32(8)
+    return (
+        _spread_fp6_group_u32(g0),
+        _spread_fp6_group_u32(g1),
+        _spread_fp6_group_u32(g2),
+        _spread_fp6_group_u32(g3),
+    )
+
+
+@cute.jit
+def _expand_packed_b_stage_smem(
+    sb_base_addr: Int32,
+    stage: Int32,
+    tidx: Int32,
+    tile_n: cutlass.Constexpr,
+    tile_k: cutlass.Constexpr,
+    num_threads: cutlass.Constexpr,
+    sync_barrier,
+) -> None:
+    """Expand one 3:4-packed B stage IN PLACE into the byte-container sB stage.
+
+    TMA stages the packed tile (96 B/row, plain k-major, no swizzle) into the
+    BOTTOM ``tile_n * 3*tile_k/4`` bytes of the sB stage itself — no separate
+    staging buffer, which buys an extra pipeline stage (3 -> 4 for the decode
+    tile). The expanded output (128 B/row, swizzled) overlaps the packed input
+    region, so expansion is two-phase: every thread loads ALL of its packed
+    rows into registers, one MMA-group named-barrier, then writes the expanded
+    swizzled rows. Each thread owns whole rows (``tile_n / num_threads`` of
+    them), so within a row reads always precede writes; the barrier orders
+    them across threads.
+
+    Raw addressing is deliberate: ``cute.recast_tensor(sB, Uint8)`` STRIPS the
+    smem swizzle on this build (confirmed in the fused-MoE FC2 requant path).
+    The 8-bit K-major SW128 atom (Sw<3,4,3>, 8x128 = 1024 B) gives
+    ``physical = flat ^ ((row & 7) << 4)`` — the XOR touches bits 4..6 only,
+    so every 16-byte unit stays contiguous and the traffic is fully 128-bit
+    (6 x ld.shared.v4 in, 8 x st.shared.v4 out per row). Per-group bit math
+    matches :func:`b12x.cute.fp6.expand_mxfp6_packed_to_bytes` exactly, so
+    downstream ldmatrix/MMA sees bytes identical to the pre-expanded path.
+
+    Runs on the MMA warp group only; the caller must still follow with the
+    MMA-group named barrier before any ldmatrix reads of this stage.
+    """
+    # Whole-row ownership; ceil-divide so configs with more threads than rows
+    # (e.g. the 256-thread (128,128) tile) stay correct — guarded threads skip
+    # the row I/O but ALL threads reach the phase barrier.
+    rows_per_thread = (tile_n + num_threads - 1) // num_threads
+    packed_row_bytes = tile_k * 3 // 4
+    words_per_row = packed_row_bytes // 4
+    sb_stage = sb_base_addr + stage * Int32(tile_n * tile_k)
+
+    # Phase 1: read all owned packed rows into registers (static rmem layout).
+    w = cute.make_rmem_tensor((rows_per_thread * words_per_row,), Uint32)
+    for r_i in cutlass.range_constexpr(rows_per_thread):
+        row = Int32(tidx) + Int32(r_i * num_threads)
+        if row < Int32(tile_n):
+            src = sb_stage + row * Int32(packed_row_bytes)
+            for c in cutlass.range_constexpr(words_per_row // 4):
+                w0, w1, w2, w3 = ld_shared_v4_u32(src + Int32(c * 16))
+                w[r_i * words_per_row + c * 4 + 0] = w0
+                w[r_i * words_per_row + c * 4 + 1] = w1
+                w[r_i * words_per_row + c * 4 + 2] = w2
+                w[r_i * words_per_row + c * 4 + 3] = w3
+
+    # All packed reads must complete before any expanded write lands.
+    sync_barrier.arrive_and_wait()
+
+    # Phase 2: expand and write the swizzled byte-container rows.
+    for r_i in cutlass.range_constexpr(rows_per_thread):
+        row = Int32(tidx) + Int32(r_i * num_threads)
+        if row < Int32(tile_n):
+            sw = (row & Int32(7)) << Int32(4)
+            flat = row * Int32(tile_k)
+            for o in cutlass.range_constexpr(tile_k // 16):
+                base = r_i * words_per_row + o * 3
+                o0, o1, o2, o3 = _expand_packed_b_triplet(
+                    w[base + 0], w[base + 1], w[base + 2]
+                )
+                st_shared_v4_u32(
+                    sb_stage + ((flat + Int32(o * 16)) ^ sw), o0, o1, o2, o3
+                )
+
+
 class DenseGemmKernel:
     """Implements batched matrix multiplication (C = A x SFA x B x SFB) for
     Blackwell GeForce architecture using warp-level MMA.
@@ -167,10 +331,13 @@ class DenseGemmKernel:
         - Supported combinations:
             * NVF4: A/B: Float4E2M1FN, SF: Float8E4M3FN, sf_vec_size: 16
             * MXF4: A/B: Float4E2M1FN, SF: Float8E8M0FNU, sf_vec_size: 32
+            * MXFP8: A/B: Float8E4M3FN, SF: Float8E8M0FNU, sf_vec_size: 32
+            * MX-FP6: A/B: Float6E3M2FN or Float6E2M3FN, SF: Float8E8M0FNU,
+              sf_vec_size: 32 (inline ``mxf8f6f4`` MMA, m16n8k32)
         - Tile shape constraints:
             * tile_m must be divisible by 128
             * tile_n must be divisible by 128
-            * tile_k must be divisible by 64 (sf_vec_size=16) or 128 (sf_vec_size=32)
+            * tile_k must be divisible by 64 (sf_vec_size=16) or 128 (MXFP8 / MX-FP6)
     """
 
     def __init__(
@@ -187,7 +354,54 @@ class DenseGemmKernel:
         use_m1_non_tma_a: bool = False,
         use_m1_non_tma_c: bool = False,
         use_m1_non_tma_sfa: bool = False,
+        mxfp6_fmt: Optional[str] = None,
+        mxfp6_fmt_a: Optional[str] = None,
+        mxfp6_fmt_b: Optional[str] = None,
+        b_packed: bool = False,
     ):
+        # When set, A/B operands are MX codes carried in Float8E4M3FN
+        # byte-containers: the whole kernel runs the MXFP8 smem/TMA/ldmatrix
+        # machinery, and only the mainloop MMA is emitted as the inline
+        # ``mxf8f6f4`` instruction (cutlass has no working 6-bit smem layout).
+        # ``mxfp6_fmt_a`` / ``mxfp6_fmt_b`` may differ (W6A8: e4m3 acts, e2m3
+        # weights). A single ``mxfp6_fmt`` still means both operands match.
+        if mxfp6_fmt_a is None and mxfp6_fmt_b is None:
+            mxfp6_fmt_a = mxfp6_fmt
+            mxfp6_fmt_b = mxfp6_fmt
+        elif mxfp6_fmt_a is None or mxfp6_fmt_b is None:
+            raise ValueError("mxfp6_fmt_a and mxfp6_fmt_b must both be set or both None")
+        self.mxfp6_fmt_a = mxfp6_fmt_a
+        self.mxfp6_fmt_b = mxfp6_fmt_b
+        # Native packed-FP6 streaming: B arrives 3:4-packed ``(N, 3K/4, L)`` in
+        # gmem, TMA stages the packed tile into a plain smem buffer, and the MMA
+        # warps expand it into the swizzled byte-container sB right after
+        # consumer_wait. Cuts B HBM traffic by 25% vs the byte-container layout;
+        # the ldmatrix/MMA path is unchanged.
+        assert not b_packed or mxfp6_fmt_b is not None, (
+            "b_packed requires the MX-FP6 path (mxfp6_fmt_b set)"
+        )
+        # The in-kernel expansion computes swizzled sB addresses assuming the
+        # 8-bit K-major SW128 atom (8x128 = 1024 B): physical =
+        # flat ^ ((row & 7) << 4). That atom is selected iff the smem major
+        # size is 128, i.e. tile_k == 128 (always true for MX-FP6).
+        assert not b_packed or (tile_k or sf_vec_size * 8) == 128, (
+            "b_packed expansion assumes tile_k == 128 (SW128 smem atom)"
+        )
+        self.b_packed = b_packed
+        self.a_bf16_fused = _DENSE_FUSED_QUANT and use_m1_non_tma_a
+        if self.a_bf16_fused:
+            _fused_fmt = mxfp6_fmt_a or "e4m3"
+            self._fused_gs_num = mx_gs_numerator(_fused_fmt)
+            self._fused_act_fmt = _fused_fmt
+            self._fused_fmt_max = {
+                "e4m3": FLOAT8_E4M3_MAX,
+                "e3m2": FLOAT6_E3M2_MAX,
+                "e2m3": FLOAT6_E2M3_MAX,
+            }[_fused_fmt]
+        else:
+            self._fused_gs_num = 0.0
+            self._fused_act_fmt = ""
+            self._fused_fmt_max = 0.0
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
         self.mma_k = mma_k
@@ -222,6 +436,10 @@ class DenseGemmKernel:
             self.num_mma_warps = 4
         else:
             self.num_mma_warps = 8
+        # NOTE: widening the small-M atom to (1,4,1) to double the packed-B
+        # expansion threads was tried and aborts in MLIR tiled_copy_retile (the
+        # ldmatrix retile geometry only supports atom_n=2 here). Expansion
+        # parallelism is capped at 2 warps for the decode tile.
         self.tma_load_warp_id = self.num_mma_warps
         self.num_threads_per_warp = 32
         self.threads_per_cta = (
@@ -251,8 +469,19 @@ class DenseGemmKernel:
 
     def _setup_attributes(self):
         if cutlass.const_expr(self.a_dtype == cutlass.Float8E4M3FN):
-            mma_op = cute.nvgpu.warp.MmaMXF8Op(
+            mma_op = _MmaMXF8Op(
                 self.a_dtype,
+                self.acc_dtype,
+                self.sf_dtype,
+            )
+        elif cutlass.const_expr(
+            self.a_dtype == cutlass.Float6E3M2FN
+            or self.a_dtype == cutlass.Float6E2M3FN
+        ):
+            # MX-FP6 uses inline ``mxf8f6f4`` MMA in the mainloop. Build tiled_mma
+            # with the MXFP8 op so smem/SF layouts match m16n8k32 geometry.
+            mma_op = _MmaMXF8Op(
+                cutlass.Float8E4M3FN,
                 self.acc_dtype,
                 self.sf_dtype,
             )
@@ -267,7 +496,11 @@ class DenseGemmKernel:
         permutation_mnk = sm120_utils.get_permutation_mnk(
             self.tile_shape_mnk,
             self.sf_vec_size,
-            cutlass.const_expr(self.a_dtype == cutlass.Float8E4M3FN),
+            cutlass.const_expr(
+                self.a_dtype == cutlass.Float8E4M3FN
+                or self.a_dtype == cutlass.Float6E3M2FN
+                or self.a_dtype == cutlass.Float6E2M3FN
+            ),
         )
         self.tiled_mma = cute.make_tiled_mma(
             mma_op,
@@ -311,10 +544,17 @@ class DenseGemmKernel:
             self.c_dtype,
             self.smem_capacity,
             self.occupancy,
+            self.b_packed,
         )
 
         assert self.epi_stage > 0, (
             "epi_stage <= 0, not enough shared memory. This configuration will be skipped."
+        )
+
+        # Decided here because it depends on the computed stage depth; see the
+        # _PACKED_B_EXPAND_AHEAD module comment for the >= 4 stage rationale.
+        self.packed_expand_ahead = (
+            self.b_packed and _PACKED_B_EXPAND_AHEAD and self.ab_stage >= 4
         )
 
         (
@@ -338,100 +578,39 @@ class DenseGemmKernel:
             self.tiled_mma,
         )
 
-    @cute.jit
-    def __call__(
-        self,
-        a: cute.Tensor,
-        b: cute.Tensor,
-        sfa: cute.Tensor,
-        sfb: cute.Tensor,
-        c: cute.Tensor,
-        alpha: cute.Tensor,
-        max_active_clusters: cutlass.Constexpr,
-        stream: cuda.CUstream,
-        epilogue_op: cutlass.Constexpr = lambda x: x,
-    ):
-        """Execute the GEMM operation.
-
-        Args:
-            a: Input tensor A
-            b: Input tensor B
-            sfa: Scale factor tensor for A
-            sfb: Scale factor tensor for B
-            c: Output tensor C
-            alpha: Alpha scaling factor tensor, shape (1,), float32
-            max_active_clusters: Max active clusters
-            stream: CUDA stream
-            epilogue_op: Elementwise epilogue function
-        """
-        # Setup static attributes
-        self.a_dtype = a.element_type
-        self.b_dtype = b.element_type
-        self.c_dtype = c.element_type
-        self.sf_dtype = sfa.element_type
-
-        self.a_layout = utils.LayoutEnum.from_tensor(a)
-        self.b_layout = utils.LayoutEnum.from_tensor(b)
-        self.c_layout = utils.LayoutEnum.from_tensor(c)
-
-        if cutlass.const_expr(self.a_dtype != self.b_dtype):
-            raise TypeError(f"Type mismatch: {self.a_dtype} != {self.b_dtype}")
-
-        self._setup_attributes()
-
-        # Setup sfa/sfb tensor by filling A/B tensor to scale factor atom layout
-        self.sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(
-            a.shape, self.sf_vec_size
-        )
-        sfa_tensor = cute.make_tensor(sfa.iterator, self.sfa_layout)
-
-        self.sfb_layout = blockscaled_utils.tile_atom_to_shape_SF(
-            b.shape, self.sf_vec_size
-        )
-        sfb_tensor = cute.make_tensor(sfb.iterator, self.sfb_layout)
-
-        tma_atom_a, tma_tensor_a = self._make_tma_atoms_and_tensors(
-            a,
-            self.a_smem_layout_staged,
-            (self.tile_shape_mnk[0], self.tile_shape_mnk[2]),
-            1,
-        )
-        tma_atom_b, tma_tensor_b = self._make_tma_atoms_and_tensors(
-            b,
-            self.b_smem_layout_staged,
-            (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
-            1,
-        )
-        if cutlass.const_expr(self.use_m1_non_tma_sfa):
-            tma_atom_sfa = tma_atom_b
-            tma_tensor_sfa = sfa_tensor
-        else:
-            tma_atom_sfa, tma_tensor_sfa = self._make_tma_atoms_and_tensors(
-                sfa_tensor,
-                self.sfa_smem_layout_staged,
-                self.sfa_tile_shape_mk,
-                1,
-                internal_type=cutlass.Int16,
+        # Plain (non-swizzled) k-major staging layout for the 3:4-packed B
+        # tile, ALIASED into the bottom of each sB stage: TMA writes the 96
+        # packed bytes/row there (16-byte aligned box, within TMA's
+        # non-swizzled constraints) and the MMA warps expand IN PLACE into the
+        # full swizzled 128 B/row stage (two-phase, see
+        # _expand_packed_b_stage_smem). No separate staging buffer means the
+        # packed mode pays zero extra smem -> one more pipeline stage. The
+        # stage stride is sB's full stage size, NOT the packed tile size.
+        if self.b_packed:
+            self.b_packed_smem_layout_staged = cute.make_layout(
+                (
+                    self.tile_shape_mnk[1],
+                    self.tile_shape_mnk[2] * 3 // 4,
+                    self.ab_stage,
+                ),
+                stride=(
+                    self.tile_shape_mnk[2] * 3 // 4,
+                    1,
+                    self.tile_shape_mnk[1] * self.tile_shape_mnk[2],
+                ),
             )
-        tma_atom_sfb, tma_tensor_sfb = self._make_tma_atoms_and_tensors(
-            sfb_tensor,
-            self.sfb_smem_layout_staged,
-            self.sfb_tile_shape_nk,
-            1,
-            internal_type=cutlass.Int16,
-        )
-        tma_atom_c, tma_tensor_c = self._make_tma_store_atoms_and_tensors(
-            c,
-            self.epi_smem_layout_staged,
-            self.epi_tile,
-        )
+        else:
+            self.b_packed_smem_layout_staged = None
 
-        tile_sched_params, grid = self._compute_grid(
-            c,
-            self.tile_shape_mnk,
-            max_active_clusters,
-        )
+    def _build_shared_storage(self):
+        """Define the kernel smem struct (trace-time only).
 
+        Single variant for both modes: in ``b_packed`` mode the packed TMA
+        tile is aliased into the bottom of each sB stage (in-place expansion),
+        so no extra region exists. The DSL preprocessor traces into this
+        method when called from the JIT ``__call__``; keeping it a plain
+        helper with a single return avoids the struct-flattening pitfalls.
+        """
         @cute.struct
         class SharedStorage:
             mainloop_pipeline_array_ptr: cute.struct.MemRange[
@@ -468,7 +647,134 @@ class DenseGemmKernel:
                 self.buffer_align_bytes,
             ]
 
-        self.shared_storage = SharedStorage
+        return SharedStorage
+
+    @cute.jit
+    def __call__(
+        self,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        sfa: cute.Tensor,
+        sfb: cute.Tensor,
+        c: cute.Tensor,
+        alpha: cute.Tensor,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+        epilogue_op: cutlass.Constexpr = lambda x: x,
+        x_bf16: cute.Tensor = None,
+        w_gscale: cute.Tensor = None,
+    ):
+        """Execute the GEMM operation.
+
+        Args:
+            a: Input tensor A (byte-containers, or dummy when a_bf16_fused)
+            b: Input tensor B
+            sfa: Scale factor tensor for A (or dummy when a_bf16_fused)
+            sfb: Scale factor tensor for B
+            c: Output tensor C
+            alpha: Alpha scaling factor tensor, shape (1,), float32.
+                   In fused mode the kernel WRITES alpha here.
+            max_active_clusters: Max active clusters
+            stream: CUDA stream
+            epilogue_op: Elementwise epilogue function
+            x_bf16: BF16 activation input (fused quant mode only)
+            w_gscale: Weight global scale, shape (1,), f32 (fused mode only)
+        """
+        # Setup static attributes
+        self.a_dtype = a.element_type
+        self.b_dtype = b.element_type
+        self.c_dtype = c.element_type
+        self.sf_dtype = sfa.element_type
+
+        self.a_layout = utils.LayoutEnum.from_tensor(a)
+        self.b_layout = utils.LayoutEnum.from_tensor(b)
+        self.c_layout = utils.LayoutEnum.from_tensor(c)
+
+        if cutlass.const_expr(self.a_dtype != self.b_dtype):
+            raise TypeError(f"Type mismatch: {self.a_dtype} != {self.b_dtype}")
+
+        self._setup_attributes()
+
+        # Setup sfa/sfb tensor by filling A/B tensor to scale factor atom layout
+        self.sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(
+            a.shape, self.sf_vec_size
+        )
+        sfa_tensor = cute.make_tensor(sfa.iterator, self.sfa_layout)
+
+        # With packed B the gmem extent is 3K/4 bytes, but scale-factor geometry
+        # follows the LOGICAL K (one UE8M0 per 32 codes), so rebuild the shape.
+        if cutlass.const_expr(self.b_packed):
+            sfb_shape_nkl = (b.shape[0], b.shape[1] * 4 // 3, b.shape[2])
+        else:
+            sfb_shape_nkl = b.shape
+        self.sfb_layout = blockscaled_utils.tile_atom_to_shape_SF(
+            sfb_shape_nkl, self.sf_vec_size
+        )
+        sfb_tensor = cute.make_tensor(sfb.iterator, self.sfb_layout)
+
+        tma_atom_a, tma_tensor_a = self._make_tma_atoms_and_tensors(
+            a,
+            self.a_smem_layout_staged,
+            (self.tile_shape_mnk[0], self.tile_shape_mnk[2]),
+            1,
+        )
+        if cutlass.const_expr(self.b_packed):
+            # TMA loads the packed tile (tile_n, 3*tile_k/4 bytes) into the
+            # plain staging layout; the swizzled sB is filled in-kernel.
+            tma_atom_b, tma_tensor_b = self._make_tma_atoms_and_tensors(
+                b,
+                self.b_packed_smem_layout_staged,
+                (self.tile_shape_mnk[1], self.tile_shape_mnk[2] * 3 // 4),
+                1,
+            )
+        else:
+            tma_atom_b, tma_tensor_b = self._make_tma_atoms_and_tensors(
+                b,
+                self.b_smem_layout_staged,
+                (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
+                1,
+            )
+        if cutlass.const_expr(self.use_m1_non_tma_sfa):
+            tma_atom_sfa = tma_atom_b
+            tma_tensor_sfa = sfa_tensor
+        else:
+            tma_atom_sfa, tma_tensor_sfa = self._make_tma_atoms_and_tensors(
+                sfa_tensor,
+                self.sfa_smem_layout_staged,
+                self.sfa_tile_shape_mk,
+                1,
+                internal_type=cutlass.Int16,
+            )
+        tma_atom_sfb, tma_tensor_sfb = self._make_tma_atoms_and_tensors(
+            sfb_tensor,
+            self.sfb_smem_layout_staged,
+            self.sfb_tile_shape_nk,
+            1,
+            internal_type=cutlass.Int16,
+        )
+        tma_atom_c, tma_tensor_c = self._make_tma_store_atoms_and_tensors(
+            c,
+            self.epi_smem_layout_staged,
+            self.epi_tile,
+        )
+
+        tile_sched_params, grid = self._compute_grid(
+            c,
+            self.tile_shape_mnk,
+            max_active_clusters,
+        )
+
+        # Built in a plain (non-JIT) method: conditional @cute.struct class
+        # definitions inside a JIT-traced function body have no precedent on
+        # this build, while plain helper methods execute as ordinary Python.
+        self.shared_storage = self._build_shared_storage()
+
+        # Unused (never traced) when b_packed is off; pass the expanded layout
+        # as a stand-in so the kernel signature stays uniform.
+        if cutlass.const_expr(self.b_packed):
+            b_packed_smem_layout_arg = self.b_packed_smem_layout_staged
+        else:
+            b_packed_smem_layout_arg = self.b_smem_layout_staged
 
         self.kernel(
             tma_atom_a,
@@ -489,12 +795,15 @@ class DenseGemmKernel:
             self.cta_layout_mnk,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
+            b_packed_smem_layout_arg,
             self.sfa_smem_layout_staged,
             self.sfb_smem_layout_staged,
             self.epi_smem_layout_staged,
             tile_sched_params,
             epilogue_op,
             alpha,
+            x_bf16,
+            w_gscale,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -557,14 +866,16 @@ class DenseGemmKernel:
         cta_layout_mnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
+        b_packed_smem_layout_staged,
         sfa_smem_layout_staged: cute.Layout,
         sfb_smem_layout_staged: cute.Layout,
         epi_smem_layout_staged: cute.ComposedLayout,
         tile_sched_params: utils.PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
         alpha: cute.Tensor,
+        directX_bf16: cute.Tensor,
+        w_gscale: cute.Tensor,
     ):
-        # Keep alpha in FP32 for precision
         alpha_value = alpha[0].to(cutlass.Float32)
 
         tidx, _, _ = cute.arch.thread_idx()
@@ -591,9 +902,17 @@ class DenseGemmKernel:
         b_smem_layout = cute.slice_(b_smem_layout_staged, (None, None, 0))
         sfa_smem_layout = cute.slice_(sfa_smem_layout_staged, (None, None, 0))
         sfb_smem_layout = cute.slice_(sfb_smem_layout_staged, (None, None, 0))
+        # B's TMA transaction covers the packed staging tile when b_packed (the
+        # expanded sB is filled by the MMA warps, not by TMA).
+        if cutlass.const_expr(self.b_packed):
+            b_tma_smem_layout = cute.slice_(
+                b_packed_smem_layout_staged, (None, None, 0)
+            )
+        else:
+            b_tma_smem_layout = b_smem_layout
         if cutlass.const_expr(self.use_m1_non_tma_sfa):
             tma_copy_bytes = (
-                cute.size_in_bytes(self.b_dtype, b_smem_layout)
+                cute.size_in_bytes(self.b_dtype, b_tma_smem_layout)
                 + cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
             )
             if cutlass.const_expr(not self.use_m1_non_tma_a):
@@ -601,7 +920,7 @@ class DenseGemmKernel:
         else:
             tma_copy_bytes = (
                 cute.size_in_bytes(self.a_dtype, a_smem_layout)
-                + cute.size_in_bytes(self.b_dtype, b_smem_layout)
+                + cute.size_in_bytes(self.b_dtype, b_tma_smem_layout)
                 + cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
                 + cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
             )
@@ -639,6 +958,25 @@ class DenseGemmKernel:
         sB = storage.sB.get_tensor(
             b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
         )
+        if cutlass.const_expr(self.b_packed):
+            # Packed TMA destination ALIASED into sB's storage (bottom 96 B of
+            # each row span, stage stride = full sB stage): no separate buffer,
+            # expansion happens in place (see _expand_packed_b_stage_smem).
+            sBPacked = cute.make_tensor(
+                storage.sB.data_ptr(), b_packed_smem_layout_staged
+            )
+            # Raw u32 smem address for the packed->container expansion. Two
+            # constraints force this exact spot: (1) cute.recast_tensor strips
+            # sB's swizzle (see _expand_packed_b_stage_smem), so the expansion
+            # needs raw addresses; (2) @cute.struct instances cannot be
+            # flattened across DYNAMIC ifs (NVIDIA/cutlass#3268) and the if-
+            # capture analysis is syntactic, so ``storage`` must never be
+            # referenced inside the warp-dispatch branches - only this Int32
+            # address may cross into them.
+            sb_base_addr = shared_ptr_to_u32(storage.sB.data_ptr())
+        if cutlass.const_expr(self.a_bf16_fused):
+            sa_base_addr = shared_ptr_to_u32(storage.sA.data_ptr())
+            ssfa_base_addr = shared_ptr_to_u32(storage.sSFA.data_ptr())
         sC = storage.sC.get_tensor(
             epi_smem_layout_staged.outer, swizzle=epi_smem_layout_staged.inner
         )
@@ -651,11 +989,20 @@ class DenseGemmKernel:
             cute.slice_(self.tile_shape_mnk, (None, 0, None)),
             (None, None, None),
         )
-        gB_nkl = cute.local_tile(
-            mB_nkl,
-            cute.slice_(self.tile_shape_mnk, (0, None, None)),
-            (None, None, None),
-        )
+        if cutlass.const_expr(self.b_packed):
+            # Packed gmem extent: 96 bytes per 128-wide logical K-tile, same
+            # K-tile count as the A side ((3K/4)/96 == K/128).
+            gB_nkl = cute.local_tile(
+                mB_nkl,
+                (self.tile_shape_mnk[1], self.tile_shape_mnk[2] * 3 // 4),
+                (None, None, None),
+            )
+        else:
+            gB_nkl = cute.local_tile(
+                mB_nkl,
+                cute.slice_(self.tile_shape_mnk, (0, None, None)),
+                (None, None, None),
+            )
         if cutlass.const_expr(not self.use_m1_non_tma_sfa):
             gSFA_mkl = cute.local_tile(
                 mSFA_mkl,
@@ -688,16 +1035,25 @@ class DenseGemmKernel:
                 cute.group_modes(gA_mkl, 0, 2),
             )
 
-        # TMA partitions for B
+        # TMA partitions for B (targets the packed staging buffer when b_packed)
         b_cta_layout = cute.make_layout(cute.slice_(cta_layout_mnk, (None, 0, 0)).shape)
         b_cta_crd = cluster_coord_mnk[0]
-        tBsB, tBgB = cpasync.tma_partition(
-            tma_atom_b,
-            b_cta_crd,
-            b_cta_layout,
-            cute.group_modes(sB, 0, 2),
-            cute.group_modes(gB_nkl, 0, 2),
-        )
+        if cutlass.const_expr(self.b_packed):
+            tBsB, tBgB = cpasync.tma_partition(
+                tma_atom_b,
+                b_cta_crd,
+                b_cta_layout,
+                cute.group_modes(sBPacked, 0, 2),
+                cute.group_modes(gB_nkl, 0, 2),
+            )
+        else:
+            tBsB, tBgB = cpasync.tma_partition(
+                tma_atom_b,
+                b_cta_crd,
+                b_cta_layout,
+                cute.group_modes(sB, 0, 2),
+                cute.group_modes(gB_nkl, 0, 2),
+            )
 
         # TMA partitions for SFA
         if cutlass.const_expr(not self.use_m1_non_tma_sfa):
@@ -763,6 +1119,16 @@ class DenseGemmKernel:
         mainloop_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.ab_stage
         )
+        if cutlass.const_expr(self.packed_expand_ahead):
+            # Second consumer-side view of the mainloop pipeline, kept exactly
+            # one stage ahead of mainloop_consumer_state: it advances once at
+            # each work-tile prologue and once per k_tile at k_block 0, for a
+            # total of k_tile_cnt per tile — the same as the main state's
+            # (k_tile_cnt - 1) in-loop advances plus 1 in the hoisted tail —
+            # so the two stay phase-aligned across persistent work tiles.
+            packed_b_lookahead_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.ab_stage
+            )
 
         # MMA warp group
         if warp_idx < self.num_mma_warps:
@@ -866,6 +1232,24 @@ class DenseGemmKernel:
                 mainloop_pipeline.consumer_wait(
                     mainloop_consumer_state, peek_ab_full_status
                 )
+                if cutlass.const_expr(self.b_packed):
+                    # Expand the TMA-staged packed B tile in place into the
+                    # swizzled byte-container sB BEFORE any ldmatrix touches
+                    # this stage (two-phase; internal read/write barrier).
+                    _expand_packed_b_stage_smem(
+                        sb_base_addr,
+                        mainloop_consumer_state.index,
+                        Int32(tidx),
+                        self.tile_shape_mnk[1],
+                        self.tile_shape_mnk[2],
+                        self.num_mma_warps * self.num_threads_per_warp,
+                        self.mma_sync_barrier,
+                    )
+                    self.mma_sync_barrier.arrive_and_wait()
+                    if cutlass.const_expr(self.packed_expand_ahead):
+                        # Lookahead expanded this stage too (same index as the
+                        # consumer state at the prologue); move it one ahead.
+                        packed_b_lookahead_state.advance()
                 tCsA_p = tCsA_copy_view[None, None, None, mainloop_consumer_state.index]
                 tCsB_p = tCsB_copy_view[None, None, None, mainloop_consumer_state.index]
                 tCsSFA_p = tCsSFA_tile_copy_view[
@@ -907,6 +1291,36 @@ class DenseGemmKernel:
                             0 if k_block_idx + 1 == num_k_blocks else k_block_idx + 1
                         )
 
+                        if cutlass.const_expr(self.packed_expand_ahead):
+                            if k_block_idx == 0:
+                                # Expand-ahead: wait for stage s+1 (producer
+                                # runs >= 2 stages ahead at this depth, so the
+                                # wait is usually free) and expand it now, so
+                                # the whole expansion overlaps stage s's MMA
+                                # k-blocks instead of sitting at the stage
+                                # boundary. The matching write->ldmatrix fence
+                                # is the deferred barrier after the last
+                                # k-block's MMA below.
+                                lookahead_peek = (
+                                    mainloop_pipeline.consumer_try_wait(
+                                        packed_b_lookahead_state
+                                    )
+                                )
+                                mainloop_pipeline.consumer_wait(
+                                    packed_b_lookahead_state, lookahead_peek
+                                )
+                                _expand_packed_b_stage_smem(
+                                    sb_base_addr,
+                                    packed_b_lookahead_state.index,
+                                    Int32(tidx),
+                                    self.tile_shape_mnk[1],
+                                    self.tile_shape_mnk[2],
+                                    self.num_mma_warps
+                                    * self.num_threads_per_warp,
+                                    self.mma_sync_barrier,
+                                )
+                                packed_b_lookahead_state.advance()
+
                         if k_block_idx == num_k_blocks - 1:
                             mainloop_pipeline.consumer_release(mainloop_consumer_state)
                             mainloop_consumer_state.advance()
@@ -931,19 +1345,72 @@ class DenseGemmKernel:
                             mainloop_pipeline.consumer_wait(
                                 mainloop_consumer_state, peek_ab_full_status
                             )
+                            if cutlass.const_expr(
+                                self.b_packed and not self.packed_expand_ahead
+                            ):
+                                # Shallow-pipeline fallback (< 4 stages): the
+                                # new stage just became full (packed bytes
+                                # only); expand before the k_block_next=0
+                                # ldmatrix of this stage later in this
+                                # iteration. Reads of the PREVIOUS stage
+                                # finished at the prior iteration's copies, so
+                                # writing here is safe. The matching barrier
+                                # sits AFTER the MMA block below: the last
+                                # k-block's MMA reads only registers, so it
+                                # overlaps expansion stragglers instead of
+                                # waiting on the barrier first. (In expand-
+                                # ahead mode this stage was already expanded
+                                # at k_block 0; the consumer_wait above then
+                                # returns immediately.)
+                                _expand_packed_b_stage_smem(
+                                    sb_base_addr,
+                                    mainloop_consumer_state.index,
+                                    Int32(tidx),
+                                    self.tile_shape_mnk[1],
+                                    self.tile_shape_mnk[2],
+                                    self.num_mma_warps
+                                    * self.num_threads_per_warp,
+                                    self.mma_sync_barrier,
+                                )
 
                         # Manual atom unroll: avoids hasAuxTensor address space bug
                         for _mt in range(self.num_m_tiles):
                             for _nt in range(self.num_n_tiles):
-                                mma_atom.set(WarpField.SFA, tCrSFA_tile[None, _mt, k_block_idx].iterator)
-                                mma_atom.set(WarpField.SFB, tCrSFB_tile[None, _nt, k_block_idx].iterator)
-                                cute.gemm(
-                                    mma_atom,
-                                    accumulators[None, _mt, _nt],
-                                    tCrA[None, _mt, k_block_idx],
-                                    tCrB[None, _nt, k_block_idx],
-                                    accumulators[None, _mt, _nt],
-                                )
+                                if cutlass.const_expr(self.mxfp6_fmt_a is not None):
+                                    emit_mxfp6_dense_mma_k_block(
+                                        accumulators,
+                                        tCrA,
+                                        tCrB,
+                                        tCrSFA_tile,
+                                        tCrSFB_tile,
+                                        _mt,
+                                        _nt,
+                                        k_block_idx,
+                                        self.mxfp6_fmt_a,
+                                        self.mxfp6_fmt_b,
+                                    )
+                                else:
+                                    mma_atom.set(
+                                        WarpField.SFA,
+                                        tCrSFA_tile[None, _mt, k_block_idx].iterator,
+                                    )
+                                    mma_atom.set(
+                                        WarpField.SFB,
+                                        tCrSFB_tile[None, _nt, k_block_idx].iterator,
+                                    )
+                                    cute.gemm(
+                                        mma_atom,
+                                        accumulators[None, _mt, _nt],
+                                        tCrA[None, _mt, k_block_idx],
+                                        tCrB[None, _nt, k_block_idx],
+                                        accumulators[None, _mt, _nt],
+                                    )
+                        if cutlass.const_expr(self.b_packed):
+                            # Deferred expansion barrier (see expansion call
+                            # above): must precede the k_block_next=0 ldmatrix
+                            # of the just-expanded next stage right below.
+                            if k_block_idx == num_k_blocks - 1:
+                                self.mma_sync_barrier.arrive_and_wait()
                         cute.copy(
                             smem_tiled_copy_A,
                             tCsA_p[None, None, k_block_next],
@@ -1008,15 +1475,35 @@ class DenseGemmKernel:
                     # Manual atom unroll: avoids hasAuxTensor address space bug
                     for _mt in range(self.num_m_tiles):
                         for _nt in range(self.num_n_tiles):
-                            mma_atom.set(WarpField.SFA, tCrSFA_tile[None, _mt, k_block_idx].iterator)
-                            mma_atom.set(WarpField.SFB, tCrSFB_tile[None, _nt, k_block_idx].iterator)
-                            cute.gemm(
-                                mma_atom,
-                                accumulators[None, _mt, _nt],
-                                tCrA[None, _mt, k_block_idx],
-                                tCrB[None, _nt, k_block_idx],
-                                accumulators[None, _mt, _nt],
-                            )
+                            if cutlass.const_expr(self.mxfp6_fmt_a is not None):
+                                emit_mxfp6_dense_mma_k_block(
+                                    accumulators,
+                                    tCrA,
+                                    tCrB,
+                                    tCrSFA_tile,
+                                    tCrSFB_tile,
+                                    _mt,
+                                    _nt,
+                                    k_block_idx,
+                                    self.mxfp6_fmt_a,
+                                    self.mxfp6_fmt_b,
+                                )
+                            else:
+                                mma_atom.set(
+                                    WarpField.SFA,
+                                    tCrSFA_tile[None, _mt, k_block_idx].iterator,
+                                )
+                                mma_atom.set(
+                                    WarpField.SFB,
+                                    tCrSFB_tile[None, _nt, k_block_idx].iterator,
+                                )
+                                cute.gemm(
+                                    mma_atom,
+                                    accumulators[None, _mt, _nt],
+                                    tCrA[None, _mt, k_block_idx],
+                                    tCrB[None, _nt, k_block_idx],
+                                    accumulators[None, _mt, _nt],
+                                )
 
                 # EPILOGUE
                 _is_m_major = self.c_layout.is_m_major_c()
@@ -1103,8 +1590,6 @@ class DenseGemmKernel:
                             tRS_rD_layout.shape, self.c_dtype
                         )
                         acc_vec = tRS_rD.load()
-                        # Multiply alpha in FP32 before converting to c_dtype
-                        # to avoid overflow when c_dtype is FP16
                         acc_vec = epilogue_op((alpha_value * acc_vec).to(self.c_dtype))
                         tRS_rD_out.store(acc_vec)
 
@@ -1199,6 +1684,74 @@ class DenseGemmKernel:
                 tBgSFB_nkl = tBgSFB[(None, sfb_tile_coord_n, None, tile_coord_mnl[2])]
 
                 mainloop_producer_state.reset_count()
+                lane = Int32(tidx % self.num_threads_per_warp)
+
+                if cutlass.const_expr(self.a_bf16_fused):
+                    full_k = Int32(directX_bf16.shape[1])
+                    nvec = full_k // Int32(8)
+                    bf16_base = get_ptr_as_int64(directX_bf16, Int32(0))
+                    local_amax = cutlass.Float32(0.0)
+                    i_vec = lane
+                    while i_vec < nvec:
+                        w0, w1, w2, w3 = ld_global_v4_u32(
+                            bf16_base + cutlass.Int64(i_vec) * cutlass.Int64(16)
+                        )
+                        for w in (w0, w1, w2, w3):
+                            hi = u32_as_f32(w & Uint32(0x7FFF0000))
+                            lo = u32_as_f32(
+                                (w << Uint32(16)) & Uint32(0x7FFF0000)
+                            )
+                            local_amax = fmax_f32(
+                                local_amax, fmax_f32(hi, lo)
+                            )
+                        i_vec += Int32(self.num_threads_per_warp)
+                    fused_amax = warp_reduce(local_amax, fmax_f32)
+                    fused_amax_c = fmax_f32(
+                        fused_amax, cutlass.Float32(1e-6)
+                    )
+                    fused_gs = (
+                        cutlass.Float32(self._fused_gs_num) / fused_amax_c
+                    )
+                    _fq_k_base = Int32(0)
+                    _fq_sa_stage = Int32(0)
+                    _fq_packed_scales = Uint32(0)
+                    _fq_k_abs = Int32(0)
+                    _fq_val = cutlass.Float32(0.0)
+                    _fq_bmax = cutlass.Float32(0.0)
+                    _fq_su32 = Uint32(0)
+                    _fq_inv = cutlass.Float32(0.0)
+                    _fq_scaled = cutlass.Float32(0.0)
+                    _fq_pair = Uint32(0)
+                    _fq_code = Uint8(0)
+                    _fq_ssfa_stage = Int32(0)
+                    _fq_lin = Int32(0)
+                    _fq_m = Int32(0)
+                    _fq_sg_idx = Int32(0)
+                    _fq_sf_off = Int32(0)
+                    _fq_sb = Uint8(0)
+                    _fq_sfa_sg = self.tile_shape_mnk[2] // self.sf_vec_size
+                    _fq_sfa_slots = self.sfa_tile_shape_mk[0] * _fq_sfa_sg
+                    _fq_sg = 0
+                    _fq_si = 0
+
+                if cutlass.const_expr(self.use_m1_non_tma_a):
+                    a_iter = 0
+                    k_local = Int32(0)
+                    k_coord = Int32(0)
+
+                if cutlass.const_expr(self.use_m1_non_tma_sfa):
+                    scale_groups_per_k_tile = (
+                        self.tile_shape_mnk[2] // self.sf_vec_size
+                    )
+                    sfa_slots = (
+                        self.sfa_tile_shape_mk[0] * scale_groups_per_k_tile
+                    )
+                    sfa_iter = 0
+                    linear = Int32(0)
+                    m_local = Int32(0)
+                    scale_group = Int32(0)
+                    k_local_sfa = Int32(0)
+                    k_coord_sfa = Int32(0)
 
                 for k_tile in range(0, k_tile_cnt, 1, unroll=2):
                     mainloop_pipeline.producer_acquire(mainloop_producer_state)
@@ -1218,8 +1771,119 @@ class DenseGemmKernel:
                     tBgSFB_k = tBgSFB_nkl[(None, mainloop_producer_state.count)]
                     tBsSFB_pipe = tBsSFB[(None, mainloop_producer_state.index)]
 
-                    if cutlass.const_expr(self.use_m1_non_tma_a):
-                        lane = Int32(tidx % self.num_threads_per_warp)
+                    if cutlass.const_expr(self.a_bf16_fused):
+                        _fq_k_base = (
+                            mainloop_producer_state.count
+                            * Int32(self.tile_shape_mnk[2])
+                        )
+                        _fq_sa_stage = (
+                            mainloop_producer_state.index
+                            * Int32(
+                                self.tile_shape_mnk[0]
+                                * self.tile_shape_mnk[2]
+                            )
+                        )
+                        _fq_packed_scales = Uint32(0)
+
+                        for _fq_sg in cutlass.range_constexpr(
+                            self.tile_shape_mnk[2] // self.sf_vec_size
+                        ):
+                            _fq_k_abs = (
+                                _fq_k_base
+                                + Int32(_fq_sg * self.sf_vec_size)
+                                + lane
+                            )
+                            _fq_val = cutlass.Float32(
+                                directX_bf16[(Int32(0), _fq_k_abs)]
+                            )
+                            _fq_bmax = warp_reduce(
+                                fabs_f32(_fq_val), fmax_f32
+                            )
+                            _fq_su32 = fp6_block_ue8m0_exact(
+                                _fq_bmax,
+                                fused_gs,
+                                cutlass.Float32(self._fused_fmt_max),
+                            )
+                            _fq_inv = ue8m0_output_scale_exact(
+                                _fq_su32, fused_gs
+                            )
+                            _fq_scaled = _fq_val * _fq_inv
+                            if cutlass.const_expr(
+                                self._fused_act_fmt == "e4m3"
+                            ):
+                                _fq_pair = cvt_f32_to_e4m3x2(
+                                    cutlass.Float32(0.0), _fq_scaled
+                                )
+                            elif cutlass.const_expr(
+                                self._fused_act_fmt == "e3m2"
+                            ):
+                                _fq_pair = cvt_f32_to_e3m2x2(
+                                    cutlass.Float32(0.0), _fq_scaled
+                                )
+                            else:
+                                _fq_pair = cvt_f32_to_e2m3x2(
+                                    cutlass.Float32(0.0), _fq_scaled
+                                )
+                            _fq_code = Uint8(_fq_pair & Uint32(0xFF))
+
+                            # sA row-0 store (SW128 XOR is zero for row 0)
+                            st_shared_u8(
+                                sa_base_addr
+                                + _fq_sa_stage
+                                + Int32(_fq_sg * self.sf_vec_size)
+                                + lane,
+                                _fq_code,
+                            )
+
+                            _fq_packed_scales = _fq_packed_scales | (
+                                (_fq_su32 & Uint32(0xFF))
+                                << Uint32(_fq_sg * 8)
+                            )
+
+                        # Broadcast scale bytes to all 128 SFA M-rows.
+                        # SFA atom layout (Sw<3,4,3> UE8M0 block): flat offset
+                        # for (m_row, sg) = (m%32)*16 + (m//32)*4 + sg.
+                        _fq_sfa_sg = self.tile_shape_mnk[2] // self.sf_vec_size
+                        _fq_sfa_slots = self.sfa_tile_shape_mk[0] * _fq_sfa_sg
+                        _fq_ssfa_stage = (
+                            mainloop_producer_state.index
+                            * Int32(
+                                (self.sfa_tile_shape_mk[0] // 128) * 128
+                                * _fq_sfa_sg
+                            )
+                        )
+                        for _fq_si in cutlass.range_constexpr(
+                            (_fq_sfa_slots + self.num_threads_per_warp - 1)
+                            // self.num_threads_per_warp
+                        ):
+                            _fq_lin = lane + Int32(
+                                _fq_si * self.num_threads_per_warp
+                            )
+                            if _fq_lin < Int32(_fq_sfa_slots):
+                                _fq_m = _fq_lin // Int32(_fq_sfa_sg)
+                                _fq_sg_idx = _fq_lin - _fq_m * Int32(
+                                    _fq_sfa_sg
+                                )
+                                _fq_sf_off = (
+                                    (_fq_m & Int32(31)) * Int32(16)
+                                    + (_fq_m >> Int32(5)) * Int32(4)
+                                    + _fq_sg_idx
+                                )
+                                _fq_sb = Uint8(
+                                    (_fq_packed_scales
+                                     >> (Uint32(_fq_sg_idx) * Uint32(8)))
+                                    & Uint32(0xFF)
+                                )
+                                st_shared_u8(
+                                    ssfa_base_addr
+                                    + _fq_ssfa_stage
+                                    + _fq_sf_off,
+                                    _fq_sb,
+                                )
+
+                        cute.arch.fence_proxy("async.shared", space="cta")
+
+                    elif cutlass.const_expr(self.use_m1_non_tma_a):
                         for a_iter in cutlass.range_constexpr(
                             (self.tile_shape_mnk[2] + self.num_threads_per_warp - 1)
                             // self.num_threads_per_warp
@@ -1254,8 +1918,9 @@ class DenseGemmKernel:
                             ),
                         )
 
-                    if cutlass.const_expr(self.use_m1_non_tma_sfa):
-                        lane = Int32(tidx % self.num_threads_per_warp)
+                    if cutlass.const_expr(self.a_bf16_fused):
+                        pass  # scales already written above
+                    elif cutlass.const_expr(self.use_m1_non_tma_sfa):
                         scale_groups_per_k_tile = (
                             self.tile_shape_mnk[2] // self.sf_vec_size
                         )
@@ -1346,6 +2011,7 @@ class DenseGemmKernel:
         c_dtype,
         smem_capacity: int,
         occupancy: int,
+        b_packed: bool = False,
     ) -> tuple:
         epi_stage_max = (tile_shape_mnk[1] // epi_tile[1]) * (
             tile_shape_mnk[0] // epi_tile[0]
@@ -1360,6 +2026,8 @@ class DenseGemmKernel:
             cute.size(a_shape) * a_dtype.width // 8
             + cute.size(b_shape) * b_dtype.width // 8
         )
+        # b_packed costs no extra smem: the packed TMA tile is aliased into the
+        # bottom of each sB stage and expanded in place.
         sf_bytes_per_stage = (
             cute.size(cute.filter_zeros(sfa_smem_layout).shape) * sf_dtype.width // 8
             + cute.size(cute.filter_zeros(sfb_smem_layout).shape) * sf_dtype.width // 8
@@ -1373,6 +2041,10 @@ class DenseGemmKernel:
         ) // (ab_bytes_per_stage + sf_bytes_per_stage)
         ab_stage = max(1, min(raw_ab_stage, 4))
         if tile_shape_mnk[0] == 64 and tile_shape_mnk[1] == 128:
+            ab_stage = max(1, min(raw_ab_stage, 5))
+        if b_packed:
+            # In-place packed staging freed 12 KB/stage; deeper pipelines give
+            # the producer the lookahead the packed consumer chain needs.
             ab_stage = max(1, min(raw_ab_stage, 5))
         return ab_stage, epi_stage
 
@@ -1543,12 +2215,21 @@ class DenseGemmKernel:
         # quanta, while the SF paths round narrow tiles up to full 128-element
         # scale-factor blocks.
         if mma_tiler_mn in ((16, 64), (16, 128), (32, 64), (32, 128)):
-            if ab_dtype != cutlass.Float8E4M3FN:
+            if ab_dtype not in (
+                cutlass.Float8E4M3FN,
+                cutlass.Float6E3M2FN,
+                cutlass.Float6E2M3FN,
+            ):
                 return False
         elif mma_tiler_mn[0] % 64 != 0 or mma_tiler_mn[1] % 64 != 0:
             return False
-        # The current target supports FP4 and MXFP8 warp MMA paths.
-        if ab_dtype not in (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN):
+        # The current target supports FP4, MXFP8, and MX-FP6 warp MMA paths.
+        if ab_dtype not in (
+            cutlass.Float4E2M1FN,
+            cutlass.Float8E4M3FN,
+            cutlass.Float6E3M2FN,
+            cutlass.Float6E2M3FN,
+        ):
             return False
         # Current target MMA constraints:
         #   sf_vec_size=16 requires sf_dtype=Float8E4M3FN
@@ -1559,6 +2240,8 @@ class DenseGemmKernel:
             return False
         if ab_dtype == cutlass.Float8E4M3FN and sf_vec_size != 32:
             return False
+        if is_mxfp6_ab_dtype(ab_dtype) and sf_vec_size != 32:
+            return False
         # Only 16-bit output types supported for now
         if c_dtype not in (cutlass.Float16, cutlass.BFloat16):
             return False
@@ -1566,7 +2249,10 @@ class DenseGemmKernel:
         if a_major != "k" or b_major != "k":
             return False
         # Alignment: K must be divisible by tile_k
-        tile_k = 128 if ab_dtype == cutlass.Float8E4M3FN else sf_vec_size * 8
+        if ab_dtype == cutlass.Float8E4M3FN or is_mxfp6_ab_dtype(ab_dtype):
+            tile_k = mxfp6_tile_k() if is_mxfp6_ab_dtype(ab_dtype) else 128
+        else:
+            tile_k = sf_vec_size * 8
         if k % tile_k != 0:
             return False
         return True
@@ -1594,7 +2280,17 @@ class _DenseGemmLaunch:
         policy: _DenseGemmPolicy,
         sm_count: int,
         sm_version: str,
+        mxfp6_fmt: Optional[str] = None,
+        mxfp6_fmt_a: Optional[str] = None,
+        mxfp6_fmt_b: Optional[str] = None,
+        b_packed: bool = False,
     ):
+        if mxfp6_fmt_a is None and mxfp6_fmt_b is None:
+            mxfp6_fmt_a = mxfp6_fmt
+            mxfp6_fmt_b = mxfp6_fmt
+        self._mxfp6_fmt_a = mxfp6_fmt_a
+        self._mxfp6_fmt_b = mxfp6_fmt_b
+        self._b_packed = b_packed
         self._n = n
         self._k = k
         self._l = l
@@ -1646,6 +2342,8 @@ class _DenseGemmLaunch:
         sfb_ptr: cute.Pointer,
         c_ptr: cute.Pointer,
         alpha_ptr: cute.Pointer,
+        x_bf16_ptr: cute.Pointer,
+        w_gscale_ptr: cute.Pointer,
         m: cutlass.Int32,
         current_stream: cuda.CUstream,
     ):
@@ -1656,10 +2354,12 @@ class _DenseGemmLaunch:
                 order=(0, 1, 2) if self._a_major == "m" else (1, 0, 2),
             ),
         )
+        # Packed B carries 3 bytes per 4 codes: gmem extent is 3K/4.
+        b_k_extent = self._k * 3 // 4 if self._b_packed else self._k
         b_tensor = cute.make_tensor(
             b_ptr,
             layout=cute.make_ordered_layout(
-                (self._n, self._k, self._l),
+                (self._n, b_k_extent, self._l),
                 order=(0, 1, 2) if self._b_major == "n" else (1, 0, 2),
             ),
         )
@@ -1676,6 +2376,14 @@ class _DenseGemmLaunch:
         )
         sfa_tensor = cute.make_tensor(sfa_ptr, layout=cute.make_layout((1,)))
         sfb_tensor = cute.make_tensor(sfb_ptr, layout=cute.make_layout((1,)))
+        x_bf16_tensor = cute.make_tensor(
+            x_bf16_ptr,
+            layout=cute.make_ordered_layout((m, self._k), order=(0, 1)),
+        )
+        w_gscale_tensor = cute.make_tensor(
+            w_gscale_ptr,
+            layout=cute.make_ordered_layout((Int32(1),), order=(0,)),
+        )
         policy = self._policy
         DenseGemmKernel(
             sf_vec_size=self._sf_vec_size,
@@ -1685,12 +2393,12 @@ class _DenseGemmLaunch:
             tile_k=self._tile_k,
             single_work_tile_per_cta=policy.single_work_tile_per_cta,
             direct_one_m_tile_scheduler=policy.direct_one_m_tile_scheduler,
-            # The M=1 FP8 shape uses a 128-row MMA/TMA tile. In this lowering,
-            # the narrow A/SFA/C tensor-map paths illegal-instruction instead
-            # of relying on OOB handling, so keep them as explicit direct paths.
             use_m1_non_tma_a=policy.use_m1_non_tma,
             use_m1_non_tma_c=policy.use_m1_non_tma,
             use_m1_non_tma_sfa=policy.use_m1_non_tma,
+            mxfp6_fmt_a=self._mxfp6_fmt_a,
+            mxfp6_fmt_b=self._mxfp6_fmt_b,
+            b_packed=self._b_packed,
         )(
             a_tensor,
             b_tensor,
@@ -1700,6 +2408,8 @@ class _DenseGemmLaunch:
             alpha_tensor,
             self._max_active_clusters,
             current_stream,
+            x_bf16=x_bf16_tensor,
+            w_gscale=w_gscale_tensor,
         )
 
 
@@ -1723,6 +2433,10 @@ def _get_compiled_dense_gemm(
     policy: _DenseGemmPolicy,
     sm_count: int,
     sm_version: str,
+    mxfp6_fmt: Optional[str] = None,
+    mxfp6_fmt_a: Optional[str] = None,
+    mxfp6_fmt_b: Optional[str] = None,
+    b_packed: bool = False,
 ) -> Callable:
     def _make_runtime_pointers(
         input_tensors: Optional[List[torch.Tensor]],
@@ -1735,7 +2449,9 @@ def _get_compiled_dense_gemm(
                 sfb_data_ptr,
                 c_data_ptr,
                 alpha_data_ptr,
-            ) = [16 for _ in range(6)]
+                x_bf16_data_ptr,
+                w_gscale_data_ptr,
+            ) = [16 for _ in range(8)]
         else:
             (
                 a_tensor_gpu,
@@ -1744,6 +2460,8 @@ def _get_compiled_dense_gemm(
                 sfb_tensor_gpu,
                 c_tensor_gpu,
                 alpha_tensor_gpu,
+                x_bf16_tensor_gpu,
+                w_gscale_tensor_gpu,
             ) = input_tensors
             (
                 a_data_ptr,
@@ -1760,6 +2478,16 @@ def _get_compiled_dense_gemm(
                 c_tensor_gpu.data_ptr(),
                 alpha_tensor_gpu.data_ptr(),
             )
+            x_bf16_data_ptr = (
+                x_bf16_tensor_gpu.data_ptr()
+                if x_bf16_tensor_gpu is not None
+                else 16
+            )
+            w_gscale_data_ptr = (
+                w_gscale_tensor_gpu.data_ptr()
+                if w_gscale_tensor_gpu is not None
+                else 16
+            )
 
         return [
             make_ptr(ab_dtype, a_data_ptr, cute.AddressSpace.gmem, assumed_align=16),
@@ -1768,6 +2496,8 @@ def _get_compiled_dense_gemm(
             make_ptr(sf_dtype, sfb_data_ptr, cute.AddressSpace.gmem, assumed_align=16),
             make_ptr(c_dtype, c_data_ptr, cute.AddressSpace.gmem, assumed_align=16),
             make_ptr(alpha_dtype, alpha_data_ptr, cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(cutlass.BFloat16, x_bf16_data_ptr, cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(cutlass.Float32, w_gscale_data_ptr, cute.AddressSpace.gmem, assumed_align=16),
         ]
 
     launch = _DenseGemmLaunch(
@@ -1789,6 +2519,10 @@ def _get_compiled_dense_gemm(
         policy=policy,
         sm_count=sm_count,
         sm_version=sm_version,
+        mxfp6_fmt=mxfp6_fmt,
+        mxfp6_fmt_a=mxfp6_fmt_a,
+        mxfp6_fmt_b=mxfp6_fmt_b,
+        b_packed=b_packed,
     )
     compile_key = (
         n,
@@ -1806,6 +2540,9 @@ def _get_compiled_dense_gemm(
         policy,
         sm_count,
         sm_version,
+        mxfp6_fmt_a if mxfp6_fmt_a is not None else mxfp6_fmt,
+        mxfp6_fmt_b if mxfp6_fmt_b is not None else mxfp6_fmt,
+        b_packed,
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile",
@@ -1827,6 +2564,8 @@ def _get_compiled_dense_gemm(
         sfb_tensor_gpu: torch.Tensor,
         c_tensor_gpu: Optional[torch.Tensor] = None,
         alpha_tensor_gpu: Optional[torch.Tensor] = None,
+        x_bf16_tensor_gpu: Optional[torch.Tensor] = None,
+        w_gscale_tensor_gpu: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         m = a_tensor_gpu.shape[0]
         if c_tensor_gpu is None:
@@ -1852,6 +2591,8 @@ def _get_compiled_dense_gemm(
                     sfb_tensor_gpu,
                     c_tensor_gpu,
                     alpha_tensor_gpu,
+                    x_bf16_tensor_gpu,
+                    w_gscale_tensor_gpu,
                 ]
             ),
             m,
@@ -1868,15 +2609,19 @@ def _select_default_mma_tiler_mn(
     sm_count: int,
     *,
     is_mxfp8: bool,
+    is_mxfp6: bool = False,
 ) -> Tuple[int, int]:
     coarse_tile = (128, 128)
-    if is_mxfp8 and n > 1536:
-        # Keep the true single-token decode specialization, but do not let
-        # ordinary live prefill tails choose compile-time-only small-M tiles.
-        # vLLM warms attention with large prefill shapes and then passes the
-        # live token count at launch; prefix-cache continuations can otherwise
-        # hit first-use compiles for m=16/32/128 during serving.
-        if m == 1:
+    if (is_mxfp8 or is_mxfp6) and n > 1536:
+        # Small-M decode specialization (Phase 2.1). m<=16 covers BS1 decode
+        # (m=1) AND the MTP spec-decode verify forward (m = 1 +
+        # num_speculative_tokens, typically 5-8), which streams the full
+        # weight set every step; all fit in one 16-row M-tile. Widening past
+        # the historical m<=4 cap is safe ONLY because the vLLM plugin
+        # warm-runs every dense shape at m in {1,2,4,5,8,16} at load time
+        # (_warm_dense_decode_shapes), so no first-use JIT can hit
+        # mid-serving on live prefill-tail token counts.
+        if m <= 16:
             return (16, 128)
         return coarse_tile
 
@@ -1905,6 +2650,20 @@ def _select_default_mma_tiler_mn(
     return coarse_tile
 
 
+def _expand_packed_mxfp6_ab(t: torch.Tensor, num_codes: int) -> torch.Tensor:
+    """Expand a 3:4-packed FP6 operand ``(X, packed_k, L)`` to byte-containers.
+
+    Returns an ``(X, num_codes, L)`` uint8 view whose underlying memory is laid out
+    K-major (matching ``a_major``/``b_major == "k"``), so the compiled kernel reads
+    each FP6 code from one byte. The launch only uses ``data_ptr`` plus the compiled
+    ``(X, K, L)`` layout, so the returned view's strides need not be contiguous; the
+    contiguous backing buffer is kept alive by the returned view.
+    """
+    t_lxk = t.permute(2, 0, 1).contiguous()  # (L, X, packed_k), packed_k fastest
+    e_lxk = expand_mxfp6_packed_to_bytes(t_lxk, num_codes)  # (L, X, num_codes)
+    return e_lxk.permute(1, 2, 0)  # (X, num_codes, L), K stride 1
+
+
 def dense_gemm(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],
@@ -1919,28 +2678,103 @@ def dense_gemm(
     cluster_shape_mn: Tuple[int, int] = (1, 1),
     alpha: Optional[torch.Tensor] = None,
     alpha_dtype: Optional[str] = None,
+    a_preexpanded: bool = False,
+    b_preexpanded: bool = False,
+    b_packed: bool = False,
+    a_fmt: Optional[str] = None,
+    b_fmt: Optional[str] = None,
+    x_bf16: Optional[torch.Tensor] = None,
+    w_gscale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Execute dense block-scaled GEMM for one expert-major batch stack."""
+    """Execute dense block-scaled GEMM for one expert-major batch stack.
+
+    ``b_preexpanded``: when True the RHS is already in 1-byte-per-code FP8
+    container layout (the output of ``_expand_packed_mxfp6_ab``) and the
+    per-call weight expansion is skipped. Callers hoist the expansion to load
+    time so the static weight is unpacked once instead of every token.
+
+    ``a_preexpanded``: same for the LHS — its shape is then ``(M, K, L)`` with
+    one code per byte (e.g. the quantizer's ``emit="bytes"`` output), so the
+    logical K is read directly from the shape and no expansion runs.
+
+    ``b_packed``: native packed-FP6 streaming. The RHS stays in the 3:4-packed
+    wire format ``(N, 3K/4, L)``; the kernel TMA-streams the packed bytes and
+    expands to byte-containers in smem. 25% less B HBM traffic than the
+    byte-container layout and no expanded copy resident in VRAM. MX-FP6 only;
+    mutually exclusive with ``b_preexpanded``.
+
+    ``a_fmt`` / ``b_fmt``: optional per-operand MX sub-formats (``e2m3`` /
+    ``e3m2`` / ``e4m3``). When omitted, both operands use the format implied by
+    ``ab_dtype``. W6A8 dense passes ``a_fmt="e4m3"`` (activations) and
+    ``b_fmt="e2m3"`` (weights) with ``ab_dtype="float6_e2m3fn"`` so the weight
+    packing / expansion path stays on the MX-FP6 branch.
+    """
     a_torch, sfa_torch = lhs
     b_torch, sfb_torch = rhs
+    if b_packed and b_preexpanded:
+        raise ValueError("b_packed and b_preexpanded are mutually exclusive")
 
     m, k, l = a_torch.shape
     n, _, _ = b_torch.shape
+    mxfp6_fmt: Optional[str] = None
+    mxfp6_fmt_a: Optional[str] = None
+    mxfp6_fmt_b: Optional[str] = None
     if ab_dtype == "float4_e2m1fn":
         is_mxfp8 = False
+        is_mxfp6 = False
         k *= 2
         mma_k = 64
         tile_k = sf_vec_size * 8
     elif ab_dtype == "float8_e4m3fn":
         is_mxfp8 = True
+        is_mxfp6 = False
         mma_k = 32
         tile_k = 128
+    elif ab_dtype in ("float6_e3m2fn", "float6_e2m3fn"):
+        is_mxfp8 = False
+        is_mxfp6 = True
+        if sf_vec_size != 32:
+            raise ValueError("MX-FP6 dense_gemm requires sf_vec_size=32")
+        if sf_dtype != "float8_e8m0fnu":
+            raise ValueError("MX-FP6 dense_gemm requires sf_dtype='float8_e8m0fnu'")
+        if not a_preexpanded:
+            k = mxfp6_logical_k_from_packed_bytes(k)
+        mma_k = 32
+        tile_k = mxfp6_tile_k(sf_vec_size)
+        weight_fmt = "e3m2" if ab_dtype == "float6_e3m2fn" else "e2m3"
+        mxfp6_fmt_b = b_fmt if b_fmt is not None else weight_fmt
+        mxfp6_fmt_a = a_fmt if a_fmt is not None else weight_fmt
+        mxfp6_fmt = mxfp6_fmt_a if mxfp6_fmt_a == mxfp6_fmt_b else None
+        for name, fmt in (("a_fmt", mxfp6_fmt_a), ("b_fmt", mxfp6_fmt_b)):
+            if fmt not in ("e2m3", "e3m2", "e4m3"):
+                raise ValueError(f"unsupported {name}={fmt!r}")
     else:
         raise TypeError(f"dense_gemm unsupported ab_dtype: {ab_dtype}")
+    if b_packed:
+        if mxfp6_fmt_b is None:
+            raise ValueError("b_packed requires an MX-FP6 ab_dtype")
+        if b_torch.shape[1] * 4 != k * 3:
+            raise ValueError(
+                f"b_packed expects (N, 3K/4, L); got packed K bytes "
+                f"{b_torch.shape[1]} for logical K {k}"
+            )
 
     if sm_count is None:
         sm_count = get_num_sm(a_torch.device)
     ab_cutlass_dtype = get_cutlass_dtype(ab_dtype)
+    if mxfp6_fmt_a is not None:
+        # Stage 1: carry MX codes in Float8E4M3FN byte-containers so the kernel
+        # uses cutlass's native 8-bit smem/TMA/ldmatrix path (cutlass cannot build
+        # a 6-bit smem layout). Expand the 3:4-packed inputs to one code per byte
+        # at this load boundary; the on-disk/wire format stays packed. E4M3
+        # activations are already one-byte-per-code (a_preexpanded required).
+        ab_cutlass_dtype = cutlass.Float8E4M3FN
+        if not a_preexpanded:
+            if mxfp6_fmt_a == "e4m3":
+                raise ValueError("e4m3 activations require a_preexpanded=True")
+            a_torch = _expand_packed_mxfp6_ab(a_torch, k)
+        if not (b_preexpanded or b_packed):
+            b_torch = _expand_packed_mxfp6_ab(b_torch, k)
     sf_cutlass_dtype = get_cutlass_dtype(sf_dtype)
     c_cutlass_dtype = get_cutlass_dtype(c_dtype)
     if mma_tiler_mn is None:
@@ -1949,6 +2783,7 @@ def dense_gemm(
             n,
             sm_count,
             is_mxfp8=is_mxfp8,
+            is_mxfp6=is_mxfp6,
         )
     if alpha_dtype is None:
         alpha_dtype = "float32" if alpha is None else str(alpha.dtype).split(".")[-1]
@@ -1984,6 +2819,10 @@ def dense_gemm(
         policy=policy,
         sm_count=sm_count,
         sm_version="sm_120",
+        mxfp6_fmt=mxfp6_fmt,
+        mxfp6_fmt_a=mxfp6_fmt_a,
+        mxfp6_fmt_b=mxfp6_fmt_b,
+        b_packed=b_packed,
     )
     t_compiled = time.perf_counter() if _B12X_TIMING else 0.0
     result = compiled(
@@ -1993,6 +2832,8 @@ def dense_gemm(
         sfb_tensor_gpu=sfb_torch,
         c_tensor_gpu=out,
         alpha_tensor_gpu=alpha,
+        x_bf16_tensor_gpu=x_bf16,
+        w_gscale_tensor_gpu=w_gscale,
     )
     if _B12X_TIMING:
         t_launch = time.perf_counter()

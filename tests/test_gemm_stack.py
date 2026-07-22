@@ -212,3 +212,22 @@ def test_default_dense_tile_selector_handles_small_m_wide_n(
     expected: tuple[int, int],
 ) -> None:
     assert _select_default_mma_tiler_mn(m, n, sm_count, is_mxfp8=False) == expected
+
+
+@pytest.mark.parametrize(
+    ("m", "expected"),
+    [
+        (1, (16, 128)),
+        (4, (16, 128)),
+        (5, (16, 128)),  # MTP verify m=1+4: was (128,128) before Phase 2.1
+        (8, (16, 128)),
+        (16, (16, 128)),
+        (17, (128, 128)),  # prefill tails stay on the coarse tile
+    ],
+)
+def test_default_dense_tile_selector_mxfp6_small_m(
+    m: int, expected: tuple[int, int]
+) -> None:
+    """Phase 2.1: the small-M decode tile covers m<=16 for MX-FP6/FP8."""
+    got = _select_default_mma_tiler_mn(m, 4096, 48, is_mxfp8=False, is_mxfp6=True)
+    assert got == expected

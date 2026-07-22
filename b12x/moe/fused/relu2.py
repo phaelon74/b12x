@@ -59,6 +59,9 @@ class MoEStaticKernelRelu2(MoEStaticKernelBackend):
         share_input_across_experts: bool = False,
         share_expert_scales: bool = False,
         dynamic_down_scale: bool = False,
+        mxfp6_fmt_a: str | None = None,
+        mxfp6_fmt_b: str | None = None,
+        deterministic_scatter: bool = False,
     ):
         super().__init__(
             sf_vec_size,
@@ -71,6 +74,9 @@ class MoEStaticKernelRelu2(MoEStaticKernelBackend):
             share_input_across_experts=share_input_across_experts,
             share_expert_scales=share_expert_scales,
             dynamic_down_scale=dynamic_down_scale,
+            mxfp6_fmt_a=mxfp6_fmt_a,
+            mxfp6_fmt_b=mxfp6_fmt_b,
+            deterministic_scatter=deterministic_scatter,
         )
 
 
@@ -83,6 +89,9 @@ class MoEDynamicKernelRelu2(MoEDynamicKernelBackend):
         fast_math: bool = False,
         dynamic_down_scale: bool = False,
         share_input_across_experts: bool = False,
+        mxfp6_fmt_a: str | None = None,
+        mxfp6_fmt_b: str | None = None,
+        deterministic_scatter: bool = False,
     ):
         super().__init__(
             sf_vec_size,
@@ -91,6 +100,9 @@ class MoEDynamicKernelRelu2(MoEDynamicKernelBackend):
             activation="relu2",
             dynamic_down_scale=dynamic_down_scale,
             share_input_across_experts=share_input_across_experts,
+            mxfp6_fmt_a=mxfp6_fmt_a,
+            mxfp6_fmt_b=mxfp6_fmt_b,
+            deterministic_scatter=deterministic_scatter,
         )
 
 

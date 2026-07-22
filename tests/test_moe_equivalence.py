@@ -333,3 +333,94 @@ def test_moe_cuda_graph_replay_multilayer_tracks_routing_updates(m):
             assert (
                 cos > cos_tol
             ), f"m={m} scenario={scenario_name} layer={layer_idx}: cos={cos:.6f}"
+
+
+@pytest.mark.parametrize("m", [1, 4, 17, 64])
+def test_moe_bitwise_determinism(m, monkeypatch):
+    """Call b12x_moe_fp4 twice with identical inputs and verify bit-identical output.
+
+    Self-contained test with synthetic weights — no model files required.
+    With B12X_MOE_DETERMINISTIC=1 (opt-in; default is the fast atomic-scatter
+    path), each (routed pair, intermediate
+    slice) FC2 partial scatters to its own unique staging row (exactly one
+    atomic add per location — order-independent values), the kernel records
+    each physical row's pair index, and the host sums slices then topk slots
+    in canonical order.  This must produce bit-identical results across
+    calls.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("No CUDA")
+
+    monkeypatch.setenv("B12X_MOE_DETERMINISTIC", "1")
+
+    from b12x.integration.tp_moe import (
+        allocate_tp_moe_workspace_pool,
+        b12x_moe_fp4,
+        clear_tp_moe_caches,
+    )
+    from tests.test_tp_moe_relu2_reference import _quantize_moe_weight_storage
+
+    clear_tp_moe_caches()
+
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+
+    hidden_size = 4096
+    intermediate_size = 1024
+    num_experts = 8
+    top_k = 8
+
+    x = torch.randn(m, hidden_size, device=device, dtype=torch.bfloat16) / 10
+    topk_ids = torch.stack(
+        [
+            (torch.arange(top_k, device=device, dtype=torch.int32) + tok) % num_experts
+            for tok in range(m)
+        ]
+    ).contiguous()
+    topk_logits = torch.randn(m, top_k, device=device, dtype=torch.float32)
+    topk_weights = torch.softmax(topk_logits, dim=-1).contiguous()
+
+    weight_scale = torch.ones(num_experts, device=device, dtype=torch.float32)
+    w13 = torch.randn(
+        num_experts, 2 * intermediate_size, hidden_size,
+        device=device, dtype=torch.bfloat16,
+    ) / 50
+    w2 = torch.randn(
+        num_experts, hidden_size, intermediate_size,
+        device=device, dtype=torch.bfloat16,
+    ) / 50
+    w13_fp4, w13_bs = _quantize_moe_weight_storage(w13, weight_scale)
+    w2_fp4, w2_bs = _quantize_moe_weight_storage(w2, weight_scale)
+    w13_input_scale = torch.linspace(
+        0.00045, 0.00075, steps=num_experts, device=device, dtype=torch.float32,
+    )
+    w2_input_scale = torch.linspace(
+        0.00030, 0.00055, steps=num_experts, device=device, dtype=torch.float32,
+    )
+    w13_alphas = torch.ones(num_experts, device=device, dtype=torch.float32)
+    w2_alphas = torch.ones(num_experts, device=device, dtype=torch.float32)
+
+    workspace = allocate_tp_moe_workspace_pool()
+
+    def _run():
+        return b12x_moe_fp4(
+            x,
+            1.0 / w13_input_scale,
+            w13_fp4, w13_bs, w13_alphas,
+            1.0 / w2_input_scale,
+            w2_fp4, w2_bs, w2_alphas,
+            topk_weights, topk_ids,
+            workspace=workspace,
+            input_scales_static=True,
+        )
+
+    out1 = _run().clone()
+    torch.cuda.synchronize()
+    out2 = _run().clone()
+    torch.cuda.synchronize()
+
+    mismatches = (out1 != out2).sum().item()
+    total = out1.numel()
+    assert mismatches == 0, (
+        f"m={m}: {mismatches}/{total} elements differ between two identical calls"
+    )

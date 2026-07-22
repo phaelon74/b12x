@@ -120,7 +120,9 @@ from .residual import (
 )
 from .tp_moe import (
     B12XFP4ExpertWeights,
+    B12XFP6ExpertWeights,
     B12XPreparedFP4MoEWeights,
+    B12XPreparedFP6MoEWeights,
     B12XTopKRouting,
     TPMoEFP4Binding,
     TPMoERouteBinding,
@@ -131,6 +133,7 @@ from .tp_moe import (
     TPMoEWorkspacePool,
     allocate_tp_moe_workspace_pool,
     b12x_moe_fp4,
+    b12x_moe_fp6,
     b12x_route_experts_fast,
     b12x_sparse_moe_fp4,
     build_tp_moe_fp4_binding,
@@ -139,6 +142,16 @@ from .tp_moe import (
     plan_tp_moe_arena_layout,
     plan_tp_moe_scratch,
     prepare_b12x_fp4_moe_weights,
+    prepare_b12x_fp6_moe_weights,
+)
+from .fp6_serving import (
+    B12XFP6LinearMethod,
+    B12XFP6MoEMethod,
+    is_b12x_fp6_checkpoint,
+    is_b12x_fp6_enabled,
+    load_b12x_fp6_linear_methods,
+    load_b12x_fp6_moe_methods,
+    should_use_b12x_fp6,
 )
 
 __all__ = [
@@ -245,7 +258,9 @@ __all__ = [
     "mhc_workspace_nbytes",
     "plan_mhc_scratch",
     "B12XFP4ExpertWeights",
+    "B12XFP6ExpertWeights",
     "B12XPreparedFP4MoEWeights",
+    "B12XPreparedFP6MoEWeights",
     "B12XTopKRouting",
     "TPMoEFP4Binding",
     "TPMoERouteBinding",
@@ -256,6 +271,7 @@ __all__ = [
     "TPMoEWorkspacePool",
     "allocate_tp_moe_workspace_pool",
     "b12x_moe_fp4",
+    "b12x_moe_fp6",
     "b12x_route_experts_fast",
     "b12x_sparse_moe_fp4",
     "build_tp_moe_fp4_binding",
@@ -264,4 +280,12 @@ __all__ = [
     "plan_tp_moe_arena_layout",
     "plan_tp_moe_scratch",
     "prepare_b12x_fp4_moe_weights",
+    "prepare_b12x_fp6_moe_weights",
+    "B12XFP6LinearMethod",
+    "B12XFP6MoEMethod",
+    "is_b12x_fp6_checkpoint",
+    "is_b12x_fp6_enabled",
+    "load_b12x_fp6_linear_methods",
+    "load_b12x_fp6_moe_methods",
+    "should_use_b12x_fp6",
 ]
