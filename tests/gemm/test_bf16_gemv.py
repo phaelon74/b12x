@@ -16,7 +16,11 @@ cuda_required = pytest.mark.skipif(
 
 
 def _op():
-    import sparkinfer.gemm.bf16_gemv  # noqa: F401  (registers the op)
+    from sparkinfer.gemm import bf16_gemv
+
+    # The package API is lazy (install_lazy_api); touching the attribute
+    # imports _kernel, which registers the torch custom op.
+    bf16_gemv.bf16_gemv_small_n  # noqa: B018
 
     return torch.ops.sparkinfer.bf16_gemv_small_n
 

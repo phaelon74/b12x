@@ -947,9 +947,11 @@ class DenseGemmKernel:
         """
         # Dead kernel arguments on every non-fused path; substitute a
         # type-compatible live tensor so the traced signature stays uniform.
-        if x_bf16 is None:
+        # const_expr is required: DSL >= 4.6 otherwise traces this as a
+        # runtime if-region and rejects the rebind (CONTAINER_STRUCTURE_CHANGED).
+        if cutlass.const_expr(x_bf16 is None):
             x_bf16 = alpha
-        if w_gscale is None:
+        if cutlass.const_expr(w_gscale is None):
             w_gscale = alpha
         # Setup static attributes
         self.a_dtype = a.element_type
