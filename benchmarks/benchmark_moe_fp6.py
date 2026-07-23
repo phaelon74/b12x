@@ -69,7 +69,9 @@ def main() -> None:
     from sparkinfer.moe import fused_moe
     from sparkinfer.quantization.mxfp6 import quantize_moe_weights_to_fp6
 
-    device = torch.device("cuda")
+    # Fully-qualified device: the scratch binder compares device strings
+    # exactly, and tensors allocated on "cuda" report "cuda:0".
+    device = torch.device("cuda", torch.cuda.current_device())
     torch.manual_seed(0)
     m, k, n, e, topk = args.m, args.k, args.n, args.experts, args.topk
     if k % 128 != 0 or n % 128 != 0:

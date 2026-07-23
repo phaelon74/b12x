@@ -107,7 +107,9 @@ def main() -> None:
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA required (the FP6 kernel runs on SM120)")
-    device = torch.device("cuda")
+    # Fully-qualified device: the scratch binder compares device strings
+    # exactly, and tensors allocated on "cuda" report "cuda:0".
+    device = torch.device("cuda", torch.cuda.current_device())
     torch.manual_seed(args.seed)
     e, k, n, topk = args.experts, args.k, args.n, args.topk
     if k % 128 != 0 or n % 128 != 0:
