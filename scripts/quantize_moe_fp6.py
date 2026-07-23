@@ -6,19 +6,20 @@ API directly; upstream the consumer is ``sparkinfer.moe.fused_moe`` (load with
 ``sparkinfer.quantization.mxfp6.load_fp6_moe_weights``). Activations are NOT quantized here:
 they are quantized on the fly inside the kernel at inference time.
 
-Input checkpoint (``--input``) must be a torch-loadable file containing a dict with
-BF16 tensors:
+Input checkpoint (``--input``) must be a safetensors file containing BF16
+tensors (safetensors only; pickle .pt inputs are not supported):
     w1 / w13 : FC1 weights (E, 2*N, K)  (gate+up; (E, N, K) for relu2)
     w2 / w_down / down : FC2 weights (E, K, N)
 
 Examples
 --------
 Quantize a checkpoint:
-    python scripts/quantize_moe_fp6.py --input experts_bf16.pt --output experts_fp6.pt
+    python scripts/quantize_moe_fp6.py --input experts_bf16.safetensors \
+        --output experts_fp6.safetensors
 
 Generate + quantize random weights (no checkpoint needed) to smoke-test the path:
     python scripts/quantize_moe_fp6.py --demo --experts 4 --k 128 --n 128 \
-        --output demo_fp6.pt
+        --output demo_fp6.safetensors
 """
 from __future__ import annotations
 
@@ -38,8 +39,8 @@ def _pick(d: dict, *keys: str) -> torch.Tensor:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", help="torch checkpoint with w1/w13 and w2/down")
-    parser.add_argument("--output", required=True, help="destination .pt path")
+    parser.add_argument("--input", help="safetensors checkpoint with w1/w13 and w2/down")
+    parser.add_argument("--output", required=True, help="destination .safetensors path")
     parser.add_argument("--source-format", default="mxfp6_default")
     parser.add_argument("--activation", default="silu", choices=["silu", "relu2"])
     parser.add_argument(
@@ -64,7 +65,9 @@ def main() -> None:
     else:
         if not args.input:
             parser.error("--input is required unless --demo is set")
-        ckpt = torch.load(args.input, map_location=device)
+        from safetensors.torch import load_file
+
+        ckpt = load_file(args.input, device=str(device))
         w1 = _pick(ckpt, "w1", "w13", "w1_bf16").to(device=device, dtype=torch.bfloat16)
         w2 = _pick(ckpt, "w2", "w_down", "down", "w2_bf16").to(device=device, dtype=torch.bfloat16)
 

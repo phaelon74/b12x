@@ -421,7 +421,7 @@ def convert_moe_model_to_fp6(
     dry_run: bool = False,
     verbose: bool = True,
 ) -> ConvertReport:
-    """Quantize routed-expert FFNs to MX-FP6, one ``layer_{L}.moe_fp6.pt`` each.
+    """Quantize routed-expert FFNs to MX-FP6, one ``layer_{L}.moe_fp6.safetensors`` each.
 
     ``gate_up_order`` describes how the source fused FC1 rows are laid out:
     ``"gate_up"`` (HF default: ``[gate; up]``) or ``"up_gate"``. The kernel needs
@@ -458,7 +458,7 @@ def convert_moe_model_to_fp6(
         weights = quantize_moe_weights_to_fp6(
             w1, w2, source_format=source_format, activation=activation, use_gpu=use_gpu
         )
-        fname = f"layer_{layer}.moe_fp6.pt"
+        fname = f"layer_{layer}.moe_fp6.safetensors"
         save_fp6_moe_weights(weights, str(out / fname))
         report.tensors_written += 2  # w1 + w2
         report.artifacts.append(
@@ -495,11 +495,16 @@ def convert_dense_model_to_fp6(
 ) -> ConvertReport:
     """Quantize dense MLP (+ optional attention) linears, one file per layer.
 
-    Writes ``layer_{L}.dense_fp6.pt`` (a dict ``{full_key: FP6DenseWeight payload,
-    "__format__": ...}``). Real quantization requires CUDA (the dense quantizer is
-    GPU-only); ``dry_run`` works anywhere.
+    Writes ``layer_{L}.dense_fp6.safetensors``: tensor fields are stored flat
+    as ``{full_key}::{field}`` entries, non-tensor fields as JSON metadata
+    under ``{full_key}`` (safetensors only; pickle persistence is not
+    supported by project policy). Real quantization requires CUDA (the dense
+    quantizer is GPU-only); ``dry_run`` works anywhere.
     """
+    import json
     from dataclasses import asdict
+
+    from safetensors.torch import save_file
 
     from sparkinfer.quantization.mxfp6 import quantize_dense_weight_to_fp6
 
@@ -527,7 +532,10 @@ def convert_dense_model_to_fp6(
     out = pathlib.Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     for layer in layers:
-        payload: dict[str, object] = {}
+        tensors: dict[str, torch.Tensor] = {}
+        # historical on-disk format id; do not rename
+        metadata: dict[str, str] = {"__format__": "b12x_fp6_dense_layer_v1"}
+        linear_keys: list[str] = []
         for rel in rels:
             key = scheme.linear_key(layer, rel)
             if not model.has(key):
@@ -538,25 +546,25 @@ def convert_dense_model_to_fp6(
                 continue
             w = model.get_tensor(key).to(device, torch.bfloat16)
             qw = quantize_dense_weight_to_fp6(w, source_format=source_format)
-            entry = asdict(qw)
-            for k2, v in entry.items():
+            scalars: dict[str, object] = {}
+            for k2, v in asdict(qw).items():
                 if isinstance(v, torch.Tensor):
-                    entry[k2] = v.detach().cpu()
-            payload[key] = entry
+                    tensors[f"{key}::{k2}"] = v.detach().cpu().contiguous()
+                else:
+                    scalars[k2] = v
+            metadata[key] = json.dumps(scalars)
+            linear_keys.append(key)
             report.tensors_written += 1
             del w, qw
             torch.cuda.empty_cache()
-        if payload:
-            # historical on-disk format id; do not rename
-            payload["__format__"] = "b12x_fp6_dense_layer_v1"
-            fname = f"layer_{layer}.dense_fp6.pt"
-            torch.save(payload, str(out / fname))
+        if tensors:
+            fname = f"layer_{layer}.dense_fp6.safetensors"
+            save_file(tensors, str(out / fname), metadata=metadata)
             report.artifacts.append(
-                {"layer": layer, "file": fname,
-                 "tensors": [k for k in payload if k != "__format__"]}
+                {"layer": layer, "file": fname, "tensors": linear_keys}
             )
             if verbose:
-                print(f"  layer {layer}: {report.artifacts[-1]['tensors'].__len__()} linears -> {fname}")
+                print(f"  layer {layer}: {len(linear_keys)} linears -> {fname}")
 
     _write_manifest(out, {
         # historical on-disk format id; do not rename

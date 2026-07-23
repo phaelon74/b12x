@@ -228,21 +228,43 @@ def quantize_moe_weights_to_fp6(
 
 
 def save_fp6_moe_weights(weights: FP6MoEWeights, path: str) -> None:
-    """Serialize :class:`FP6MoEWeights` to ``path`` (tensors stored on CPU)."""
-    payload = asdict(weights)
-    for key, value in payload.items():
+    """Serialize :class:`FP6MoEWeights` to ``path`` as safetensors.
+
+    Tensors are stored on CPU; the non-tensor dataclass fields travel as
+    JSON-encoded safetensors metadata. Pickle (.pt) persistence is
+    intentionally not supported (project policy: safetensors only).
+    """
+    import json
+
+    from safetensors.torch import save_file
+
+    tensors: dict[str, torch.Tensor] = {}
+    # historical schema id; do not rename (existing artifacts carry it)
+    metadata = {"__format__": "b12x_fp6_moe_weights_v1"}
+    for key, value in asdict(weights).items():
         if isinstance(value, torch.Tensor):
-            payload[key] = value.detach().cpu()
-    # historical on-disk format id; do not rename (existing artifacts carry it)
-    payload["__format__"] = "b12x_fp6_moe_weights_v1"
-    torch.save(payload, path)
+            tensors[key] = value.detach().cpu().contiguous()
+        else:
+            metadata[key] = json.dumps(value)
+    save_file(tensors, path, metadata=metadata)
 
 
 def load_fp6_moe_weights(
     path: str, *, device: torch.device | str = "cuda"
 ) -> FP6MoEWeights:
     """Load weights saved by :func:`save_fp6_moe_weights` onto ``device``."""
-    payload = torch.load(path, map_location="cpu")
-    payload.pop("__format__", None)
-    weights = FP6MoEWeights(**payload)
+    import json
+
+    from safetensors.torch import safe_open
+
+    fields: dict[str, object] = {}
+    with safe_open(path, framework="pt", device="cpu") as f:
+        metadata = f.metadata() or {}
+        for key in f.keys():
+            fields[key] = f.get_tensor(key)
+    for key, value in metadata.items():
+        if key == "__format__":
+            continue
+        fields[key] = json.loads(value)
+    weights = FP6MoEWeights(**fields)
     return weights.to(device)

@@ -174,9 +174,9 @@ is by design; the flag is off by default for serving.
 ## 9. Step 7 — Quantization tooling smoke
 
 ```bash
-# Synthetic MoE artifact end-to-end (no model download needed)
-python scripts/quantize_moe_fp6.py --demo --experts 8 --k 256 --n 256 --output /tmp/demo_fp6.pt
-python scripts/validate_fp6_moe_artifact.py --artifact /tmp/demo_fp6.pt --tokens 8,128
+# Synthetic MoE artifact end-to-end (no model download needed; safetensors only)
+python scripts/quantize_moe_fp6.py --demo --experts 8 --k 256 --n 256 --output /tmp/demo_fp6.safetensors
+python scripts/validate_fp6_moe_artifact.py --artifact /tmp/demo_fp6.safetensors --tokens 8,128 --reference
 
 # If the real models are on the rig, a dry-run costs nothing:
 python scripts/quantize_model_fp6.py --model /path/to/Qwen3.6-35B-A3B --out /tmp/probe --arch auto --dry-run

@@ -110,7 +110,7 @@ def test_moe_convert_cpu_roundtrip(tmp_path) -> None:
     )
     assert report.tensors_written == 2
     assert (tmp_path / "out" / "manifest.json").is_file()
-    art = tmp_path / "out" / "layer_0.moe_fp6.pt"
+    art = tmp_path / "out" / "layer_0.moe_fp6.safetensors"
     assert art.is_file()
 
     from sparkinfer.quantization.mxfp6 import load_fp6_moe_weights

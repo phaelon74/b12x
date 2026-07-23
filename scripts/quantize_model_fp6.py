@@ -9,8 +9,10 @@ packed MX-FP6. Two output formats:
   ``.input_scale``) with ``quantization_config.quant_algo="W6A6"``. Routed MoE
   experts are written per-expert. Sharded ``model-*.safetensors`` + index +
   patched ``config.json`` + copied tokenizer/aux files.
-* ``--format pt``: legacy per-layer ``.pt`` artifacts for kernel validation
-  (load with ``sparkinfer.quantization.mxfp6.load_fp6_moe_weights``).
+* ``--format pt``: per-layer ``.moe_fp6.safetensors`` / ``.dense_fp6.safetensors``
+  artifacts for kernel validation (load MoE layers with
+  ``sparkinfer.quantization.mxfp6.load_fp6_moe_weights``). The flag name is
+  historical; output is safetensors (pickle persistence is not supported).
 
 Routed experts plus the non-expert 2-D Linears (attention, shared experts; and
 for dense, MLP) are quantized via the golden-rule walk; norms, embeddings,
@@ -34,7 +36,7 @@ Export a full FP6 HF checkpoint (MoE):
 Export a full FP6 HF checkpoint (dense, MLP + attention):
     python scripts/quantize_model_fp6.py --model /path/Qwen3.6-27B --out qwen27_fp6 --arch dense
 
-Legacy per-layer .pt artifacts (kernel validation):
+Per-layer kernel-validation artifacts (safetensors):
     python scripts/quantize_model_fp6.py --model /path/Qwen3.6-35B-A3B --out out_moe --arch moe --format pt
 """
 from __future__ import annotations

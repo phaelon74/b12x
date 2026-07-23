@@ -590,20 +590,42 @@ def dense_fp6_linear(
 
 
 def save_fp6_dense_weight(weight: FP6DenseWeight, path: str) -> None:
-    """Serialize a :class:`FP6DenseWeight` to ``path`` (tensors stored on CPU)."""
-    payload = asdict(weight)
-    for key, value in payload.items():
+    """Serialize a :class:`FP6DenseWeight` to ``path`` as safetensors.
+
+    Tensors are stored on CPU; non-tensor fields travel as JSON-encoded
+    safetensors metadata. Pickle (.pt) persistence is intentionally not
+    supported (project policy: safetensors only).
+    """
+    import json
+
+    from safetensors.torch import save_file
+
+    tensors: dict[str, torch.Tensor] = {}
+    # historical schema id; do not rename (existing artifacts carry it)
+    metadata = {"__format__": "b12x_fp6_dense_weight_v1"}
+    for key, value in asdict(weight).items():
         if isinstance(value, torch.Tensor):
-            payload[key] = value.detach().cpu()
-    # historical on-disk format id; do not rename (existing artifacts carry it)
-    payload["__format__"] = "b12x_fp6_dense_weight_v1"
-    torch.save(payload, path)
+            tensors[key] = value.detach().cpu().contiguous()
+        else:
+            metadata[key] = json.dumps(value)
+    save_file(tensors, path, metadata=metadata)
 
 
 def load_fp6_dense_weight(
     path: str, *, device: torch.device | str = "cuda"
 ) -> FP6DenseWeight:
     """Load a weight saved by :func:`save_fp6_dense_weight` onto ``device``."""
-    payload = torch.load(path, map_location="cpu")
-    payload.pop("__format__", None)
-    return FP6DenseWeight(**payload).to(device)
+    import json
+
+    from safetensors.torch import safe_open
+
+    fields: dict[str, object] = {}
+    with safe_open(path, framework="pt", device="cpu") as f:
+        metadata = f.metadata() or {}
+        for key in f.keys():
+            fields[key] = f.get_tensor(key)
+    for key, value in metadata.items():
+        if key == "__format__":
+            continue
+        fields[key] = json.loads(value)
+    return FP6DenseWeight(**fields).to(device)

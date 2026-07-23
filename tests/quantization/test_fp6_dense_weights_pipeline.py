@@ -44,7 +44,7 @@ def test_dense_fp6_weight_pipeline_roundtrip_and_equivalence(
     assert _cos(y, ref) > 0.95
 
     # save/load round-trip: identical tensors and identical kernel output.
-    path = str(tmp_path / "dense_fp6.pt")
+    path = str(tmp_path / "dense_fp6.safetensors")
     save_fp6_dense_weight(qw, path)
     loaded = load_fp6_dense_weight(path, device="cuda")
     assert isinstance(loaded, FP6DenseWeight)
