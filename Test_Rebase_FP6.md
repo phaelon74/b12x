@@ -12,12 +12,7 @@ numerically correct on real hardware.
 - MoE `w6a8_mx` end-to-end correctness vs a BF16 reference + performance
 - Bit-determinism spot checks
 
-**NOT covered by this pass (Phase 2 — requires the vLLM plugin rewrite):**
-
-- KLD scoring vs BF16 (dense 0.033389 / MoE 0.015043 targets)
-- `vllm serve` throughput/TPOT benchmarks
-- The plugin lives on a separate branch and is rewritten *after* this pass
-  confirms the kernels are healthy.
+**Phase 2 (vLLM serve validation)** is documented in [Section 12](#12-phase-2--vllm-serve--kld-validation).
 
 ---
 
@@ -205,13 +200,109 @@ on the dev box):
 - The `w6a8_mx` dynamic-kernel launch wrapper (fake-tensor arity/dtypes were
   only validated at compile time).
 
-## 11. What happens after this pass
+## 11. What happens after Phase 1
 
-1. **Phase 2 — vLLM plugin rewrite (Branch B):** rewrite the plugin against
-   sparkinfer's new op APIs (`sparkinfer::` namespace, plan/bind/run facade).
-2. **Phase 3 — KLD re-validation on the rig:** eager + deterministic scoring,
-   same `score_mode_kld.py` command as before. Targets: dense W6A8
-   **0.033389**, MoE W6A8 **0.015043**, bit-identical across repeat runs.
-3. **Phase 4 — serve benchmarks:** TPOT/TTFT/MTP-acceptance parity with the
-   pre-rebase branch.
-4. **PR submission** to `local-inference-lab/sparkinfer` once 1-3 are green.
+Phase 1 confirms the kernels are healthy.  Phase 2 (below) validates the vLLM
+shim and serving path.  Once both are green, open the PR to
+`local-inference-lab/sparkinfer`.
+
+---
+
+## 12. Phase 2 — vLLM serve + KLD validation
+
+The FP6 vLLM adapter lives at `sparkinfer/integration/vllm/` (see
+`docs/mxfp6-vllm-integration.md`).  It follows the same pattern as the
+maintainer's NVFP4 glue: a thin shim that calls sparkinfer's public
+`plan` / `bind` / `run` APIs.
+
+### 12.1 Prerequisites
+
+| Requirement | Notes |
+|---|---|
+| KLD vLLM fork | Your fork with `score_mode_kld.py` unchanged |
+| FP6 checkpoints | Dense and MoE models quantized with `scripts/quantize_model_fp6.py` |
+| sparkinfer branch | `fp6-sparkinfer` (or `fp6-vllm-plugin` merged into it) |
+
+### 12.2 Wire the plugin
+
+Install sparkinfer editable, then ensure your vLLM fork loads the entry point
+(either from sparkinfer's `pyproject.toml` or your fork's):
+
+```toml
+[project.entry-points."vllm.general_plugins"]
+sparkinfer_fp6 = "sparkinfer.integration.vllm.plugin:register_sparkinfer_fp6"
+```
+
+Sanity-check registration in the vLLM venv:
+
+```bash
+python -c "from sparkinfer.integration.vllm.plugin import register_sparkinfer_fp6; register_sparkinfer_fp6(); print('plugin OK')"
+```
+
+### 12.3 Environment for KLD scoring
+
+KLD **must** be bit-identical across repeated runs.  Use the same flags as the
+pre-rebase baseline:
+
+```bash
+export SPARKINFER_ENABLE_FP6=1
+export SPARKINFER_FP6_MODEL_DIR=/path/to/fp6-checkpoint
+export SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT=1
+export TORCH_COMPILE_DISABLE=1
+```
+
+For MoE TP>1 on Blackwell, add `--disable-custom-all-reduce` to `vllm serve`.
+
+### 12.4 Dense model KLD
+
+Serve the dense FP6 model and score with your unchanged `score_mode_kld.py`:
+
+```bash
+vllm serve "$SPARKINFER_FP6_MODEL_DIR" \
+  --tensor-parallel-size 1 \
+  --max-model-len 4096 \
+  ...   # same flags as pre-rebase baseline
+
+# In a second shell — run twice, KLD must match exactly:
+python score_mode_kld.py ...   # your existing command
+python score_mode_kld.py ...   # must print identical KLD
+```
+
+**PASS:** KLD = **0.033389** (pre-rebase dense W6A8 target) and bit-identical
+across both runs.
+
+### 12.5 MoE model KLD
+
+Same procedure on the MoE FP6 checkpoint.  For TP=2:
+
+```bash
+vllm serve "$SPARKINFER_FP6_MODEL_DIR" \
+  --tensor-parallel-size 2 \
+  --disable-custom-all-reduce \
+  ...
+```
+
+**PASS:** KLD = **0.015043** (pre-rebase MoE W6A8 target) and bit-identical
+across both runs.
+
+### 12.6 Serve performance spot check
+
+Re-run the TPOT/TTFT/MTP-acceptance benchmarks from the pre-rebase branch on
+the same hardware.  Record numbers for the PR — expect parity, not regression.
+
+### 12.7 Reporting back (Phase 2)
+
+1. Dense + MoE KLD values (both runs each — must match).
+2. Any `vllm serve` launch flags that differed from pre-rebase.
+3. TPOT/TTFT numbers vs pre-rebase baseline.
+4. Full console output of any failure.
+
+### 12.8 PR submission
+
+Once Phase 1 + Phase 2 are green:
+
+1. Merge `fp6-vllm-plugin` into `fp6-sparkinfer` if not already done.
+2. Open PR to `local-inference-lab/sparkinfer` with:
+   - Kernel port (Phase 1)
+   - `sparkinfer/integration/vllm/` shim files for the maintainer
+   - `docs/mxfp6-vllm-integration.md`
