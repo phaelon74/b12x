@@ -79,7 +79,11 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise SystemExit("CUDA required")
 
-    import sparkinfer.gemm.bf16_gemv  # noqa: F401
+    from sparkinfer.gemm import bf16_gemv
+
+    # The package API is lazy (install_lazy_api); touching the attribute
+    # imports _kernel, which registers the torch custom op.
+    bf16_gemv.bf16_gemv_small_n  # noqa: B018
 
     op = torch.ops.sparkinfer.bf16_gemv_small_n
     torch.manual_seed(args.seed)

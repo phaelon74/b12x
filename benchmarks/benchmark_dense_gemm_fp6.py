@@ -12,7 +12,7 @@ import torch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from benchmarks.benchmark_dense_gemm import (
+from benchmarks.fp6_common import (
     capture_graph_replay,
     check_outputs,
     fmt_us,

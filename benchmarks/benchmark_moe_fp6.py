@@ -12,7 +12,12 @@ import torch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from benchmarks.benchmark_dense_gemm import capture_graph_replay, fmt_us, make_l2_flush_fn, resolve_l2_flush_bytes
+from benchmarks.fp6_common import (
+    capture_graph_replay,
+    fmt_us,
+    make_l2_flush_fn,
+    resolve_l2_flush_bytes,
+)
 
 from tests.quantization.test_fp6_gpu import _synthetic_mxfp6_moe_weights
 
