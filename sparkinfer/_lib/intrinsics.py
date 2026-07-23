@@ -2304,6 +2304,28 @@ def fabs_f32(a: Float32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
+def div_rn_f32(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+    """IEEE round-to-nearest f32 division (div.rn.f32).
+
+    The DSL's ``/`` operator may lower to an approximate division; div.rn is
+    correctly rounded and therefore bit-identical to torch division /
+    ``torch.reciprocal`` on the same operands. Use this wherever a kernel
+    must reproduce a host-side f32 divide exactly.
+    """
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "div.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
 def cvt_f32_to_bf16_bits(x: Float32, *, loc=None, ip=None) -> Uint32:
     """Round one float32 to bf16 (cvt.rn.bf16.f32, round-to-nearest-even) and
     return its 16 raw bits zero-extended into a u32.

@@ -470,22 +470,46 @@ per-row output correction all happen in the one quant launch. Numerics are
 bit-identical by construction; `SPARKINFER_DENSE_PER_ROW_IN_KERNEL=0`
 restores the host chain for A/B.
 
-Validation sequence on the rig (after `git pull` on `fp6-sparkinfer` and
-reinstalling in both venvs):
-
-### 17.1 Unit tests (kernel venv)
+Validation sequence on the rig. Everything (unit tests, KLD, serving,
+benches) runs in the ONE shared venv (`~/sparkinfer-kld-nightly/venv`).
+First `git pull` the `fp6-sparkinfer` checkout, then reinstall:
 
 ```bash
-cd ~/fp6-sparkinfer/sparkinfer-fp6 && source .venv/bin/activate
-pytest tests/quantization/test_fp6_small_m_quant.py -v
-pytest tests/quantization/test_fp6_dense_weights_pipeline.py -v
+cd ~/sparkinfer-kld-nightly && source venv/bin/activate
+# --no-deps is MANDATORY in this venv: vLLM pins torch==2.11.0 and a plain
+# install lets sparkinfer's torch>=2.12 requirement upgrade the whole stack.
+uv pip install -e ~/sparkinfer-kld-nightly/fp6-sparkinfer --no-deps
+```
+
+If `--no-deps` is ever forgotten and torch gets upgraded (torch 2.13.0
+appears in the install log), recover with:
+
+```bash
+uv pip install --index-url https://download.pytorch.org/whl/cu130 \
+  torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0
+cd ~/sparkinfer-kld-nightly/kld-nightly && VLLM_USE_PRECOMPILED=1 uv pip install -e .
+uv pip install -e ~/sparkinfer-kld-nightly/fp6-sparkinfer --no-deps
+python -c "import torchvision; import vllm; print('stack OK')"
+```
+
+### 17.1 Unit tests
+
+Run from the sparkinfer checkout (same venv). Use `python -m pytest` — the
+venv does not ship pytest, and a bare `pytest` silently falls through to the
+SYSTEM interpreter (no torch) with a confusing `ModuleNotFoundError`:
+
+```bash
+cd ~/sparkinfer-kld-nightly/fp6-sparkinfer
+uv pip install pytest   # once, if not already present
+python -m pytest tests/quantization/test_fp6_small_m_quant.py -v
+python -m pytest tests/quantization/test_fp6_dense_weights_pipeline.py -v
 ```
 
 **PASS:** all green, in particular `test_small_m_per_row_matches_host_chain`
 (kernel vs host recipe, incl. the all-zero-row clamp edge) and
 `test_small_m_per_row_linear_ab_bit_exact` (fused vs host path, bitwise).
 
-### 17.2 Dense KLD (serving venv) — the hard gate
+### 17.2 Dense KLD — the hard gate
 
 Re-run Section 13.1 exactly. **PASS:** Mean KLD is exactly **0.034423**,
 twice. Any other value means the fused kernel is NOT bit-identical — report

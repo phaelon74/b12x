@@ -48,6 +48,7 @@ from sparkinfer._lib.compiler import KernelCompileSpec, compile as sparkinfer_co
 from sparkinfer._lib.intrinsics import (
     block_reduce,
     cvt_f32_to_bf16_bits,
+    div_rn_f32,
     fabs_f32,
     fmax_f32,
     get_ptr_as_int64,
@@ -199,9 +200,15 @@ class SmallMQuantKernel:
                     local, fmax_f32, red_buf, cutlass.Float32(0.0)
                 )
                 # gs_r = numerator(fmt) / max(amax_r, 1e-6): identical IEEE
-                # f32 ops (clamp_min, div) to the host recipe.
-                gs_pr[r] = cutlass.Float32(_GS_NUMERATOR[self.fmt]) / fmax_f32(
-                    amax_r, cutlass.Float32(1e-6)
+                # f32 ops (clamp_min, div) to the host recipe. div.rn is
+                # REQUIRED here — the DSL's ``/`` can lower to an approximate
+                # division that differs from torch by 1 ulp on edge operands,
+                # which is enough to flip the bf16 rounding of pre-scaled
+                # elements (seen as a single-row code mismatch vs the host
+                # chain in test_small_m_linear_end_to_end_bit_exact).
+                gs_pr[r] = div_rn_f32(
+                    cutlass.Float32(_GS_NUMERATOR[self.fmt]),
+                    fmax_f32(amax_r, cutlass.Float32(1e-6)),
                 )
             # Per-row output correction for the caller's post-GEMM multiply:
             # inv_gs_r = bf16(1/gs_r), bit-identical to the host chain's
@@ -209,7 +216,7 @@ class SmallMQuantKernel:
             if bidx == Int32(0):
                 for r in cutlass.range_constexpr(m_c):
                     if tidx == Int32(r):
-                        inv_r = cutlass.Float32(1.0) / gs_pr[r]
+                        inv_r = div_rn_f32(cutlass.Float32(1.0), gs_pr[r])
                         st_global_u16(
                             get_ptr_as_int64(mInvGs, Int32(r)),
                             cvt_f32_to_bf16_bits(inv_r),
@@ -245,9 +252,12 @@ class SmallMQuantKernel:
 
             # Activation global scale, fused: gs = numerator(fmt) /
             # max(amax, 1e-6). Identical IEEE f32 ops to the host recipe
-            # (convert, clamp_min, divide) -> bit-identical gs.
+            # (convert, clamp_min, divide) -> bit-identical gs. div.rn, not
+            # the DSL's ``/`` (see the per-row branch comment).
             amax_f32 = fmax_f32(amax_val, cutlass.Float32(1e-6))
-            gs_value = cutlass.Float32(_GS_NUMERATOR[self.fmt]) / amax_f32
+            gs_value = div_rn_f32(
+                cutlass.Float32(_GS_NUMERATOR[self.fmt]), amax_f32
+            )
 
         # Phase 1: one 32-element block per thread across the full grid —
         # same parallelism as the pre-fusion kernel. Same per-block math
@@ -259,8 +269,9 @@ class SmallMQuantKernel:
             # matches torch.reciprocal (both correctly rounded). In per-row
             # mode gs_value is the unit scale (1.0) — alpha = 1/(1*w_gs),
             # same as the host chain's torch.reciprocal(gs_unit * w_gs).
-            alpha = cutlass.Float32(1.0) / (
-                gs_value * cutlass.Float32(mWgs[Int32(0)])
+            alpha = div_rn_f32(
+                cutlass.Float32(1.0),
+                gs_value * cutlass.Float32(mWgs[Int32(0)]),
             )
             st_global_f32(get_ptr_as_int64(mAlpha, Int32(0)), alpha)
         if idx < total:
@@ -376,7 +387,7 @@ def compile_bf16_to_fp6_small_m(m: int, k: int, fmt: str = "e3m2", per_row: bool
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "quantization.bf16_to_fp6_small_m",
-            5,
+            6,
             cache_key,
         ),
     )
