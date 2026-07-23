@@ -12,7 +12,8 @@ numerically correct on real hardware.
 - MoE `w6a8_mx` end-to-end correctness vs a BF16 reference + performance
 - Bit-determinism spot checks
 
-**Phase 2 (vLLM serve validation)** is documented in [Section 12](#12-phase-2--vllm-serve--kld-validation).
+**Phase 2 (install + KLD + serve + benchmarks)** starts at
+[Section 11](#11-phase-2--what-to-do-now).
 
 ---
 
@@ -200,109 +201,307 @@ on the dev box):
 - The `w6a8_mx` dynamic-kernel launch wrapper (fake-tensor arity/dtypes were
   only validated at compile time).
 
-## 11. What happens after Phase 1
+## 11. Phase 2 — what to do now
 
-Phase 1 confirms the kernels are healthy.  Phase 2 (below) validates the vLLM
-shim and serving path.  Once both are green, open the PR to
-`local-inference-lab/sparkinfer`.
+Phase 1 is green.  The FP6 vLLM shim now lives at
+`sparkinfer/integration/vllm/` (see `docs/mxfp6-vllm-integration.md`) and
+registers itself through the `vllm.general_plugins` entry point in
+sparkinfer's own `pyproject.toml` — same pattern as the maintainer's NVFP4
+glue, no separate plugin package anymore.
+
+**No requantization is needed.** The on-disk checkpoint contract is unchanged
+(`quant_method=modelopt`, `quant_algo=W6A6`, unswizzled UE8M0 scales), so the
+existing Qwen3.6-27B-FP6 and Qwen3.6-35B-A3B-FP6 checkpoints load as-is.
+
+Order of operations (sections 12-15):
+
+1. Replace `b12x` with `sparkinfer` in the KLD vLLM venv (Section 12)
+2. KLD-score the dense and MoE models — twice each, bit-identical (Section 13)
+3. Serve both models for a live smoke (Section 14)
+4. Benchmark TPOT/TTFT/acceptance vs pre-rebase (Section 15)
+
+Env-var renames vs the old plugin (legacy `B12X_*` names still work, but use
+the new ones going forward):
+
+| Old (b12x) | New (sparkinfer) |
+|---|---|
+| `B12X_ENABLE_FP6` | `SPARKINFER_ENABLE_FP6` |
+| `B12X_FP6_MODEL_DIR` | `SPARKINFER_FP6_MODEL_DIR` |
+| `B12X_MOE_DETERMINISTIC` | `SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT` |
+| `B12X_MOE_WARM_MS` | `SPARKINFER_MOE_WARM_MS` |
+| `B12X_DISABLE_BF16_GEMV` | `SPARKINFER_DISABLE_BF16_GEMV` |
 
 ---
 
-## 12. Phase 2 — vLLM serve + KLD validation
-
-The FP6 vLLM adapter lives at `sparkinfer/integration/vllm/` (see
-`docs/mxfp6-vllm-integration.md`).  It follows the same pattern as the
-maintainer's NVFP4 glue: a thin shim that calls sparkinfer's public
-`plan` / `bind` / `run` APIs.
-
-### 12.1 Prerequisites
-
-| Requirement | Notes |
-|---|---|
-| KLD vLLM fork | Your fork with `score_mode_kld.py` unchanged |
-| FP6 checkpoints | Dense and MoE models quantized with `scripts/quantize_model_fp6.py` |
-| sparkinfer branch | `fp6-sparkinfer` (or `fp6-vllm-plugin` merged into it) |
-
-### 12.2 Wire the plugin
-
-Install sparkinfer editable, then ensure your vLLM fork loads the entry point
-(either from sparkinfer's `pyproject.toml` or your fork's):
-
-```toml
-[project.entry-points."vllm.general_plugins"]
-sparkinfer_fp6 = "sparkinfer.integration.vllm.plugin:register_sparkinfer_fp6"
-```
-
-Sanity-check registration in the vLLM venv:
+## 12. Install sparkinfer into the KLD vLLM venv
 
 ```bash
+# 1. Activate the KLD fork's venv
+cd ~/kld-nightly-vllm && source venv/bin/activate
+
+# 2. Uninstall the old b12x package (its entry point would double-claim
+#    the checkpoint alongside the new sparkinfer_fp6 plugin)
+pip uninstall -y b12x
+
+# 3. Get the fp6-sparkinfer branch (fresh clone shown; a pull of the
+#    existing ~/fp6-sparkinfer/sparkinfer-fp6 checkout works too)
+cd ~
+git clone https://github.com/phaelon74/b12x.git sparkinfer-fp6-serve
+cd sparkinfer-fp6-serve
+git checkout fp6-sparkinfer
+
+# 4. Install editable INTO THE KLD VENV (entry-point metadata lands here)
+pip install -e .
+
+# 5. Verify the plugin registers and the entry point is visible
 python -c "from sparkinfer.integration.vllm.plugin import register_sparkinfer_fp6; register_sparkinfer_fp6(); print('plugin OK')"
+python -c "
+from importlib.metadata import entry_points
+eps = [e for e in entry_points(group='vllm.general_plugins') if e.name == 'sparkinfer_fp6']
+print('entry point OK' if eps else 'ENTRY POINT MISSING')
+"
 ```
 
-### 12.3 Environment for KLD scoring
+**PASS:** both checks print OK.  If the entry point is missing, re-run
+`pip install -e .` (an editable refresh alone does not rewrite entry-point
+metadata).
 
-KLD **must** be bit-identical across repeated runs.  Use the same flags as the
-pre-rebase baseline:
+---
+
+## 13. KLD scoring (run each model TWICE — must be bit-identical)
+
+KLD runs offline through `score_mode_kld.py` (no server needed).  Determinism
+requirements (unchanged from pre-rebase, see old §4.0.5): eager enforce for
+all models, plus the deterministic MoE combine for the MoE model only.
+
+### 13.1 Dense — Qwen3.6-27B-FP6
+
+```bash
+cd ~/kld-nightly-vllm && source venv/bin/activate
+export SPARKINFER_ENABLE_FP6=1
+export SPARKINFER_FP6_MODEL_DIR=/media/fmodels/TheHouseOfTheDude/Qwen3.6-27B-FP6-P12
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export TORCH_COMPILE_DISABLE=1   # eager enforce — mandatory for reproducible KLD
+
+python examples/offline_inference/score_mode_kld.py \
+  --model "$SPARKINFER_FP6_MODEL_DIR" \
+  --reference-logits ~/kld-nightly-vllm/kld-vllm/ref_logits_Qwen3.6-27B_ctx2048_s512 \
+  --dataset wikitext --dataset-config wikitext-2-raw-v1 \
+  --context-length 2048 --stride 512 \
+  --gpu-memory-utilization 0.90 --max-num-seqs 128 \
+  2>&1 | tee /tmp/phase2_kld_dense_run1.log
+
+# Run the IDENTICAL command again:
+#   ... | tee /tmp/phase2_kld_dense_run2.log
+```
+
+**PASS:** Mean KLD ≈ **0.033389** (pre-rebase eager dense baseline;
+band-stable ±1e-4 is acceptable given torch 2.11→2.13) AND run1 == run2 to
+the last bit.  Any run-to-run drift is a bug — report it, do not average.
+
+### 13.2 MoE — Qwen3.6-35B-A3B-FP6
+
+Adds the deterministic-combine flag (MoE only; dense has no atomics):
 
 ```bash
 export SPARKINFER_ENABLE_FP6=1
-export SPARKINFER_FP6_MODEL_DIR=/path/to/fp6-checkpoint
-export SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT=1
+export SPARKINFER_FP6_MODEL_DIR=/media/fmodels/TheHouseOfTheDude/qwen3-6_35B-A3B_moe_fp6
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export TORCH_COMPILE_DISABLE=1
+export SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT=1   # deterministic MoE combine
+
+python examples/offline_inference/score_mode_kld.py \
+  --model "$SPARKINFER_FP6_MODEL_DIR" \
+  --reference-logits /media/fmodels/kld-refs/qwen3.6-35b-a3b_ctx2048_s512 \
+  --dataset wikitext --dataset-config wikitext-2-raw-v1 \
+  --context-length 2048 --stride 512 \
+  --gpu-memory-utilization 0.90 --max-num-seqs 128 \
+  2>&1 | tee /tmp/phase2_kld_moe_run1.log
+
+# Run the IDENTICAL command again -> /tmp/phase2_kld_moe_run2.log
 ```
 
-For MoE TP>1 on Blackwell, add `--disable-custom-all-reduce` to `vllm serve`.
+**PASS:** Mean KLD ≈ **0.015043** (pre-rebase eager MoE baseline) AND
+run1 == run2 to the last bit.
 
-### 12.4 Dense model KLD
+Adjust `--model` / `--reference-logits` paths to wherever the checkpoints and
+pinned eager reference logits actually live on the rig; the flags themselves
+must match the pre-rebase scoring command exactly.
 
-Serve the dense FP6 model and score with your unchanged `score_mode_kld.py`:
+---
+
+## 14. Serve the models
+
+Serving is done through the two launch scripts (updated for the sparkinfer
+rebase — they now export `SPARKINFER_ENABLE_FP6` / `SPARKINFER_FP6_MODEL_DIR`,
+pass `--quantization sparkinfer_fp6`, unset the legacy `B12X_*` names, and
+unset the KLD-only vars `TORCH_COMPILE_DISABLE` /
+`SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT`):
+
+- `VLLM-Launch_Scripts/qwen3.6-27b-fp6.sh`
+- `VLLM-Launch_Scripts/qwen3.6-35b-a3b-fp6.sh`
+
+Copy the current versions to the rig and run them from the serving venv
+(`~/kld-nightly-vllm && source venv/bin/activate`). No FP6 env setup is needed
+beforehand — the scripts set everything, and stale vars from a KLD shell
+cannot leak in.
+
+### 14.1 Dense — Qwen3.6-27B-FP6, TP=1 with MTP
 
 ```bash
-vllm serve "$SPARKINFER_FP6_MODEL_DIR" \
-  --tensor-parallel-size 1 \
-  --max-model-len 4096 \
-  ...   # same flags as pre-rebase baseline
-
-# In a second shell — run twice, KLD must match exactly:
-python score_mode_kld.py ...   # your existing command
-python score_mode_kld.py ...   # must print identical KLD
+MODEL_DIR=/media/fmodels/TheHouseOfTheDude/Qwen3.6-27B-FP6-P12 \
+MTP_SPEC='{"method":"qwen3_next_mtp","num_speculative_tokens":4}' \
+./qwen3.6-27b-fp6.sh API-KEY-HERE
 ```
 
-**PASS:** KLD = **0.033389** (pre-rebase dense W6A8 target) and bit-identical
-across both runs.
+`MODEL_DIR` must point at the checkpoint you scored in Section 13.
+`MTP_SPEC` with k=4 matches the pre-rebase benchmark baseline (the script's
+default is k=2); the script derives the cudagraph capture sizes from it
+automatically.
 
-### 12.5 MoE model KLD
-
-Same procedure on the MoE FP6 checkpoint.  For TP=2:
+### 14.2 Dense TP=2 variant
 
 ```bash
-vllm serve "$SPARKINFER_FP6_MODEL_DIR" \
-  --tensor-parallel-size 2 \
-  --disable-custom-all-reduce \
-  ...
+CUDA_VISIBLE_DEVICES=0,1 TP_SIZE=2 \
+MODEL_DIR=/media/fmodels/TheHouseOfTheDude/Qwen3.6-27B-FP6-P12 \
+MTP_SPEC='{"method":"qwen3_next_mtp","num_speculative_tokens":4}' \
+./qwen3.6-27b-fp6.sh API-KEY-HERE
 ```
 
-**PASS:** KLD = **0.015043** (pre-rebase MoE W6A8 target) and bit-identical
-across both runs.
+The script adds `--disable-custom-all-reduce` automatically whenever
+`TP_SIZE > 1` (Blackwell sm_120 custom all-reduce crashes during graph
+capture, so this is mandatory).
 
-### 12.6 Serve performance spot check
+### 14.3 MoE — Qwen3.6-35B-A3B-FP6
 
-Re-run the TPOT/TTFT/MTP-acceptance benchmarks from the pre-rebase branch on
-the same hardware.  Record numbers for the PR — expect parity, not regression.
+```bash
+MODEL_DIR=/media/fmodels/TheHouseOfTheDude/qwen3-6_35B-A3B_moe_fp6 \
+MTP_SPEC='{"method":"qwen3_next_mtp","num_speculative_tokens":4}' \
+./qwen3.6-35b-a3b-fp6.sh API-KEY-HERE
+```
 
-### 12.7 Reporting back (Phase 2)
+For a TP=2 MoE serve, prefix with `CUDA_VISIBLE_DEVICES=0,1 TP_SIZE=2` as in
+14.2. Unlike the old b12x binding (which loaded whole experts from the sidecar
+and was TP=1-only), the sparkinfer shim registers per-partition-sized expert
+weights (`intermediate_size_per_partition`) and lets vLLM's standard FusedMoE
+weight loader shard w13 along the intermediate (row) dim and w2 along its
+packed input dim, with the usual TP all-reduce combining the partial sums.
+Shard sizes must stay divisible by 32 (intermediate 512 → TP=2/4/8 all fine).
+Expect sub-linear latency gains at BS1 — the per-rank expert GEMMs are tiny,
+so router/DeltaNet/all-reduce overhead dominates; TP mainly buys throughput
+under concurrency, not single-stream latency.
 
-1. Dense + MoE KLD values (both runs each — must match).
-2. Any `vllm serve` launch flags that differed from pre-rebase.
-3. TPOT/TTFT numbers vs pre-rebase baseline.
+**PASS (all serves):** server reaches "Application startup complete"; startup
+logs show `SparkInfer FP6: N FP6 modules discovered ...` and
+`SparkInfer FP6: bound FP6 linear/MoE ...` lines; a test completion returns
+coherent text:
+
+```bash
+curl -s http://localhost:8001/v1/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer API-KEY-HERE' \
+  -d '{"model":"Qwen3.6-27B-FP6-W6A6","prompt":"The capital of France is","max_tokens":16,"temperature":0}'
+```
+
+---
+
+## 15. Serve benchmarks (compare vs pre-rebase)
+
+With each server from Section 14 running, benchmark from a second shell.
+The server is API-key protected (the launch scripts pass `--api-key`), and the
+bench client sends the key as a Bearer token from the `OPENAI_API_KEY` env var
+— without it every request comes back 401 and the benchmark reports garbage:
+
+```bash
+export OPENAI_API_KEY=API-KEY-HERE   # same key passed to the launch script
+
+vllm bench serve --base-url http://localhost:8001 \
+  --model Qwen3.6-27B-FP6-W6A6 \
+  --tokenizer /media/fmodels/TheHouseOfTheDude/Qwen3.6-27B-FP6-P12 \
+  --dataset-name random --random-input-len 1024 --random-output-len 256 \
+  --num-prompts 8 --max-concurrency 1 --temperature 0
+```
+
+(Swap `--model` / `--tokenizer` for the MoE run.)
+
+Pre-rebase reference numbers (dense 27B, k=4 MTP, Jul 12):
+
+| metric | TP=1 | TP=2 |
+|---|---|---|
+| Output tok/s | 108.49 | 134.89 |
+| Mean TPOT (ms) | 7.80 | 5.97 |
+| Mean ITL (ms) | 28.28 | 20.26 |
+| Acceptance rate (%) | 65.99 | 60.48 |
+
+**PASS:** parity (±5%) with the table above; server logs at TP=2 still show
+`kept packed-B` for the wide fused projections.
+
+---
+
+## 16. Reporting back + PR
+
+1. Dense + MoE KLD values — both runs each; state explicitly whether the two
+   runs matched bit-for-bit.
+2. Serve benchmark table (TP=1/TP=2 dense, TP=2 MoE) vs the Section 15
+   reference numbers.
+3. Any launch flags that had to differ from this document.
 4. Full console output of any failure.
 
-### 12.8 PR submission
+Once Sections 12-15 are green, `fp6-sparkinfer` is PR-ready:
 
-Once Phase 1 + Phase 2 are green:
+- Kernel port (Phase 1, Sections 3-9)
+- `sparkinfer/integration/vllm/` shim (the files the maintainer drops into
+  his private `sparkinfer/integration/` tree)
+- `docs/mxfp6-vllm-integration.md` + `docs/mxfp6-w6a8.md`
 
-1. Merge `fp6-vllm-plugin` into `fp6-sparkinfer` if not already done.
-2. Open PR to `local-inference-lab/sparkinfer` with:
-   - Kernel port (Phase 1)
-   - `sparkinfer/integration/vllm/` shim files for the maintainer
-   - `docs/mxfp6-vllm-integration.md`
+Open the PR against `local-inference-lab/sparkinfer` `master`.
+
+---
+
+## 17. In-kernel per-row quant fix (decode-latency regression)
+
+Profiling the Jul 23 serve benches showed decode steps ~8.5 ms slower than
+the pre-rebase baseline at both TP=1 and TP=2. Root cause: the per-row
+activation-scaling recipe (added during the rebase for m=1 bit-exactness)
+ran as ~12 eager torch kernels around every FP6 linear on the decode path.
+The fix fuses the whole recipe into `SmallMQuantKernel`
+(`per_row=True`): row amax, bf16 pre-scale, unit-gs quantization and the
+per-row output correction all happen in the one quant launch. Numerics are
+bit-identical by construction; `SPARKINFER_DENSE_PER_ROW_IN_KERNEL=0`
+restores the host chain for A/B.
+
+Validation sequence on the rig (after `git pull` on `fp6-sparkinfer` and
+reinstalling in both venvs):
+
+### 17.1 Unit tests (kernel venv)
+
+```bash
+cd ~/fp6-sparkinfer/sparkinfer-fp6 && source .venv/bin/activate
+pytest tests/quantization/test_fp6_small_m_quant.py -v
+pytest tests/quantization/test_fp6_dense_weights_pipeline.py -v
+```
+
+**PASS:** all green, in particular `test_small_m_per_row_matches_host_chain`
+(kernel vs host recipe, incl. the all-zero-row clamp edge) and
+`test_small_m_per_row_linear_ab_bit_exact` (fused vs host path, bitwise).
+
+### 17.2 Dense KLD (serving venv) — the hard gate
+
+Re-run Section 13.1 exactly. **PASS:** Mean KLD is exactly **0.034423**,
+twice. Any other value means the fused kernel is NOT bit-identical — report
+it and set `SPARKINFER_DENSE_PER_ROW_IN_KERNEL=0` to confirm the fallback
+still produces 0.034423.
+
+### 17.3 MoE KLD
+
+Re-run Section 13.2 exactly. **PASS:** Mean KLD is exactly **0.011016**,
+twice. (MoE attention/dense projections share this decode path.)
+
+### 17.4 Serve bench
+
+Re-run Section 15 for dense TP=1 (bench twice, keep the warm run).
+**Expected:** mean ITL drops from ~36.8 ms to ~29 ms and single-stream
+output tok/s recovers to roughly the 100+ range, restoring parity with the
+pre-rebase 108.5 tok/s baseline (residual gap, if any, is the nightly
+vLLM/harness delta — compare ITL, not just tok/s, and note the MTP
+acceptance rate, which varies with the random prompts).

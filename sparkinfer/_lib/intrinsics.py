@@ -624,6 +624,23 @@ def st_global_u8(base_ptr: Int64, value: Uint8, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def st_global_u16(base_ptr: Int64, value: Uint32, *, loc=None, ip=None):
+    """Store the low 16 bits of a u32 to global memory (st.global.u16)."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(base_ptr).ir_value(loc=loc, ip=ip),
+            Uint32(value).ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .b16 t; cvt.u16.u32 t, $1; st.global.u16 [$0], t; }",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
 def st_global_f32(base_ptr: Int64, value: Float32, *, loc=None, ip=None):
     """Store 32-bit float to global memory."""
     llvm.inline_asm(
@@ -2279,6 +2296,28 @@ def fabs_f32(a: Float32, *, loc=None, ip=None) -> Float32:
             [Float32(a).ir_value(loc=loc, ip=ip)],
             "abs.f32 $0, $1;",
             "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def cvt_f32_to_bf16_bits(x: Float32, *, loc=None, ip=None) -> Uint32:
+    """Round one float32 to bf16 (cvt.rn.bf16.f32, round-to-nearest-even) and
+    return its 16 raw bits zero-extended into a u32.
+
+    Bit-identical to ``torch.Tensor.to(torch.bfloat16)`` on finite values —
+    both are IEEE RN. Widen back to f32 with ``u32_as_f32(bits << 16)``
+    (bf16 -> f32 is exact).
+    """
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(x).ir_value(loc=loc, ip=ip)],
+            "{ .reg .b16 t; cvt.rn.bf16.f32 t, $1; cvt.u32.u16 $0, t; }",
+            "=r,f",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,

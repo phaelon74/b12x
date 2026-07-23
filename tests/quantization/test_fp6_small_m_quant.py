@@ -111,3 +111,73 @@ def test_small_m_compile_guards():
         compile_bf16_to_fp6_small_m(17, 512)
     with pytest.raises(AssertionError, match="multiple of 128"):
         compile_bf16_to_fp6_small_m(1, 96)
+
+
+@cuda_required
+@pytest.mark.parametrize("fmt", ["e2m3", "e3m2", "e4m3"])
+@pytest.mark.parametrize("m", [1, 3, 5, 16])
+def test_small_m_per_row_matches_host_chain(m, fmt):
+    """The fused per-row kernel must reproduce the host pre-scale chain bit-for-bit.
+
+    Host reference (the serving decode recipe before fusion): per-row bf16
+    amax -> f32 clamp/div -> bf16 pre-scale -> quantize with the kernel's
+    re-derived (unit) gs. The per_row=True kernel does all of it in one
+    launch; codes, scale bytes, alpha AND the per-row output correction must
+    match exactly.
+    """
+    from sparkinfer.quantization.mxfp6.fp6_dense_weights import (
+        _quantize_matrix_fp6_bytes_small_m,
+    )
+    from sparkinfer._lib.fp6 import mx_gs_numerator
+
+    torch.manual_seed(1)
+    k = 512
+    device = torch.device("cuda")
+    x = (torch.randn(m, k, device=device) * 0.1).to(torch.bfloat16)
+    x[0, 3] = 6.0  # distinct row amaxes, including one far off the others
+    if m > 1:
+        x[m - 1].zero_()  # degenerate all-zero row: clamp_min(1e-6) edge
+    w_gs = torch.tensor([0.5], dtype=torch.float32, device=device)
+
+    # Host chain reference (identical to fp6_dense_weights' unfused path).
+    a_amax_pr = x.abs().amax(dim=1, keepdim=True).float()
+    a_gs_pr = mx_gs_numerator(fmt) / a_amax_pr.clamp_min_(1e-6)
+    x_pre = (x.float() * a_gs_pr).to(torch.bfloat16)
+    codes_ref, scale_ref, alpha_ref = _quantize_matrix_fp6_bytes_small_m(
+        x_pre, fmt, w_gs, _TILE
+    )
+    codes_ref = codes_ref[:m].clone()
+    scale_ref = scale_ref.clone()
+    alpha_ref = alpha_ref.clone()
+    inv_ref = (1.0 / a_gs_pr).to(torch.bfloat16)
+
+    codes_pr, scale_pr, alpha_pr, inv_pr = _quantize_matrix_fp6_bytes_small_m(
+        x, fmt, w_gs, _TILE, per_row=True
+    )
+
+    torch.testing.assert_close(codes_pr[:m], codes_ref, rtol=0.0, atol=0.0)
+    off = _sf_offsets(m, k).to(device)
+    torch.testing.assert_close(
+        scale_pr.view(-1)[off], scale_ref.view(-1)[off], rtol=0.0, atol=0.0
+    )
+    torch.testing.assert_close(alpha_pr, alpha_ref, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(inv_pr, inv_ref, rtol=0.0, atol=0.0)
+
+
+@cuda_required
+@pytest.mark.parametrize("m", [1, 5, 16])
+def test_small_m_per_row_linear_ab_bit_exact(m, monkeypatch):
+    """dense_fp6_linear: fused in-kernel per-row path == host-chain path, bitwise."""
+    from sparkinfer.quantization.mxfp6 import fp6_dense_weights as fdw
+
+    torch.manual_seed(2)
+    w = fdw.quantize_dense_weight_to_fp6(
+        torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+    )
+    x = torch.randn(m, w.in_features, dtype=torch.bfloat16, device="cuda")
+
+    monkeypatch.setattr(fdw, "_PER_ROW_IN_KERNEL", False)
+    y_host = fdw.dense_fp6_linear(x, w).clone()
+    monkeypatch.setattr(fdw, "_PER_ROW_IN_KERNEL", True)
+    y_fused = fdw.dense_fp6_linear(x, w)
+    torch.testing.assert_close(y_fused, y_host, rtol=0.0, atol=0.0)
