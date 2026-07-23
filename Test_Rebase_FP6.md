@@ -113,8 +113,14 @@ pre-existing) before attributing it to the FP6 port.
 ## 6. Step 4 — Dense GEMM correctness + performance
 
 ```bash
-# Correctness + perf across M sweep at a Qwen3.6-27B-like layer shape
-python benchmarks/benchmark_dense_gemm_fp6.py --m 1 16 128 1024 --n 5120 --k 5120
+# Correctness gate at a small shape: the reference check dequantizes with a
+# pure-Python per-block loop, which is minutes-to-hours at 5120x5120. Run the
+# check small, then the real-shape sweep with --no-check (real-shape
+# correctness is already covered by tests/gemm/test_fp6_dense_w6a8.py).
+python benchmarks/benchmark_dense_gemm_fp6.py --m 1 16 128 --n 256 --k 256
+
+# Perf across M sweep at a Qwen3.6-27B-like layer shape
+python benchmarks/benchmark_dense_gemm_fp6.py --m 1 16 128 1024 --n 5120 --k 5120 --no-check
 
 # Packed-B streaming smoke (3:4 packed weight expansion path)
 python scripts/smoke_packed_b.py
