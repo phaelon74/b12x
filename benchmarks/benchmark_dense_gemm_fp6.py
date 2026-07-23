@@ -20,7 +20,7 @@ from benchmarks.fp6_common import (
     resolve_l2_flush_bytes,
 )
 from sparkinfer._lib.fp6 import SF_VEC_SIZE_FP6, dequant_mxfp6_torch
-from sparkinfer._lib.dense_gemm import dense_gemm
+from sparkinfer._lib.dense_gemm import _expand_packed_mxfp6_ab, dense_gemm
 
 from tests.quantization.test_fp6_gpu import _bf16_global_scale, _quantize_bf16_matrix
 
@@ -45,16 +45,25 @@ def bench_one_fp6(
     alpha = (1.0 / (a_gs[0] * b_gs[0])).view(1)
     out = torch.empty((m, n, 1), device="cuda", dtype=torch.bfloat16)
 
+    # Expand the 3:4-packed operands to byte-containers ONCE at setup, exactly
+    # like the production path (dense_fp6_linear keeps weights pre-expanded).
+    # Without this, dense_gemm's convenience path re-expands the full weight
+    # matrix inside every timed launch, swamping the GEMM (~30x at M=1).
+    a_exp = _expand_packed_mxfp6_ab(a_packed.unsqueeze(-1), k)
+    b_exp = _expand_packed_mxfp6_ab(b_packed.unsqueeze(-1), k)
+
     def launch():
         dense_gemm(
-            (a_packed.unsqueeze(-1), a_sf),
-            (b_packed.unsqueeze(-1), b_sf),
+            (a_exp, a_sf),
+            (b_exp, b_sf),
             alpha=alpha,
             ab_dtype="float6_e3m2fn",
             sf_dtype="float8_e8m0fnu",
             sf_vec_size=SF_VEC_SIZE_FP6,
             c_dtype="bfloat16",
             out=out,
+            a_preexpanded=True,
+            b_preexpanded=True,
         )
 
     replay = capture_graph_replay(launch)
