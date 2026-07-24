@@ -21,7 +21,7 @@ JIT-compiled on first use and cached.
 
 ## What's in here
 
-Every kernel is one op at `sparkinfer.<group>.<op>` (15 total; `list_ops()`
+Every kernel is one op at `sparkinfer.<group>.<op>` (17 total; `list_ops()`
 enumerates them). The op owns its `plan`/`bind`/`run` facade in `api.py`; the
 kernel guts sit in `_impl.py`/`_kernel.py`; cross-op lowering lives in
 `<group>/_shared/` and the universal compile/scratch spine in `sparkinfer/_lib/`.
@@ -29,7 +29,8 @@ kernel guts sit in `_impl.py`/`_kernel.py`; cross-op lowering lives in
 **`gemm`** — a dense block-scaled GEMM (NVFP4/MXFP8 operands, BF16/FP16/FP32
 out) plus fused linears on top of it: `gemm.blockscaled` (one-shot), MXFP8
 (`gemm.mxfp8_linear`), 128×128 block-FP8 (`gemm.block_fp8_linear`), and the
-grouped WO-projection (`gemm.wo_projection`) used by MLA attention output.
+fused MLA query projection (`gemm.mla_query_projection`) and grouped
+WO-projection (`gemm.wo_projection`) used around MLA attention.
 
 **`attention`** — `attention.paged` (paged-KV decode/extend, FP8 KV, MSA block
 sparse, CUDA-graph-replayable), `attention.sparse_mla` and
@@ -101,6 +102,41 @@ collectives are stateful classes. `sparkinfer.list_ops()` enumerates the full
 set; every op exports `is_supported()`. Underneath, kernels register as torch
 custom ops in the private `sparkinfer::` namespace (torch.compile / CUDA-graph
 integration) — prefer the Python API.
+
+## PCIe DMA wire modes
+
+`PCIeDmaAllReduce` can compress eligible BF16 all-reduces. Configure it with
+`SPARKINFER_PCIE_DMA_FP8`, or pass the same value as the `fp8=` constructor
+argument. Integrations such as vLLM can forward their own launch setting to
+that constructor.
+
+| Mode | Reduce-scatter | All-gather | When to use it |
+|---|---|---|---|
+| `0` | BF16 ring | BF16 ring | Unquantized baseline |
+| `ag` | BF16 ring | block E4M3 ring | Limit E4M3 quantization to the final broadcast |
+| `ring` | block E4M3 ring, requantized per hop | block E4M3 ring | Compress both phases with the neighbor ring |
+| `a2a` | block E4M3 scatter with FP32 accumulation | block E4M3 broadcast | Quantize each input once and overlap direct peer transfers |
+| `i8` | BF16 ring | block INT8 ring | Limit INT8 quantization to the final broadcast |
+| `i8_ring` | block INT8 ring, requantized per hop | block INT8 ring | Compress both phases with the INT8 codec |
+| `i8_a2a` | block INT8 scatter with FP32 accumulation | block INT8 broadcast | Use the quantize-once all-to-all topology with INT8 |
+| `mx` | BF16 ring | MXFP8 ring | Limit MXFP8 quantization to the final broadcast |
+| `mx_ring` | MXFP8 ring, requantized per hop | MXFP8 ring | Compress both phases with standard E4M3/E8M0 MXFP8 |
+| `mx_a2a` | MXFP8 scatter with FP32 accumulation | MXFP8 broadcast | Use the quantize-once all-to-all topology with MXFP8 |
+
+Every compressed mode uses 132 bytes per 128 values instead of 256 bytes for
+BF16, a 48.4% wire-byte reduction. E4M3 and INT8 store one FP32 scale per 128
+values; MXFP8 stores four E8M0 scales, one per 32 values. These modes are most
+useful for large prefill collectives on PCIe-only multi-GPU systems where peer
+transport is the bottleneck; they do not change the KV-cache format and usually
+do not affect small decode collectives. Choose a codec by model quality gates,
+then benchmark the ring and all-to-all variants on the target PCIe topology.
+
+Compressed transport requires BF16 input and a per-rank shard divisible by
+128 elements; other shapes use the BF16 path:
+
+```bash
+SPARKINFER_PCIE_DMA_FP8=i8_ring python -m your_server
+```
 
 Compilation happens lazily per shape/config and is cached. For serving, warm
 up the shapes you need, then freeze:

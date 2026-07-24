@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Four-GPU gate for rank-identical FP8 PCIe-DMA all-reduce outputs.
+"""Four-GPU gate for rank-identical compressed PCIe-DMA all-reduce outputs.
 
 Run inside the target image after installing the overlay:
 
     python test_pcie_dma_rank_consistency_gpu.py --mode ag
     python test_pcie_dma_rank_consistency_gpu.py --mode ring
     python test_pcie_dma_rank_consistency_gpu.py --mode a2a
+    python test_pcie_dma_rank_consistency_gpu.py --mode i8
+    python test_pcie_dma_rank_consistency_gpu.py --mode i8_ring
+    python test_pcie_dma_rank_consistency_gpu.py --mode i8_a2a
+    python test_pcie_dma_rank_consistency_gpu.py --mode mx
+    python test_pcie_dma_rank_consistency_gpu.py --mode mx_ring
+    python test_pcie_dma_rank_consistency_gpu.py --mode mx_a2a
 """
 
 from __future__ import annotations
@@ -30,9 +36,9 @@ def make_input(rank: int, device: torch.device, iteration: int = 0) -> torch.Ten
     hidden = 6144
     values = torch.arange(rows * hidden, device=device, dtype=torch.float32)
     values = values.reshape(rows, hidden)
-    return (
-        torch.sin(values * 0.001 + rank * 0.31 + iteration * 0.17) * 0.5
-    ).to(torch.bfloat16)
+    return (torch.sin(values * 0.001 + rank * 0.31 + iteration * 0.17) * 0.5).to(
+        torch.bfloat16
+    )
 
 
 def assert_output(
@@ -124,7 +130,21 @@ def worker(rank: int, world: int, port: int, mode: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", required=True, choices=("ag", "ring", "a2a"))
+    parser.add_argument(
+        "--mode",
+        required=True,
+        choices=(
+            "ag",
+            "ring",
+            "a2a",
+            "i8",
+            "i8_ring",
+            "i8_a2a",
+            "mx",
+            "mx_ring",
+            "mx_a2a",
+        ),
+    )
     args = parser.parse_args()
     world = 4
     if not torch.cuda.is_available() or torch.cuda.device_count() < world:

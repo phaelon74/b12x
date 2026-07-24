@@ -43,7 +43,7 @@ FP8_QUANT_BLOCK = 128
 
 
 def _fp8_mode() -> str:
-    """Opt-in E4M3 wire transport mode.
+    """Opt-in compressed wire transport mode.
 
     "ag" (also "1"): keep the saturated bf16 reduce-scatter ring and
     quantize only the allgather phase. Final values quantize exactly once
@@ -56,10 +56,18 @@ def _fp8_mode() -> str:
     "a2a": quantize-once all-to-all (two roundings, half the wire in both
     phases).
 
-    Every FP8 mode materializes the locally owned reduced shard through the
-    same FP8 payload as its peers.  An all-reduce result must be rank-identical;
-    retaining a pre-wire BF16 owner shard while peers dequantize that shard
-    gives every TP rank a different replicated activation.
+    "i8" / "i8_ring" / "i8_a2a": the matching topology with a symmetric
+    signed-INT8 payload. Both codecs use the same layout: one payload byte
+    per value plus one fp32 scale per 128 values.
+
+    "mx" / "mx_ring" / "mx_a2a": standard MXFP8, with E4M3 payload values
+    and one E8M0 scale per 32 values. Four scale bytes per 128 values retain
+    the same wire footprint as the other compressed codecs.
+
+    Every compressed mode materializes the locally owned reduced shard through
+    the same wire payload as its peers. An all-reduce result must be
+    rank-identical; retaining a pre-wire BF16 owner shard while peers dequantize
+    that shard gives every TP rank a different replicated activation.
     """
 
     return _normalize_fp8_mode(os.getenv("SPARKINFER_PCIE_DMA_FP8", "0"))
@@ -71,7 +79,49 @@ def _normalize_fp8_mode(value: str | None) -> str:
         return ""
     if raw in ("a2a", "ring"):
         return raw
-    return "ag"
+    if raw in (
+        "i8",
+        "int8",
+        "i8_ag",
+        "i8-ag",
+        "ag_i8",
+        "int8_ag",
+        "int8-ag",
+    ):
+        return "i8"
+    if raw in ("i8_ring", "i8-ring", "int8_ring", "int8-ring", "ring_i8"):
+        return "i8_ring"
+    if raw in ("i8_a2a", "i8-a2a", "int8_a2a", "int8-a2a", "a2a_i8"):
+        return "i8_a2a"
+    if raw in (
+        "mx",
+        "mxfp8",
+        "mx_ag",
+        "mx-ag",
+        "mxfp8_ag",
+        "mxfp8-ag",
+        "ag_mx",
+    ):
+        return "mx"
+    if raw in (
+        "mx_ring",
+        "mx-ring",
+        "mxfp8_ring",
+        "mxfp8-ring",
+        "ring_mx",
+    ):
+        return "mx_ring"
+    if raw in (
+        "mx_a2a",
+        "mx-a2a",
+        "mxfp8_a2a",
+        "mxfp8-a2a",
+        "a2a_mx",
+    ):
+        return "mx_a2a"
+    if raw in ("ag", "1"):
+        return "ag"
+    raise ValueError(f"unrecognized PCIe DMA wire mode: {value!r}")
 
 
 @lru_cache(maxsize=1)
@@ -178,7 +228,17 @@ class PCIeDmaAllReduce:
             )
             self._fp8_stage_stride = stride
         self.min_bytes = 0
-        self.wire_mode = f"fp8-{self._fp8}" if self._fp8 else "bf16"
+        wire_modes = {
+            "i8": "int8-ag",
+            "i8_ring": "int8-ring",
+            "i8_a2a": "int8-a2a",
+            "mx": "mxfp8-ag",
+            "mx_ring": "mxfp8-ring",
+            "mx_a2a": "mxfp8-a2a",
+        }
+        self.wire_mode = wire_modes.get(
+            self._fp8, f"fp8-{self._fp8}" if self._fp8 else "bf16"
+        )
         logger.debug("[PCIe DMA allreduce] wire mode: %s", self.wire_mode)
         if logger.isEnabledFor(logging.DEBUG):
             self._log_peer_copy_bandwidth()
@@ -296,15 +356,41 @@ class PCIeDmaAllReduce:
         shard_elems = inp.numel() // world
         shard_bytes = shard_elems * elem
 
-        fp8_eligible = (
+        compressed_eligible = (
             bool(self._fp8)
             and inp.dtype == torch.bfloat16
             and shard_elems % FP8_QUANT_BLOCK == 0
         )
-        if fp8_eligible and self._fp8 == "a2a":
-            return self._all_reduce_fp8(inp, out, shard_elems)
-        fp8_ring = fp8_eligible and self._fp8 == "ring"
-        fp8_ag = fp8_eligible and self._fp8 in ("ag", "ring")
+        int8_wire = compressed_eligible and self._fp8.startswith("i8")
+        mxfp8_wire = compressed_eligible and self._fp8.startswith("mx")
+        wire_codec = "i8" if int8_wire else "mx" if mxfp8_wire else "e4m3"
+        if compressed_eligible and self._fp8 in ("a2a", "i8_a2a", "mx_a2a"):
+            return self._all_reduce_fp8(inp, out, shard_elems, wire_codec=wire_codec)
+        compressed_ring = compressed_eligible and self._fp8 in (
+            "ring",
+            "i8_ring",
+            "mx_ring",
+        )
+        compressed_ag = compressed_eligible and self._fp8 in (
+            "ag",
+            "ring",
+            "i8",
+            "i8_ring",
+            "mx",
+            "mx_ring",
+        )
+        if wire_codec == "i8":
+            quantize = ext.dma_quant_i8
+            dequantize_store = ext.dma_dequant_store_i8
+            dequantize_add_quant = ext.dma_dequant_add_quant_i8
+        elif wire_codec == "mx":
+            quantize = ext.dma_quant_mx
+            dequantize_store = ext.dma_dequant_store_mx
+            dequantize_add_quant = ext.dma_dequant_add_quant_mx
+        else:
+            quantize = ext.dma_quant
+            dequantize_store = ext.dma_dequant_store
+            dequantize_add_quant = ext.dma_dequant_add_quant
 
         base = out.data_ptr()
 
@@ -314,11 +400,11 @@ class PCIeDmaAllReduce:
         # chunking amortizes the flag round trip further as long as each
         # piece's copy time dominates the ~5us sub-step overhead.
         pieces = self._pick_pieces(shard_elems, shard_bytes)
-        if fp8_ag and (shard_elems // pieces) % FP8_QUANT_BLOCK != 0:
+        if compressed_ag and (shard_elems // pieces) % FP8_QUANT_BLOCK != 0:
             pieces = 1
         piece_elems = shard_elems // pieces
         piece_bytes = piece_elems * elem
-        # fp8 AG slices are piece-contiguous: [payload][scales] per piece.
+        # Compressed slices are piece-contiguous: [payload][scales] per piece.
         piece_slice_bytes = piece_elems + piece_elems // FP8_QUANT_BLOCK * 4
         steps = 2 * (world - 1)
 
@@ -359,7 +445,7 @@ class PCIeDmaAllReduce:
         def fp8_scratch_piece(owner: int, step: int, piece: int) -> int:
             return self._scratch_ptr(owner, step) + piece * piece_slice_bytes
 
-        stage = self._fp8_stage.data_ptr() if fp8_ag else 0
+        stage = self._fp8_stage.data_ptr() if compressed_ag else 0
 
         def fp8_stage_piece(chunk: int, piece: int) -> int:
             return stage + chunk * self._fp8_stage_stride + piece * piece_slice_bytes
@@ -372,17 +458,17 @@ class PCIeDmaAllReduce:
             else:
                 send_chunk = (rank + 1 - (k - (world - 1))) % world
                 recv_chunk = (rank - (k - (world - 1))) % world
-            fp8_reduce = fp8_ring and reduce_phase
-            fp8_step = fp8_reduce or (fp8_ag and not reduce_phase)
-            if fp8_step and k == world - 1:
+            compressed_reduce = compressed_ring and reduce_phase
+            compressed_step = compressed_reduce or (compressed_ag and not reduce_phase)
+            if compressed_step and k == world - 1:
                 # The AG-only mode quantizes the fully reduced owner chunk
                 # here.  The FP8 ring's fused final reduce hop already
                 # emitted the same payload.  Both modes forward those bytes
                 # verbatim, with no additional all-gather rounding.
-                if not fp8_ring:
+                if not compressed_ring:
                     for p in range(pieces):
                         ag_stage = fp8_stage_piece(send_chunk, p)
-                        ext.dma_quant(
+                        quantize(
                             piece_ptr(send_chunk, p),
                             ag_stage,
                             ag_stage + piece_elems,
@@ -399,17 +485,17 @@ class PCIeDmaAllReduce:
                 # all ranks receive bit-identical BF16 values for every shard.
                 for p in range(pieces):
                     owner_stage = fp8_stage_piece(send_chunk, p)
-                    ext.dma_dequant_store(
+                    dequantize_store(
                         piece_ptr(send_chunk, p),
                         owner_stage,
                         owner_stage + piece_elems,
                         piece_elems,
                     )
             for p in range(pieces):
-                if fp8_reduce:
+                if compressed_reduce:
                     send_src = fp8_stage_piece(send_chunk, p)
                     if k == 0:
-                        ext.dma_quant(
+                        quantize(
                             in_piece_ptr(send_chunk, p),
                             send_src,
                             send_src + piece_elems,
@@ -418,7 +504,7 @@ class PCIeDmaAllReduce:
                         self._a2a_qdone[p].record(main)
                     send_bytes = piece_slice_bytes
                     send_dst = fp8_scratch_piece(nxt, k, p)
-                elif not fp8_step:
+                elif not compressed_step:
                     send_src = (
                         in_piece_ptr(send_chunk, p)
                         if k == 0
@@ -435,11 +521,11 @@ class PCIeDmaAllReduce:
                     send_bytes = piece_slice_bytes
                     send_dst = fp8_scratch_piece(nxt, k, p)
                 with torch.cuda.stream(copy_stream):
-                    if fp8_reduce:
+                    if compressed_reduce:
                         copy_stream.wait_event(
                             self._a2a_qdone[p] if k == 0 else add_done[p]
                         )
-                    elif fp8_step and k == world - 1:
+                    elif compressed_step and k == world - 1:
                         copy_stream.wait_event(self._ag_ready)
                     elif k > 0:
                         copy_stream.wait_event(add_done[p])
@@ -456,10 +542,10 @@ class PCIeDmaAllReduce:
                     self._counter_ptr(self._wait_counters, slot(k, p)),
                 )
                 if reduce_phase:
-                    if fp8_reduce:
+                    if compressed_reduce:
                         payload = fp8_scratch_piece(rank, k, p)
                         reduced = fp8_stage_piece(recv_chunk, p)
-                        ext.dma_dequant_add_quant(
+                        dequantize_add_quant(
                             piece_ptr(recv_chunk, p),
                             in_piece_ptr(recv_chunk, p),
                             payload,
@@ -477,7 +563,7 @@ class PCIeDmaAllReduce:
                             piece_elems,
                             dtype_code,
                         )
-                elif fp8_step:
+                elif compressed_step:
                     payload = fp8_scratch_piece(rank, k, p)
                     # Forwarding reads the received FP8 payload verbatim, so
                     # it only depends on the receive flag, not on the local
@@ -485,7 +571,7 @@ class PCIeDmaAllReduce:
                     # dequantization to overlap the next hop's CE copy with
                     # this rank's read-only dequant/store.
                     add_done[p].record(main)
-                    ext.dma_dequant_store(
+                    dequantize_store(
                         piece_ptr(recv_chunk, p),
                         payload,
                         payload + piece_elems,
@@ -497,7 +583,7 @@ class PCIeDmaAllReduce:
                         scratch_piece(rank, k, p),
                         piece_bytes,
                     )
-                if reduce_phase or not fp8_step:
+                if reduce_phase or not compressed_step:
                     add_done[p].record(main)
 
         # Neighbor handshake so the next call (or graph replay) cannot
@@ -526,9 +612,14 @@ class PCIeDmaAllReduce:
         return 1
 
     def _all_reduce_fp8(
-        self, inp: torch.Tensor, out: torch.Tensor, shard_elems: int
+        self,
+        inp: torch.Tensor,
+        out: torch.Tensor,
+        shard_elems: int,
+        *,
+        wire_codec: str = "e4m3",
     ) -> torch.Tensor:
-        """Pipelined quantize-once E4M3 all-to-all.
+        """Pipelined quantize-once compressed all-to-all.
 
         Slices are split into chunks; each chunk's quantize -> scatter ->
         fp32 dequant-accumulate -> quantize-once broadcast wave overlaps the
@@ -542,6 +633,18 @@ class PCIeDmaAllReduce:
         """
 
         ext = self._ext
+        if wire_codec == "i8":
+            quantize = ext.dma_quant_i8
+            dequantize_accum = ext.dma_dequant_accum_i8
+            dequantize_store = ext.dma_dequant_store_i8
+        elif wire_codec == "mx":
+            quantize = ext.dma_quant_mx
+            dequantize_accum = ext.dma_dequant_accum_mx
+            dequantize_store = ext.dma_dequant_store_mx
+        else:
+            quantize = ext.dma_quant
+            dequantize_accum = ext.dma_dequant_accum
+            dequantize_store = ext.dma_dequant_store
         world = self.world_size
         rank = self.rank
         shard_bytes = shard_elems * 2
@@ -585,7 +688,7 @@ class PCIeDmaAllReduce:
         # ready while later quants still run.
         for c in range(chunks):
             for j in peers:
-                ext.dma_quant(
+                quantize(
                     in_base + j * shard_bytes + c * chunk_bytes,
                     stage_chunk(j, c),
                     stage_chunk(j, c) + chunk_payload,
@@ -623,10 +726,10 @@ class PCIeDmaAllReduce:
             payloads = [rs_chunk(rank, i, c) for i in range(world - 1)]
             scales = [ptr + chunk_payload for ptr in payloads]
             own = rank * shard_bytes + c * chunk_bytes
-            ext.dma_dequant_accum(
+            dequantize_accum(
                 out_base + own, in_base + own, payloads, scales, chunk_elems
             )
-            ext.dma_quant(
+            quantize(
                 out_base + own,
                 stage_chunk(rank, c),
                 stage_chunk(rank, c) + chunk_payload,
@@ -638,7 +741,7 @@ class PCIeDmaAllReduce:
             # Peers materialize this reduced shard from the broadcast FP8
             # payload.  The owner must do the same or every rank enters the
             # next TP layer with a different replicated activation.
-            ext.dma_dequant_store(
+            dequantize_store(
                 out_base + own,
                 stage_chunk(rank, c),
                 stage_chunk(rank, c) + chunk_payload,
@@ -670,7 +773,7 @@ class PCIeDmaAllReduce:
                     self._counter_ptr(self._wait_counters, slot),
                 )
                 payload = ag_chunk(rank, i, c)
-                ext.dma_dequant_store(
+                dequantize_store(
                     out_base + src * shard_bytes + c * chunk_bytes,
                     payload,
                     payload + chunk_payload,
