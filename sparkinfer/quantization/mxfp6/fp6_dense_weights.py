@@ -497,7 +497,17 @@ def dense_fp6_linear_expanded(
     if _per_row and not _per_row_in_kernel:
         _num = mx_gs_numerator(a_fmt)
         a_amax_pr = x.abs().amax(dim=1, keepdim=True).float()      # (m, 1)
-        a_gs_pr = _num / a_amax_pr.clamp_min_(1e-6)                # (m, 1)
+        # f64 divide + cast: bit-identical to a correctly-rounded f32
+        # division (f64's 53-bit quotient always re-rounds exactly; the
+        # 2p+2 double-rounding rule). torch's CUDA f32 scalar/tensor
+        # division is NOT always correctly rounded (e.g. 200704/2.625
+        # lands 1 ulp high), while the fused small-M kernel uses
+        # div.rn.f32 — a raw torch divide here flips borderline bf16
+        # pre-scales vs the in-kernel per-row path (single-code
+        # mismatches seen in test_small_m_linear_end_to_end_bit_exact).
+        a_gs_pr = (
+            _num / a_amax_pr.clamp_min_(1e-6).double()
+        ).float()                                                  # (m, 1)
         x = (x.float() * a_gs_pr).to(torch.bfloat16)               # pre-scaled
         _gs_unit = torch.ones(1, dtype=torch.float32, device=device)
     else:
@@ -558,9 +568,13 @@ def dense_fp6_linear_expanded(
             a_amax_raw = torch.linalg.vector_norm(
                 x, ord=float("inf")
             ).reshape(1)
-            a_gs = mx_gs_numerator(a_fmt) / a_amax_raw.to(
-                torch.float32
-            ).clamp_min_(1e-6)
+            # f64 divide + cast = correctly-rounded f32 division; keeps this
+            # per-tensor A/B path bit-consistent with the small-M kernel's
+            # in-kernel div.rn gs (see the per-row comment above).
+            a_gs = (
+                mx_gs_numerator(a_fmt)
+                / a_amax_raw.to(torch.float32).clamp_min_(1e-6).double()
+            ).float()
             a_codes, a_scale = _quantize_matrix_fp6_bytes(x, a_fmt, a_gs)
             alpha = torch.reciprocal(a_gs * global_scale)
     a_sf = as_grouped_mxfp6_scale_view(a_scale.view(1, -1), m_pad, k)
@@ -604,8 +618,12 @@ def dense_fp6_linear_expanded(
     elif a_gs_pr is not None:
         # Undo per-row pre-scaling: multiply by 1 / a_gs_per_row.
         # The GEMM alpha already handled the quantizer's internal gs and w_gs;
-        # this step undoes only the per-row activation scaling.
-        result.mul_((1.0 / a_gs_pr[:m]).to(torch.bfloat16))
+        # this step undoes only the per-row activation scaling. f64 reciprocal
+        # + f32 cast = correctly-rounded f32 division, matching the kernel's
+        # div.rn-computed inv_gs bit-for-bit (see the a_gs_pr comment above).
+        result.mul_(
+            (1.0 / a_gs_pr[:m].double()).float().to(torch.bfloat16)
+        )
     if out is not None:
         out.copy_(result)
         return out

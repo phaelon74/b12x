@@ -53,8 +53,11 @@ def test_small_m_matches_tma_quantizer(m, fmt):
     # every code below would mismatch).
     x[m - 1, k - 1] = 4.0
     amax_raw = torch.linalg.vector_norm(x, ord=float("inf")).reshape(1)
-    # Fmt-aware numerator: must mirror the in-kernel recipe exactly.
-    a_gs = mx_gs_numerator(fmt) / amax_raw.to(torch.float32).clamp_min(1e-6)
+    # Fmt-aware numerator; f64 divide + f32 cast == div.rn.f32 (the host
+    # recipe — torch's raw CUDA f32 division is not always correctly rounded).
+    a_gs = (
+        mx_gs_numerator(fmt) / amax_raw.to(torch.float32).clamp_min(1e-6).double()
+    ).float()
     w_gs = torch.tensor([0.5], dtype=torch.float32, device=device)
 
     x_pad = torch.zeros(_TILE, k, dtype=torch.bfloat16, device=device)
@@ -139,9 +142,10 @@ def test_small_m_per_row_matches_host_chain(m, fmt):
         x[m - 1].zero_()  # degenerate all-zero row: clamp_min(1e-6) edge
     w_gs = torch.tensor([0.5], dtype=torch.float32, device=device)
 
-    # Host chain reference (identical to fp6_dense_weights' unfused path).
+    # Host chain reference (identical to fp6_dense_weights' unfused path):
+    # f64 divide + f32 cast == div.rn.f32, matching the in-kernel division.
     a_amax_pr = x.abs().amax(dim=1, keepdim=True).float()
-    a_gs_pr = mx_gs_numerator(fmt) / a_amax_pr.clamp_min_(1e-6)
+    a_gs_pr = (mx_gs_numerator(fmt) / a_amax_pr.clamp_min_(1e-6).double()).float()
     x_pre = (x.float() * a_gs_pr).to(torch.bfloat16)
     codes_ref, scale_ref, alpha_ref = _quantize_matrix_fp6_bytes_small_m(
         x_pre, fmt, w_gs, _TILE
@@ -149,7 +153,7 @@ def test_small_m_per_row_matches_host_chain(m, fmt):
     codes_ref = codes_ref[:m].clone()
     scale_ref = scale_ref.clone()
     alpha_ref = alpha_ref.clone()
-    inv_ref = (1.0 / a_gs_pr).to(torch.bfloat16)
+    inv_ref = (1.0 / a_gs_pr.double()).float().to(torch.bfloat16)
 
     codes_pr, scale_pr, alpha_pr, inv_pr = _quantize_matrix_fp6_bytes_small_m(
         x, fmt, w_gs, _TILE, per_row=True

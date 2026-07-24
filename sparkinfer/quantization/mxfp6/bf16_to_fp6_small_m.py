@@ -25,8 +25,10 @@ fmt-aware numerator from :func:`sparkinfer._lib.fp6.mx_gs_numerator`); thread 0
 of CTA 0 emits ``alpha = 1 / (gs * w_gscale)`` for the GEMM epilogue. That
 removes the separate ``vector_norm`` reduce kernel (~1 ms/step at 256
 linears/step in the serving profile) plus the f32-convert/clamp/div/mul/
-reciprocal launches from the decode hot path. All derived values use the same
-correctly-rounded f32 ops torch uses, so codes/scales/alpha stay bit-identical.
+reciprocal launches from the decode hot path. All divisions use div.rn.f32
+(correctly rounded); the host-side chain divides in f64 and casts to f32 —
+provably the same bits — so codes/scales/alpha stay bit-identical. (A raw
+torch f32 scalar/tensor divide is NOT always correctly rounded on CUDA.)
 
 The amax scan is deliberately REDUNDANT per CTA rather than single-CTA or
 cross-CTA synced: at small-M sizes the scan is a sub-microsecond L2 read
@@ -199,13 +201,13 @@ class SmallMQuantKernel:
                 amax_r = block_reduce(
                     local, fmax_f32, red_buf, cutlass.Float32(0.0)
                 )
-                # gs_r = numerator(fmt) / max(amax_r, 1e-6): identical IEEE
-                # f32 ops (clamp_min, div) to the host recipe. div.rn is
-                # REQUIRED here — the DSL's ``/`` can lower to an approximate
-                # division that differs from torch by 1 ulp on edge operands,
-                # which is enough to flip the bf16 rounding of pre-scaled
-                # elements (seen as a single-row code mismatch vs the host
-                # chain in test_small_m_linear_end_to_end_bit_exact).
+                # gs_r = numerator(fmt) / max(amax_r, 1e-6) with a correctly
+                # rounded f32 division (div.rn.f32, not the DSL's ``/`` which
+                # may lower to an approximate division). NOTE: torch's CUDA
+                # f32 scalar/tensor division is itself NOT always correctly
+                # rounded (200704/2.625 lands 1 ulp high), so the host chain
+                # in fp6_dense_weights divides in f64 and casts — provably
+                # equal to div.rn.f32 — to stay bit-identical to this kernel.
                 gs_pr[r] = div_rn_f32(
                     cutlass.Float32(_GS_NUMERATOR[self.fmt]),
                     fmax_f32(amax_r, cutlass.Float32(1e-6)),
@@ -251,9 +253,10 @@ class SmallMQuantKernel:
             )
 
             # Activation global scale, fused: gs = numerator(fmt) /
-            # max(amax, 1e-6). Identical IEEE f32 ops to the host recipe
-            # (convert, clamp_min, divide) -> bit-identical gs. div.rn, not
-            # the DSL's ``/`` (see the per-row branch comment).
+            # max(amax, 1e-6) with a correctly rounded f32 division
+            # (div.rn, not the DSL's ``/``). The host-side A/B recipe
+            # divides in f64 and casts to f32, which is bit-identical to
+            # div.rn.f32 (see the per-row branch comment).
             amax_f32 = fmax_f32(amax_val, cutlass.Float32(1e-6))
             gs_value = div_rn_f32(
                 cutlass.Float32(_GS_NUMERATOR[self.fmt]), amax_f32

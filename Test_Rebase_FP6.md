@@ -470,6 +470,15 @@ per-row output correction all happen in the one quant launch. Numerics are
 bit-identical by construction; `SPARKINFER_DENSE_PER_ROW_IN_KERNEL=0`
 restores the host chain for A/B.
 
+**Divide-rounding follow-up (Jul 23):** bring-up of the fused kernel
+uncovered that torch's CUDA f32 scalar/tensor division is not always
+correctly rounded (e.g. `200704 / 2.625` lands 1 ulp high), while the
+kernel's `div.rn.f32` is. The host chain now divides in f64 and casts to
+f32 — provably the same bits as `div.rn.f32` — so both paths agree on every
+operand. This slightly changes the pre-scale on rare boundary rows, so the
+KLD constants below are RE-BASELINED by this run: record the new values,
+then verify they repeat bit-exactly.
+
 Validation sequence on the rig. Everything (unit tests, KLD, serving,
 benches) runs in the ONE shared venv (`~/sparkinfer-kld-nightly/venv`).
 First `git pull` the `fp6-sparkinfer` checkout, then reinstall:
@@ -511,15 +520,18 @@ python -m pytest tests/quantization/test_fp6_dense_weights_pipeline.py -v
 
 ### 17.2 Dense KLD — the hard gate
 
-Re-run Section 13.1 exactly. **PASS:** Mean KLD is exactly **0.034423**,
-twice. Any other value means the fused kernel is NOT bit-identical — report
-it and set `SPARKINFER_DENSE_PER_ROW_IN_KERNEL=0` to confirm the fallback
-still produces 0.034423.
+Re-run Section 13.1 exactly, TWICE, plus once with
+`SPARKINFER_DENSE_PER_ROW_IN_KERNEL=0`. **PASS:** all three runs print the
+IDENTICAL mean KLD, close to (but not necessarily exactly) the old
+0.034423 — the correctly-rounded divide re-baselines the constant. Record
+the new value; any run-to-run or fused-vs-fallback difference is a bug.
 
 ### 17.3 MoE KLD
 
-Re-run Section 13.2 exactly. **PASS:** Mean KLD is exactly **0.011016**,
-twice. (MoE attention/dense projections share this decode path.)
+Re-run Section 13.2 exactly, twice. **PASS:** both runs print the
+IDENTICAL mean KLD, close to the old 0.011016 (MoE attention/dense
+projections share this decode path, so this constant re-baselines too).
+Record the new value.
 
 ### 17.4 Serve bench
 
