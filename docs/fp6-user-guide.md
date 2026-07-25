@@ -246,7 +246,8 @@ export OMP_NUM_THREADS=8
 # Recent vLLM nightlies gate these endpoints on the --profiler-config CLI arg
 # (vllm/entrypoints/serve/profile/api_router.py); the old VLLM_TORCH_PROFILER_DIR
 # env var no longer registers them. PROFILE=1 enables; traces (.json.gz) land in
-# PROFILE_DIR; summarize with sparkinfer scripts/summarize_vllm_trace.py.
+# PROFILE_DIR; summarize with scripts/summarize_vllm_trace.py
+# (see docs/fp6-phase-a-evidence.md for the Behemoth Phase-A capture flow).
 PROFILE="${PROFILE:-0}"
 PROFILE_DIR="${PROFILE_DIR:-/tmp/vllm_prof}"
 if [[ "$PROFILE" == "1" ]]; then
