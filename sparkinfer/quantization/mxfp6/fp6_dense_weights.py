@@ -203,6 +203,56 @@ def _quantize_matrix_fp6_bytes(
     return out.packed_a_storage.view(m, k), out.scale_storage
 
 
+def _quantize_matrix_fp6_bytes_per_row(
+    mat_bf16: torch.Tensor,
+    fmt: str,
+    w_global_scale: torch.Tensor,
+):
+    """Quantize a padded ``(m, K)`` bf16 activation with FUSED per-row GS.
+
+    Large-M counterpart of the ``per_row=True`` small-M path: the whole
+    per-row global-scale recipe from ``dense_fp6_linear_expanded`` runs on the
+    GPU in two kernels instead of the eager amax/upcast/mul/cast chain
+    (measured ~2.2 s per 8192-token prefill chunk on Behemoth-123B TP=2 once
+    inductor fused that chain into ~7 ms/call triton reductions):
+
+    1. :func:`~sparkinfer.quantization.mxfp6.fp6_row_gs.compile_fp6_row_gs`
+       computes ``gs_r``/``inv_gs_r``/``alpha`` in one bandwidth-bound pass;
+    2. the TMA quantizer (``per_row=True``) pre-scales each element through
+       bf16 in-registers and quantizes with a unit gs.
+
+    Every written bit is identical to the host chain (same amax semantics,
+    div.rn.f32 divisions, cvt.rn.bf16.f32 pre-scale — see the kernel
+    docstrings). ``m`` must be 128-padded (TMA contract); zero padding rows
+    quantize to the same bytes as the host chain's zero-padded input.
+
+    Returns ``(codes (m, K) uint8, scale_storage flat uint8, alpha (1,) f32,
+    inv_gs (m,) bf16)``; callers slice ``inv_gs`` to the true row count.
+    """
+    m, k = mat_bf16.shape
+    if m % _TILE != 0 or k % _TILE != 0:
+        raise ValueError(
+            f"GPU FP6 quantizer requires M%{_TILE}==0 and K%{_TILE}==0, got M={m} K={k}"
+        )
+    from sparkinfer.quantization.mxfp6 import (
+        allocate_bf16_to_fp6_tma_outputs,
+        compile_bf16_to_fp6_tma,
+    )
+    from sparkinfer.quantization.mxfp6.fp6_row_gs import compile_fp6_row_gs
+
+    device = mat_bf16.device
+    x = mat_bf16.contiguous()
+    gs_launch = compile_fp6_row_gs(m, k, fmt=fmt)
+    gs_pr = torch.empty(m, dtype=torch.float32, device=device)
+    inv_gs = torch.empty(m, dtype=torch.bfloat16, device=device)
+    alpha = torch.empty(1, dtype=torch.float32, device=device)
+    gs_launch(x, w_global_scale, gs_pr, inv_gs, alpha)
+    launch = compile_bf16_to_fp6_tma(m, k, fmt=fmt, emit="bytes", per_row=True)
+    out = allocate_bf16_to_fp6_tma_outputs(m, k, device=device, emit="bytes")
+    launch(x, gs_pr, out.packed_a_flat, out.scale_flat)
+    return out.packed_a_storage.view(m, k), out.scale_storage, alpha, inv_gs
+
+
 def _quantize_matrix_fp6_bytes_small_m(
     mat_bf16: torch.Tensor,
     fmt: str,
@@ -480,20 +530,18 @@ def dense_fp6_linear_expanded(
     # same in-kernel per-tensor gs (== 1.0), so it stays bit-identical to
     # the unfused small-M path as well.
     #
-    # On the small-M decode path the whole recipe runs INSIDE the quant
-    # kernel (per_row=True below): the host-side chain here costs ~12 eager
-    # launches per linear (~8 ms/step at 27B serving scale) while the fused
-    # kernel costs zero extra launches and writes identical bits. The host
-    # chain remains for the large-M path (amortized over >=128 rows), the
-    # fused-prologue m=1 path, and as the SPARKINFER_DENSE_PER_ROW_IN_KERNEL=0
-    # A/B fallback.
+    # The whole recipe runs INSIDE the quant kernels on both regimes:
+    # small-M (decode) fuses it into SmallMQuantKernel (per_row=True below;
+    # the host chain cost ~12 eager launches per linear, ~8 ms/step at 27B
+    # serving scale), and large-M (prefill) splits it into the RowGsKernel
+    # pass + the TMA quantizer's per_row mode (the host chain's upcast/amax/
+    # mul/cast passes cost ~2.2 s per 8192-token prefill chunk on
+    # Behemoth-123B TP=2 once inductor fused them into ~7 ms/call triton
+    # reductions). All fused paths write bits identical to the host chain,
+    # which remains for the fused-prologue m=1 path and as the
+    # SPARKINFER_DENSE_PER_ROW_IN_KERNEL=0 A/B fallback.
     _per_row = _DENSE_PER_ROW_GS and m > 0 and (not _fused_quant or m == 1)
-    _per_row_in_kernel = (
-        _per_row
-        and not _fused_quant
-        and m <= _SMALL_M_QUANT_MAX
-        and _PER_ROW_IN_KERNEL
-    )
+    _per_row_in_kernel = _per_row and not _fused_quant and _PER_ROW_IN_KERNEL
     if _per_row and not _per_row_in_kernel:
         _num = mx_gs_numerator(a_fmt)
         a_amax_pr = x.abs().amax(dim=1, keepdim=True).float()      # (m, 1)
@@ -560,7 +608,18 @@ def dense_fp6_linear_expanded(
             x_pad = torch.zeros(m_pad, k, dtype=torch.bfloat16, device=device)
             x_pad[:m].copy_(x)
             x = x_pad
-        if _per_row:
+        if _per_row_in_kernel:
+            # Fused large-M per-row path: RowGsKernel + the TMA quantizer's
+            # per_row mode replace the eager pre-scale chain (which never ran
+            # above on this branch) — bit-identical, two launches total.
+            # Zero padding rows get a finite gs (amax clamped to 1e-6) and
+            # pre-scale to exactly 0.0, matching the host chain's padded
+            # zeros; their inv_gs entries are sliced away below.
+            a_codes, a_scale, alpha, inv_gs_pr = _quantize_matrix_fp6_bytes_per_row(
+                x, a_fmt, global_scale
+            )
+            inv_gs_pr = inv_gs_pr[:m].view(m, 1)
+        elif _per_row:
             # x is already pre-scaled; pass unit activation global scale.
             a_codes, a_scale = _quantize_matrix_fp6_bytes(x, a_fmt, _gs_unit)
             alpha = torch.reciprocal(_gs_unit * global_scale)

@@ -117,7 +117,7 @@ is **not** a stock vLLM quant method — without the package installed,
 | `SPARKINFER_ENABLE_FP6=1` | Master gate. Unset/0 = the plugin stays inert and vLLM uses its native paths. |
 | `SPARKINFER_FP6_MODEL_DIR=<checkpoint dir>` | Where the plugin indexes FP6 tensors. Export **unconditionally** per launch: a stale value from a previous launch mis-classifies layers and trips loader shape asserts. |
 | `SPARKINFER_ENABLE_FP6_MICRO=0` | Keep the fast fused dense kernel (the BS1 micro kernel is slower for these workloads). |
-| `SPARKINFER_DENSE_PER_ROW_IN_KERNEL` | Default 1 (fused in-kernel per-row activation quant). `0` = host-chain A/B fallback, bit-identical but ~1.7 ms/token slower at decode. |
+| `SPARKINFER_DENSE_PER_ROW_IN_KERNEL` | Default 1 (fused in-kernel per-row activation quant, both regimes: small-M fused kernel at decode, RowGsKernel + per-row TMA quantizer at prefill). `0` = host-chain A/B fallback, bit-identical but ~1.7 ms/token slower at decode and multi-second per 8k prefill chunk at 123B scale. |
 
 Never leak KLD-scoring-only variables into serving: unset
 `TORCH_COMPILE_DISABLE` and `SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT`
