@@ -117,7 +117,77 @@ def _small_m_quant_scratch(m_pad: int, k: int, device: torch.device) -> tuple:
 # (measured on RTX PRO 6000: N=13824 -> 108 CTAs -> 0.82x of expanded;
 # N<=6144 -> <=48 CTAs -> latency-bound, the in-smem expansion chain loses).
 # Default 12288 (>=96 N-tiles) only enables shapes near the measured win.
+# NOTE: the packed-vs-expanded crossover is M-dependent — the win above is a
+# DECODE (M<=16) result. At prefill M the packed stream loses 1.27-1.28x on
+# every measured shard (Phase A, Behemoth TP=2 M>=2048), so packed weights
+# are expanded per call into a shared scratch at M > _SMALL_M_QUANT_MAX (see
+# _expand_packed_weight_large_m below; SPARKINFER_PACKED_B_EXPAND_LARGE_M=0
+# restores the old always-packed behavior for A/B runs).
 PACKED_GEMM_MIN_N = int(os.getenv("SPARKINFER_PACKED_B_MIN_N", "12288"))
+
+_PACKED_B_EXPAND_LARGE_M = os.getenv(
+    "SPARKINFER_PACKED_B_EXPAND_LARGE_M", "1"
+).lower() not in ("0", "false")
+
+# Shared large-M expansion scratch: ONE grow-only uint8 buffer per
+# (device, stream), sized to the largest packed layer seen (~N*K bytes,
+# 176 MB for Behemoth's gate_up shard at TP=2) and reused across all layers
+# — the whole point is prefill-speed expanded-B without the per-layer
+# expanded copies that would erase the FP6 VRAM win. Superseded buffers are
+# retired, never freed: a captured CUDA graph may hold raw pointers into
+# them (same reasoning as the quant scratch; in practice vLLM's profile run
+# hits the largest shape before any capture, so growth after warmup is rare).
+_EXPAND_SCRATCH: dict[tuple, torch.Tensor] = {}
+_EXPAND_SCRATCH_RETIRED: list[torch.Tensor] = []
+
+
+def _packed_expand_scratch(nbytes: int, device: torch.device) -> torch.Tensor:
+    """Grow-only per-(device, stream) uint8 scratch for large-M expansion."""
+    capturing = device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+    stream = (
+        torch.cuda.current_stream(device).cuda_stream
+        if device.type == "cuda"
+        else 0
+    )
+    key = (device.type, device.index or 0, stream)
+    buf = _EXPAND_SCRATCH.get(key)
+    if buf is not None and buf.numel() >= nbytes:
+        return buf
+    new = torch.empty(nbytes, dtype=torch.uint8, device=device)
+    if _PERSISTENT_SCRATCH and not capturing:
+        if buf is not None:
+            _EXPAND_SCRATCH_RETIRED.append(buf)
+        _EXPAND_SCRATCH[key] = new
+    return new
+
+
+def _expand_packed_weight_large_m(
+    weight_packed: torch.Tensor, in_features: int
+) -> torch.Tensor:
+    """Expand a 3:4-packed weight into the shared scratch for one GEMM call.
+
+    Large-M regime fix (Phase A): the packed-B stream loses 1.27-1.28x to the
+    expanded-B kernel at prefill M on every Behemoth TP=2 shard, while the
+    one-pass expansion kernel costs ~0.2 ms on the largest shard — against a
+    measured 0.7-3.0 ms per-call GEMM saving. The scratch is consumed by the
+    GEMM before the next linear runs on the same stream, so cross-layer reuse
+    is stream-ordered-safe (same argument as the quant scratch).
+
+    Returns the ``(N, K, 1)`` K-major byte-container view ``dense_gemm``
+    consumes with ``b_preexpanded=True`` — bit-identical bytes to the
+    load-time ``_expand_packed_mxfp6_ab`` expansion.
+    """
+    from sparkinfer.quantization.mxfp6.fp6_expand_packed import (
+        compile_fp6_expand_packed,
+    )
+
+    n = weight_packed.shape[0]
+    packed_2d = weight_packed.reshape(n, -1)
+    packed_bytes = packed_2d.shape[0] * packed_2d.shape[1]
+    launch = compile_fp6_expand_packed(packed_bytes)
+    out = _packed_expand_scratch(n * in_features, weight_packed.device)
+    launch(packed_2d.reshape(-1), out)
+    return out[: n * in_features].view(n, in_features).unsqueeze(-1)
 
 
 def _weight_fmt_for_source(source_format: str) -> str:
@@ -493,6 +563,15 @@ def dense_fp6_linear_expanded(
             f"weight K extent {w_k} matches neither expanded ({in_features}) "
             f"nor packed ({in_features * 3 // 4}) layout"
         )
+    if b_packed and _PACKED_B_EXPAND_LARGE_M and m > _SMALL_M_QUANT_MAX:
+        # Large-M regime: packed streaming loses 1.27-1.28x at prefill M
+        # (Phase A), so expand into the shared scratch and take the
+        # expanded-B kernel. Decode (m <= 16) stays on the packed stream,
+        # where it wins at the dominant M=1 shape. Bit-identical either way
+        # (same codes, same MMA order — the packed path only relocates the
+        # expansion into smem).
+        weight = _expand_packed_weight_large_m(weight, in_features)
+        b_packed = False
     if weight.ndim == 2:
         weight = weight.unsqueeze(-1)
     n = out_features

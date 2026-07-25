@@ -118,6 +118,7 @@ is **not** a stock vLLM quant method — without the package installed,
 | `SPARKINFER_FP6_MODEL_DIR=<checkpoint dir>` | Where the plugin indexes FP6 tensors. Export **unconditionally** per launch: a stale value from a previous launch mis-classifies layers and trips loader shape asserts. |
 | `SPARKINFER_ENABLE_FP6_MICRO=0` | Keep the fast fused dense kernel (the BS1 micro kernel is slower for these workloads). |
 | `SPARKINFER_DENSE_PER_ROW_IN_KERNEL` | Default 1 (fused in-kernel per-row activation quant, both regimes: small-M fused kernel at decode, RowGsKernel + per-row TMA quantizer at prefill). `0` = host-chain A/B fallback, bit-identical but ~1.7 ms/token slower at decode and multi-second per 8k prefill chunk at 123B scale. |
+| `SPARKINFER_PACKED_B_EXPAND_LARGE_M` | Default 1: at M>16 a 3:4-packed weight is expanded per call into a shared scratch (~one largest-shard copy of VRAM, e.g. 176 MB at Behemoth TP=2) and the faster expanded-B GEMM runs; decode stays on the packed stream. `0` = always-packed (pre-fix behavior), bit-identical but 1.27-1.28x slower prefill GEMMs on wide-N layers. |
 
 Never leak KLD-scoring-only variables into serving: unset
 `TORCH_COMPILE_DISABLE` and `SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT`

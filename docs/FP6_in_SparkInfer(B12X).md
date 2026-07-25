@@ -160,7 +160,14 @@ doesn't that eat the FP6 win?" It does not, for four reasons:
    streams from HBM in its 3:4-packed 6-bit form and expands to
    byte-containers in shared memory (`b_packed=True`), saving 25% of
    B-side HBM traffic versus even the byte-container layout. Decode-side
-   GEMMs are bandwidth-bound; the quant pays for itself.
+   GEMMs are bandwidth-bound; the quant pays for itself. The packed
+   stream is a *decode-regime* win only: at prefill M it loses 1.27-1.28x
+   to the expanded-B kernel (compute-bound regime; Phase A, Behemoth
+   TP=2), so at M > 16 the linear expands the packed weight per call into
+   one shared grow-only scratch buffer (`ExpandPackedKernel`, one
+   coalesced pass, ~0.2 ms on the largest shard) and runs expanded-B —
+   prefill speed without per-layer expanded copies eroding the VRAM win.
+   Kill switch: `SPARKINFER_PACKED_B_EXPAND_LARGE_M=0`.
 4. **We never leave the 6/8-bit path.** There is no dequantize-to-BF16
    step anywhere between the quantizer and the accumulator: FP6 codes
    travel as `uint8` byte-containers through the FP8-shaped TMA/ldmatrix
