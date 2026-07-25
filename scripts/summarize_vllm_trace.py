@@ -19,14 +19,20 @@ Examples
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import gzip
 import json
+import os
 import pathlib
 import re
-import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Iterable
+
+try:  # 5-10x faster parse of multi-GB chrome traces when available
+    import orjson as _fast_json  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    _fast_json = None
 
 
 @dataclass
@@ -159,10 +165,13 @@ def _compile_buckets() -> list[Bucket]:
 
 def _open_trace(path: pathlib.Path) -> Any:
     if path.suffix == ".gz" or path.name.endswith(".json.gz"):
-        with gzip.open(path, "rt", encoding="utf-8") as fh:
-            return json.load(fh)
-    with path.open("r", encoding="utf-8") as fh:
-        return json.load(fh)
+        with gzip.open(path, "rb") as fh:
+            raw = fh.read()
+    else:
+        raw = path.read_bytes()
+    if _fast_json is not None:
+        return _fast_json.loads(raw)
+    return json.loads(raw)
 
 
 def _iter_events(trace: Any) -> Iterable[dict]:
@@ -198,6 +207,10 @@ def _classify(name: str, buckets: list[Bucket]) -> Bucket:
     return other
 
 
+_IS_CUDA_CAT_RE = re.compile(r"cuda|gpu|kernel", re.I)
+_IS_CUDA_NAME_RE = re.compile(r"cuda|gemm|nccl|cutlass|triton", re.I)
+
+
 def summarize_trace(path: pathlib.Path) -> dict[str, Any]:
     buckets = _compile_buckets()
     other = Bucket(name="other", patterns=())
@@ -208,6 +221,11 @@ def summarize_trace(path: pathlib.Path) -> dict[str, Any]:
     cpu_total = 0.0
     by_name_cuda: dict[str, float] = defaultdict(float)
     by_name_count: dict[str, int] = defaultdict(int)
+    # Kernel names repeat millions of times per trace; classify each unique
+    # (name, cat-class) once instead of running every bucket regex per event.
+    bucket_memo: dict[str, Bucket] = {}
+    cuda_name_memo: dict[str, bool] = {}
+    cuda_cat_memo: dict[str, bool] = {}
 
     for ev in _iter_events(trace):
         # X = complete events; also accept C++ CUDA kernels tagged similarly.
@@ -220,11 +238,22 @@ def summarize_trace(path: pathlib.Path) -> dict[str, Any]:
         dur = _duration_us(ev)
         if dur <= 0:
             continue
-        is_cuda = bool(
-            re.search(r"cuda|gpu|kernel", cat, re.I)
-            or re.search(r"cuda|gemm|nccl|cutlass|triton", name, re.I)
-        )
-        bucket = _classify(name, buckets)
+        cat_hit = cuda_cat_memo.get(cat)
+        if cat_hit is None:
+            cat_hit = bool(_IS_CUDA_CAT_RE.search(cat))
+            cuda_cat_memo[cat] = cat_hit
+        if cat_hit:
+            is_cuda = True
+        else:
+            name_hit = cuda_name_memo.get(name)
+            if name_hit is None:
+                name_hit = bool(_IS_CUDA_NAME_RE.search(name))
+                cuda_name_memo[name] = name_hit
+            is_cuda = name_hit
+        bucket = bucket_memo.get(name)
+        if bucket is None:
+            bucket = _classify(name, buckets)
+            bucket_memo[name] = bucket
         if is_cuda:
             bucket.cuda_us += dur
             cuda_total += dur
@@ -336,6 +365,15 @@ def main() -> None:
     )
     parser.add_argument("--json-out", default="", help="Write combined JSON summary")
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help=(
+            "Parallel worker processes (one per trace file). "
+            "0 = min(number of traces, CPU count). 1 = serial."
+        ),
+    )
+    parser.add_argument(
         "--self-test",
         action="store_true",
         help="Run offline classification smoke test and exit",
@@ -354,7 +392,21 @@ def main() -> None:
     if not traces:
         raise SystemExit("no trace files found")
 
-    summaries = [summarize_trace(p) for p in traces]
+    workers = args.workers or min(len(traces), os.cpu_count() or 1)
+    if _fast_json is None:
+        print(
+            "note: orjson not installed; JSON parse is the slow step. "
+            "`pip install orjson` for a large speedup.",
+            flush=True,
+        )
+    print(f"summarizing {len(traces)} trace(s) with {workers} worker(s)...", flush=True)
+    if workers <= 1 or len(traces) == 1:
+        summaries = [summarize_trace(p) for p in traces]
+    else:
+        # One process per trace: each parses its own multi-GB JSON on its own
+        # core. Order of results matches the input order.
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+            summaries = list(pool.map(summarize_trace, traces))
     for s in summaries:
         _print_summary(s)
 
