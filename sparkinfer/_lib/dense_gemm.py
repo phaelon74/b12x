@@ -173,6 +173,28 @@ _SPARKINFER_FP6_LARGE_M_TILE = _parse_tile_env(
 _SPARKINFER_FP6_DECODE_TILE = _parse_tile_env(
     "SPARKINFER_FP6_DECODE_TILE", None
 )
+
+# --- Experiment knobs (process-wide, read once at import) -------------------
+# Both are numerics-neutral: the tile-scheduler swizzle only changes WHICH CTA
+# computes which output tile (an L2-locality rasterization order), and the
+# pipeline depth only changes how far ahead the producer runs. Output bits are
+# unchanged. They are env-only (no per-call plumbing) precisely so an A/B is
+# run as two PROCESSES — the compiled-kernel cache key does not include them,
+# so switching mid-process would silently reuse the first kernel.
+#
+# SPARKINFER_DENSE_TILE_SWIZZLE=N (default 0 = keep the current per-tile rule)
+# overrides the swizzle for every tile that currently rasterizes linearly
+# (swizzle 1) — notably the FP6 prefill tile (128,64), whose grid is thousands
+# of tiles deep and re-streams operands with no L2-friendly grouping.
+_SPARKINFER_DENSE_TILE_SWIZZLE = int(
+    os.getenv("SPARKINFER_DENSE_TILE_SWIZZLE", "0")
+)
+# SPARKINFER_DENSE_AB_STAGES=N (default 0 = keep the measured caps) overrides
+# the mainloop stage cap. Always clamped by the smem-derived raw_ab_stage, so
+# an over-large N cannot exceed the smem budget. The (128,64) tile halves the
+# per-stage B bytes vs (128,128), so its smem budget likely allows a deeper
+# pipeline than the default cap of 4.
+_SPARKINFER_DENSE_AB_STAGES = int(os.getenv("SPARKINFER_DENSE_AB_STAGES", "0"))
 _SPARKINFER_DENSE_ATOM_24 = (
     os.getenv("SPARKINFER_DENSE_ATOM_24", "0") == "1"
 )
@@ -3932,6 +3954,8 @@ class DenseGemmKernel:
             # In-place packed staging freed 12 KB/stage; deeper pipelines give
             # the producer the lookahead the packed consumer chain needs.
             ab_stage = max(1, min(raw_ab_stage, 5))
+        if _SPARKINFER_DENSE_AB_STAGES:
+            ab_stage = max(1, min(raw_ab_stage, _SPARKINFER_DENSE_AB_STAGES))
         return ab_stage, epi_stage
 
     @staticmethod
@@ -4039,7 +4063,9 @@ class DenseGemmKernel:
             num_ctas_mnl,
             cluster_shape_mnl,
             swizzle_size=(
-                16 if tile_shape_mnk == (128, 128, 64) and not large_m_unroll else 1
+                16
+                if tile_shape_mnk == (128, 128, 64) and not large_m_unroll
+                else (_SPARKINFER_DENSE_TILE_SWIZZLE or 1)
             ),
         )
         if cutlass.const_expr(split_k_slices > 1):

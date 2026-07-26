@@ -460,6 +460,12 @@ def _print_evidence_header(args: argparse.Namespace) -> dict:
             "SPARKINFER_FP6_LARGE_M_UNROLL": os.getenv(
                 "SPARKINFER_FP6_LARGE_M_UNROLL"
             ),
+            "SPARKINFER_FP6_LARGE_M_TILE": os.getenv("SPARKINFER_FP6_LARGE_M_TILE"),
+            "SPARKINFER_FP6_DECODE_TILE": os.getenv("SPARKINFER_FP6_DECODE_TILE"),
+            "SPARKINFER_DENSE_TILE_SWIZZLE": os.getenv(
+                "SPARKINFER_DENSE_TILE_SWIZZLE"
+            ),
+            "SPARKINFER_DENSE_AB_STAGES": os.getenv("SPARKINFER_DENSE_AB_STAGES"),
             "CUDA_VISIBLE_DEVICES": os.getenv("CUDA_VISIBLE_DEVICES"),
         },
         "warmup": args.warmup,
