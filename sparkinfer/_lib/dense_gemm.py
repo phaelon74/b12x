@@ -203,10 +203,9 @@ _SPARKINFER_DENSE_AB_STAGES = int(os.getenv("SPARKINFER_DENSE_AB_STAGES", "0"))
 #
 # Why it exists: ncu on Behemoth-123B TP=2 decode (Jul 26) measured every one of
 # the four shards pinned at "Block Limit Shared Mem = 1", i.e. a single CTA per
-# SM, for 6-10% achieved occupancy and only 61-70% of DRAM peak. The
-# occupancy-2 path in _dense_gemm_target_occupancy is gated behind `k <= 1024`,
-# which no 123B-scale shard satisfies (K is 6144-14336), so it can never fire
-# there. This knob makes the A/B runnable before that rule is retuned.
+# SM, for 6-10% achieved occupancy and only 61-70% of DRAM peak. The MX-FP6
+# branch of _dense_gemm_target_occupancy that fixed this was derived from A/B
+# runs driven by this knob; it stays for the next such sweep.
 _SPARKINFER_DENSE_TARGET_OCCUPANCY = int(
     os.getenv("SPARKINFER_DENSE_TARGET_OCCUPANCY", "0")
 )
@@ -4774,12 +4773,24 @@ def _get_compiled_dense_gemm_mxfp6(
         b_packed=b_packed,
         a_preexpanded=a_preexpanded,
         b_preexpanded=b_preexpanded,
-        # The built-in rule in _dense_gemm_target_occupancy cannot fire for
-        # MX-FP6 (it requires k <= 1024), so this path has always run at one CTA
-        # per SM. Keep that default and let the env knob drive the A/B until the
-        # rule is retuned; _target_occupancy is part of compile_key, so the two
-        # settings never share a cached kernel.
-        target_occupancy=_SPARKINFER_DENSE_TARGET_OCCUPANCY or 1,
+        # MX-FP6 does not go through _get_compiled_dense_gemm, so the shared
+        # rule has to be called explicitly here; hardcoding a default is what
+        # silently kept this family at one CTA per SM. _target_occupancy is part
+        # of compile_key, so two settings never share a cached kernel.
+        target_occupancy=_dense_gemm_target_occupancy(
+            n=n,
+            k=k,
+            l=l,
+            ab_dtype=ab_dtype,
+            c_dtype=c_dtype,
+            tile_k=tile_k,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            sm_count=sm_count,
+            load_path="tma",
+            swap_ab=False,
+            b_tile_major=False,
+        ),
     )
     compile_key = launch.compile_key()
     raise_if_kernel_resolution_frozen(
