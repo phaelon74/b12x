@@ -29,6 +29,13 @@ Single shape, packed vs expanded only::
 Skip the optional vLLM CUTLASS FP8 arm::
 
     python benchmarks/benchmark_dense_gemm_fp6.py --preset behemoth-tp2 --no-fp8
+
+Item-4 tile sweep (expanded-B arm, candidate MMA tiles, cross-tile
+bit-equality check; run once with the default unroll and once with
+``SPARKINFER_FP6_LARGE_M_UNROLL=0`` for the unroll A/B)::
+
+    python benchmarks/benchmark_dense_gemm_fp6.py --preset behemoth-tp2 \\
+        --tile-sweep --warmup 10 --iters 50 --json-out fp6_tile_sweep.json
 """
 
 from __future__ import annotations
@@ -203,8 +210,18 @@ def _run_fp6_arm(
     iters: int,
     l2_flush,
     check: bool,
+    mma_tiler_mn: Optional[tuple[int, int]] = None,
+    out_holder: Optional[list] = None,
 ) -> ArmResult:
+    """Time one FP6 GEMM arm.
+
+    ``mma_tiler_mn`` overrides the policy tile (the item-4 tile sweep).
+    ``out_holder``, when given, receives the output tensor (holding the last
+    replay's result) so the sweep can assert cross-tile bit-equality.
+    """
     out = torch.empty((m, n, 1), device="cuda", dtype=torch.bfloat16)
+    if out_holder is not None:
+        out_holder.append(out)
     b = operands["b_packed"] if b_packed else operands["b_expanded"]
 
     def launch() -> None:
@@ -222,10 +239,23 @@ def _run_fp6_arm(
             b_packed=b_packed,
             a_fmt=operands["a_fmt"],
             b_fmt=operands["b_fmt"],
+            mma_tiler_mn=mma_tiler_mn,
         )
 
-    replay = capture_graph_replay(launch)
-    times = _bench_events(replay, warmup=warmup, iters=iters, l2_flush=l2_flush)
+    try:
+        replay = capture_graph_replay(launch)
+        times = _bench_events(
+            replay, warmup=warmup, iters=iters, l2_flush=l2_flush
+        )
+    except Exception as exc:  # unsupported tile/plan: report, keep sweeping
+        return ArmResult(
+            name=name,
+            median_us=float("nan"),
+            min_us=float("nan"),
+            raw_ms=[],
+            cosine=None,
+            skipped=f"{type(exc).__name__}: {exc}",
+        )
     cos: Optional[float] = None
     if check:
         cos = _cosine(out[:, :, 0], operands["oracle"])
@@ -421,6 +451,9 @@ def _print_evidence_header(args: argparse.Namespace) -> dict:
         "env": {
             "SPARKINFER_PACKED_B_MIN_N": os.getenv("SPARKINFER_PACKED_B_MIN_N"),
             "SPARKINFER_DENSE_PER_ROW_GS": os.getenv("SPARKINFER_DENSE_PER_ROW_GS"),
+            "SPARKINFER_FP6_LARGE_M_UNROLL": os.getenv(
+                "SPARKINFER_FP6_LARGE_M_UNROLL"
+            ),
             "CUDA_VISIBLE_DEVICES": os.getenv("CUDA_VISIBLE_DEVICES"),
         },
         "warmup": args.warmup,
@@ -443,6 +476,133 @@ def _resolve_shapes(args: argparse.Namespace) -> list[tuple[str, int, int, list[
         raise SystemExit("provide --preset behemoth-tp2 or both --n and --k")
     ms = list(args.m) if args.m else [128]
     return [("custom", args.n, args.k, ms)]
+
+
+TILE_SWEEP_DEFAULT_M = (32, 128, 512, 2048, 8192)
+
+
+def _parse_tiles(spec: str) -> list[tuple[int, int]]:
+    tiles: list[tuple[int, int]] = []
+    for part in spec.split(","):
+        part = part.strip().lower()
+        if not part:
+            continue
+        tm, tn = part.split("x")
+        tiles.append((int(tm), int(tn)))
+    return tiles
+
+
+def _run_tile_sweep(args: argparse.Namespace, l2_flush, header: dict) -> None:
+    """Item-4 evidence: FP6 expanded-B GEMM time per candidate MMA tile.
+
+    The prefill regime (M > 16) runs the expanded-B kernel on the policy
+    (128,128) tile today; the MXFP8 probe sweep found that tile the worst
+    wide-N choice at every M. This sweep gathers the FP6-side data before the
+    ladder in ``_select_default_mma_tiler_mn`` is changed. Any winning tile
+    must be M-INDEPENDENT across the regime (one kernel per (N,K) under
+    frozen resolution) and BIT-IDENTICAL to the default tile — both are
+    checked here (bit-equality via ``torch.equal`` vs the first tile).
+    Unsupported tiles report SKIP with the raising error and the sweep
+    continues.
+    """
+    tiles = _parse_tiles(args.tiles)
+    if args.preset == "behemoth-tp2":
+        ms = list(args.m) if args.m else list(TILE_SWEEP_DEFAULT_M)
+        shapes = [(name, n, k, ms) for name, (n, k) in BEHEMOTH_TP2_SHAPES.items()]
+    else:
+        if args.n is None or args.k is None:
+            raise SystemExit("provide --preset behemoth-tp2 or both --n and --k")
+        ms = list(args.m) if args.m else list(TILE_SWEEP_DEFAULT_M)
+        shapes = [("custom", args.n, args.k, ms)]
+
+    print("\nMX-FP6 W6A8 expanded-B tile sweep (CUDA graph replay)")
+    print(
+        f"{'shape':12s} {'M':>6s} {'tile':>9s} {'med_us':>10s} "
+        f"{'tflops':>8s} {'vs_t0':>8s} {'bit':>5s} {'cos':>8s}"
+    )
+
+    rows: list[dict] = []
+    for label, n, k, m_list in shapes:
+        for m in m_list:
+            operands = _setup_w6a8_operands(m, n, k, seed=args.seed)
+            ref_out: Optional[torch.Tensor] = None
+            ref_us = float("nan")
+            for idx, tile in enumerate(tiles):
+                holder: list = []
+                arm = _run_fp6_arm(
+                    name=f"tile_{tile[0]}x{tile[1]}",
+                    m=m,
+                    n=n,
+                    k=k,
+                    operands=operands,
+                    b_packed=False,
+                    warmup=args.warmup,
+                    iters=args.iters,
+                    l2_flush=l2_flush,
+                    check=not args.no_check,
+                    mma_tiler_mn=tile,
+                    out_holder=holder,
+                )
+                tile_s = f"{tile[0]}x{tile[1]}"
+                if arm.skipped:
+                    print(
+                        f"{label:12s} {m:6d} {tile_s:>9s} {'SKIP':>10s} "
+                        f"{'':>8s} {'':>8s} {'':>5s}  ({arm.skipped})"
+                    )
+                    rows.append(
+                        {
+                            "shape": label,
+                            "M": m,
+                            "N": n,
+                            "K": k,
+                            "tile": tile_s,
+                            "skipped": arm.skipped,
+                        }
+                    )
+                    continue
+                out = holder[0][:, :, 0]
+                if idx == 0 or ref_out is None:
+                    ref_out = out.clone()
+                    ref_us = arm.median_us
+                    bit = "ref"
+                else:
+                    bit = "OK" if torch.equal(out, ref_out) else "DIFF"
+                vs = (
+                    f"{arm.median_us / ref_us:.2f}x"
+                    if ref_us == ref_us and ref_us > 0
+                    else "n/a"
+                )
+                cos_s = f"{arm.cosine:.5f}" if arm.cosine is not None else "n/a"
+                print(
+                    f"{label:12s} {m:6d} {tile_s:>9s} {arm.median_us:10.1f} "
+                    f"{_tflops(m, n, k, arm.median_us):8.1f} {vs:>8s} "
+                    f"{bit:>5s} {cos_s:>8s}"
+                )
+                rows.append(
+                    {
+                        "shape": label,
+                        "M": m,
+                        "N": n,
+                        "K": k,
+                        "tile": tile_s,
+                        "median_us": arm.median_us,
+                        "min_us": arm.min_us,
+                        "tflops": _tflops(m, n, k, arm.median_us),
+                        "vs_first_tile": vs,
+                        "ratio_direction": "ratio>1 = slower_than_first_tile",
+                        "bit_exact_vs_first_tile": bit,
+                        "cosine": arm.cosine,
+                        "raw_ms": arm.raw_ms,
+                        "fmt_us": fmt_us(arm.raw_ms),
+                    }
+                )
+
+    payload = {"header": header, "mode": "tile_sweep", "rows": rows}
+    if args.json_out:
+        out_path = pathlib.Path(args.json_out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        print(f"\nWrote {out_path}")
 
 
 def main() -> None:
@@ -479,6 +639,22 @@ def main() -> None:
         "--flush-l2", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument("--l2-flush-bytes", type=int, default=0)
+    parser.add_argument(
+        "--tile-sweep",
+        action="store_true",
+        help=(
+            "Item-4 evidence mode: sweep candidate MMA tiles for the FP6 "
+            "expanded-B arm (the production prefill path) per shape x M, "
+            "asserting cross-tile bit-equality against the policy-default "
+            "(128,128) tile."
+        ),
+    )
+    parser.add_argument(
+        "--tiles",
+        type=str,
+        default="128x128,64x128,32x128,16x128,128x64,64x64",
+        help="Comma-separated MxN tile candidates for --tile-sweep.",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -486,6 +662,9 @@ def main() -> None:
 
     l2_flush = make_l2_flush_fn(enabled=args.flush_l2, bytes_hint=args.l2_flush_bytes)
     header = _print_evidence_header(args)
+    if args.tile_sweep:
+        _run_tile_sweep(args, l2_flush, header)
+        return
     shapes = _resolve_shapes(args)
 
     print(

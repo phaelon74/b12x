@@ -136,6 +136,15 @@ _SPARKINFER_TIMING_THRESHOLD_MS = float(
 _SPARKINFER_DENSE_SPLITK_TURBO = (
     os.getenv("SPARKINFER_DENSE_SPLITK_TURBO", "1") == "1"
 )
+# MX-FP6 large-M mainloop unroll (k-tile unroll 4 instead of 2, the MXFP8
+# prefill tactic). Numerics-neutral: the unroll is a pure codegen pragma (MMA
+# order per k-tile/k-block is unchanged) and the (128,128,64) swizzle branch
+# it also gates never applies to FP6 tiles. Default on after the Phase A
+# FP6-vs-DeepGEMM gap analysis; =0 restores the historical unroll=2 plan for
+# A/B runs.
+_SPARKINFER_FP6_LARGE_M_UNROLL = (
+    os.getenv("SPARKINFER_FP6_LARGE_M_UNROLL", "1") == "1"
+)
 _SPARKINFER_DENSE_ATOM_24 = (
     os.getenv("SPARKINFER_DENSE_ATOM_24", "0") == "1"
 )
@@ -6829,16 +6838,23 @@ def dense_gemm(
         )
         split_k_slices = 1
     if is_mxfp6 and (policy.split_k_slices != 1 or policy.large_m_unroll):
-        # The policy helper sees the FP8 byte-container dtype and may pick the
-        # MXFP8 split-K / large-M-unroll tactics; neither is wired for the
-        # MX-FP6 mainloop, so pin the single-slice unroll=2 plan.
+        # The policy helper sees the FP8 byte-container dtype and picks the
+        # MXFP8 tactics. Split-K stays pinned OFF for MX-FP6: it changes the
+        # accumulation order (serving-only candidate, tracked separately).
+        # large_m_unroll IS taken (subject to the A/B kill switch): it is a
+        # numerics-neutral codegen pragma — k-tile unroll 4 vs 2, identical
+        # MMA order — and closes part of the measured FP6-vs-DeepGEMM prefill
+        # efficiency gap. Verified bit-identical by
+        # tests/gemm/test_fp6_large_m_unroll.py.
         policy = _DenseGemmPolicy(
             single_work_tile_per_cta=policy.single_work_tile_per_cta,
             direct_one_m_tile_scheduler=policy.direct_one_m_tile_scheduler,
             use_m1_non_tma=policy.use_m1_non_tma,
             split_k_slices=1,
             split_k_atomic_bf16=False,
-            large_m_unroll=False,
+            large_m_unroll=(
+                policy.large_m_unroll and _SPARKINFER_FP6_LARGE_M_UNROLL
+            ),
         )
         split_k_slices = 1
     split_k_output = split_k_slices > 1
