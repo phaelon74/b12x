@@ -4790,6 +4790,7 @@ def _get_compiled_dense_gemm_mxfp6(
             load_path="tma",
             swap_ab=False,
             b_tile_major=False,
+            is_mxfp6=True,
         ),
     )
     compile_key = launch.compile_key()
@@ -5599,6 +5600,7 @@ def _dense_gemm_target_occupancy(
     load_path: str,
     swap_ab: bool,
     b_tile_major: bool,
+    is_mxfp6: bool = False,
 ) -> int:
     tile_m, tile_n = mma_tiler_mn
     n_tiles = ((n + tile_n - 1) // tile_n) * l
@@ -5608,7 +5610,10 @@ def _dense_gemm_target_occupancy(
         # 1-stage pipeline rather than failing to launch.
         return _SPARKINFER_DENSE_TARGET_OCCUPANCY
     if (
-        is_mxfp6_ab_dtype(ab_dtype)
+        # NOT is_mxfp6_ab_dtype(ab_dtype): the MX-FP6 path rewrites ab_dtype to
+        # Float8E4M3FN byte-containers before compiling, so the operand dtype
+        # cannot distinguish the two families here.
+        is_mxfp6
         and c_dtype == cutlass.BFloat16
         and tile_k == 128
         and mma_tiler_mn == (16, 64)
