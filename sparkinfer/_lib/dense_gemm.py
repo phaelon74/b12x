@@ -145,6 +145,26 @@ _SPARKINFER_DENSE_SPLITK_TURBO = (
 _SPARKINFER_FP6_LARGE_M_UNROLL = (
     os.getenv("SPARKINFER_FP6_LARGE_M_UNROLL", "1") == "1"
 )
+
+
+def _parse_tile_env(name: str, default: Tuple[int, int]) -> Tuple[int, int]:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        tm, tn = raw.lower().split("x")
+        return (int(tm), int(tn))
+    except ValueError as exc:
+        raise ValueError(f"{name} must look like '128x64', got {raw!r}") from exc
+
+
+# Wide-N (n > 1536) MX-FP6 prefill-regime (m > 16) MMA tile. (128,64) is the
+# measured M-independent winner of the FP6 tile sweep on Behemoth TP=2 shards
+# (see _select_default_mma_tiler_mn); all sweep tiles were bit-identical, so
+# this is a pure performance knob for A/B runs.
+_SPARKINFER_FP6_LARGE_M_TILE = _parse_tile_env(
+    "SPARKINFER_FP6_LARGE_M_TILE", (128, 64)
+)
 _SPARKINFER_DENSE_ATOM_24 = (
     os.getenv("SPARKINFER_DENSE_ATOM_24", "0") == "1"
 )
@@ -6224,6 +6244,19 @@ def _select_default_mma_tiler_mn(
         plan_m = expected_m if expected_m is not None else m
         if n > 1536 and plan_m <= 16:
             return (16, 128)
+        if n > 1536:
+            # Wide-N prefill regime (m > 16). The Jul 26 2026 FP6 tile sweep
+            # (benchmark_dense_gemm_fp6.py --tile-sweep, Behemoth TP=2 shards,
+            # RTX PRO 6000 GPU-41235b51, /tmp/fp6_tile_sweep.json) measured
+            # (128,64) fastest at every M >= 512 on every shard (534-582 TF at
+            # M=8192, 8-22% under the old (128,128) pin) AND faster than
+            # (128,128) at every smaller M too, so it is a safe M-INDEPENDENT
+            # choice for the whole regime — one kernel per (N,K) under frozen
+            # resolution is preserved. All candidate tiles were bit-identical
+            # (sweep `bit` gate). Override for A/B via
+            # SPARKINFER_FP6_LARGE_M_TILE=MxN (e.g. 128x128 restores the old
+            # pin).
+            return _SPARKINFER_FP6_LARGE_M_TILE
         return coarse_tile
     # The serving WO-B prefill GEMM is [M,4096] x [4096,4096]. DeepGEMM's
     # specialized O-projection dispatch switches it from BM64/BK128 to
