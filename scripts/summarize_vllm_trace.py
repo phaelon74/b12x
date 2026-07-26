@@ -15,6 +15,10 @@ Examples
     python scripts/summarize_vllm_trace.py /tmp/vllm_prof/fp6_prefill/*.pt.trace.json.gz
     python scripts/summarize_vllm_trace.py /tmp/vllm_prof --json-out /tmp/attr.json
 
+Traces only exist if the server was launched with ``PROFILE=1
+PROFILE_DIR=/tmp/vllm_prof_<tag>``; point this script at that ``PROFILE_DIR``
+(the capture tool's ``--out-dir`` holds request logs, not traces).
+
 Decode overhead attribution (D1) additionally needs the GPU idle timeline, not
 just what ran::
 
@@ -456,7 +460,15 @@ def summarize_trace(
     }
 
 
-def _find_traces(root: pathlib.Path) -> list[pathlib.Path]:
+# The API-server/frontend process writes its own trace alongside the per-rank
+# GPU traces (``<host>_<pid>.async_llm.*.pt.trace.json.gz``). It contains no
+# device work, so including it only costs parse time and dilutes the tables.
+_FRONTEND_TRACE_RE = re.compile(r"async_llm|frontend|api_server", re.I)
+
+
+def _find_traces(
+    root: pathlib.Path, include_frontend: bool = False
+) -> list[pathlib.Path]:
     if root.is_file():
         return [root]
     found: list[pathlib.Path] = []
@@ -470,6 +482,13 @@ def _find_traces(root: pathlib.Path) -> list[pathlib.Path]:
                 for p in root.rglob(pat)
                 if "trace" in p.name.lower() or "chrome" in p.name.lower()
             )
+    if not include_frontend:
+        kept = [p for p in found if not _FRONTEND_TRACE_RE.search(p.name)]
+        # Only drop the frontend traces if per-rank traces actually exist; a
+        # directory holding nothing else should still summarize rather than
+        # report "no trace files found".
+        if kept:
+            found = kept
     return sorted({p.resolve() for p in found})
 
 
@@ -586,6 +605,16 @@ def _self_test() -> None:
     assert stream["span_us"] == 10860.0
     assert stream["idle_us"] == 500.0
     assert stream["gap_count"] == 1
+    # Frontend traces are filtered out only when per-rank traces are present.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        (root / "rank0.123.pt.trace.json.gz").write_bytes(b"")
+        (root / "host_1.async_llm.456.pt.trace.json.gz").write_bytes(b"")
+        assert [p.name for p in _find_traces(root)] == ["rank0.123.pt.trace.json.gz"]
+        assert len(_find_traces(root, include_frontend=True)) == 2
+        (root / "rank0.123.pt.trace.json.gz").unlink()
+        assert len(_find_traces(root)) == 1
+
     boundary = summary["timeline"]["top_gap_boundaries"][0]
     assert boundary["after"] == "bf16_to_fp6_tma"
     assert boundary["before"] == "ncclAllReduce"
@@ -609,6 +638,14 @@ def main() -> None:
         help=(
             "Parallel worker processes (one per trace file). "
             "0 = min(number of traces, CPU count). 1 = serial."
+        ),
+    )
+    parser.add_argument(
+        "--include-frontend",
+        action="store_true",
+        help=(
+            "Also summarize the async_llm/api_server trace, which is skipped by "
+            "default because it holds no device work"
         ),
     )
     parser.add_argument(
@@ -658,7 +695,7 @@ def main() -> None:
 
     traces: list[pathlib.Path] = []
     for raw in args.paths:
-        traces.extend(_find_traces(pathlib.Path(raw)))
+        traces.extend(_find_traces(pathlib.Path(raw), args.include_frontend))
     if not traces:
         raise SystemExit("no trace files found")
 

@@ -2,8 +2,14 @@
 # Phase A serving-profile capture for FP6 vs FP8 on Behemoth-R1-123B.
 #
 # Prerequisites:
-#   - FP6 server already up (PROFILE=1) on BASE_FP6 (default :8000)
-#   - FP8 server already up (PROFILE=1) on BASE_FP8 (default :8001)
+#   - FP6 server already up on BASE_FP6 (default :8000), launched with
+#       PROFILE=1 PROFILE_DIR=/tmp/vllm_prof_fp6 ./behemoth123b-r1-v2-fp6.sh KEY
+#     (PROFILE=1 is what registers /start_profile and /stop_profile; without it
+#      the capture aborts with a 404)
+#   - FP8 server already up on BASE_FP8 (default :8001), same PROFILE=1 rule
+#     with its own PROFILE_DIR
+#   - Export PROFILE_DIR here too so the traces get collected; they are written
+#     by the server into PROFILE_DIR, never into OUT_ROOT
 #   - API key in VLLM_API_KEY or as $1
 #
 # Captures:

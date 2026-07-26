@@ -1,4 +1,22 @@
 #!/usr/bin/env python3
+"""Capture a vLLM native torch profile over a live decode window.
+
+Streams a completion, waits for the first token so the window lands in steady
+decode rather than prefill, then brackets ``--capture-seconds`` with
+``POST /start_profile`` and ``/stop_profile``.
+
+The server MUST have been launched with profiling enabled or ``/start_profile``
+returns 404::
+
+    PROFILE=1 PROFILE_DIR=/tmp/vllm_prof_<tag> \\
+    CUDA_VISIBLE_DEVICES=0,1 TP_SIZE=2 ./behemoth123b-r1-v2-fp6.sh "$API_KEY"
+
+Traces are written by the server into ``PROFILE_DIR`` (one per rank, plus a
+frontend ``async_llm`` trace); ``--out-dir`` here only collects the request
+body, stream log, and profile responses. Summarize with
+``scripts/summarize_vllm_trace.py "$PROFILE_DIR"``.
+"""
+
 from __future__ import annotations
 
 import argparse
