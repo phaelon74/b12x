@@ -97,14 +97,21 @@ else
   say "$PARAM"
 fi
 
-if [[ "$RESTRICTED" == "1" ]]; then
-  fail "GPU performance counters are restricted to root."
+APPLIED=0
+if [[ "$RESTRICTED" == "0" ]]; then
+  say "OK: counters are available to non-root users."
+else
+  # Covers both a positively-read restriction and the unknown case: the drop-in
+  # is idempotent and harmless on an already-permissive driver, so --apply must
+  # not be skipped merely because /proc did not expose the knob.
+  [[ "$RESTRICTED" == "1" ]] && fail "GPU performance counters are restricted to root."
   if [[ "$APPLY" == "1" ]]; then
     say "Applying $CONF ..."
     if printf 'options nvidia NVreg_RestrictProfilingToAdminUsers=0\n' \
         | sudo tee "$CONF" >/dev/null; then
       sudo update-initramfs -u || say "WARN: update-initramfs failed (non-Debian?)"
-      say "Wrote $CONF. REBOOT for it to take effect, then re-run this script."
+      say "Wrote $CONF."
+      APPLIED=1
     else
       fail "could not write $CONF"
     fi
@@ -122,15 +129,6 @@ if [[ "$RESTRICTED" == "1" ]]; then
   which is not the case while a vLLM server is running.
 EOS
   fi
-elif [[ "$RESTRICTED" == "0" ]]; then
-  say "OK: counters are available to non-root users."
-fi
-
-if [[ "$RESTRICTED" == "unknown" ]]; then
-  say ""
-  say "Remediation if step 4 reports ERR_NVGPUCTRPERM:"
-  say "  echo 'options nvidia NVreg_RestrictProfilingToAdminUsers=0' | sudo tee $CONF"
-  say "  sudo update-initramfs -u && sudo reboot"
 fi
 
 # ------------------------------------------------------------- 4. live test
@@ -171,6 +169,13 @@ if [[ "$ok" == "1" ]]; then
   say "ncu_version: ${VER_NUM:-unknown}"
   nvidia-smi --query-gpu=index,uuid,name,pstate --format=csv 2>/dev/null || true
   exit 0
+fi
+if [[ "$APPLIED" == "1" ]]; then
+  say "=== REBOOT REQUIRED ==="
+  say "$CONF is in place; the driver only reads it at module load, so the"
+  say "smoke test above is EXPECTED to still fail. Run:  sudo reboot"
+  say "Then re-run this script (no --apply) and expect all four steps to pass."
+  exit 2
 fi
 say "=== NOT READY - resolve the FAIL lines above and re-run. ==="
 exit 1
