@@ -4622,6 +4622,7 @@ class _DenseGemmMxfp6Launch(_DenseGemmLaunch):
             mxfp6_fmt_a=self._mxfp6_fmt_a,
             mxfp6_fmt_b=self._mxfp6_fmt_b,
             b_packed=self._b_packed,
+            target_occupancy=self._target_occupancy,
         )(
             a_tensor,
             a_tensor,
@@ -4773,6 +4774,12 @@ def _get_compiled_dense_gemm_mxfp6(
         b_packed=b_packed,
         a_preexpanded=a_preexpanded,
         b_preexpanded=b_preexpanded,
+        # The built-in rule in _dense_gemm_target_occupancy cannot fire for
+        # MX-FP6 (it requires k <= 1024), so this path has always run at one CTA
+        # per SM. Keep that default and let the env knob drive the A/B until the
+        # rule is retuned; _target_occupancy is part of compile_key, so the two
+        # settings never share a cached kernel.
+        target_occupancy=_SPARKINFER_DENSE_TARGET_OCCUPANCY or 1,
     )
     compile_key = launch.compile_key()
     raise_if_kernel_resolution_frozen(

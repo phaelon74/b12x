@@ -466,6 +466,9 @@ def _print_evidence_header(args: argparse.Namespace) -> dict:
                 "SPARKINFER_DENSE_TILE_SWIZZLE"
             ),
             "SPARKINFER_DENSE_AB_STAGES": os.getenv("SPARKINFER_DENSE_AB_STAGES"),
+            "SPARKINFER_DENSE_TARGET_OCCUPANCY": os.getenv(
+                "SPARKINFER_DENSE_TARGET_OCCUPANCY"
+            ),
             "CUDA_VISIBLE_DEVICES": os.getenv("CUDA_VISIBLE_DEVICES"),
         },
         "warmup": args.warmup,
