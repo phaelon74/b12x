@@ -81,10 +81,21 @@ fi
 # ------------------------------------------------------- 3. counter access
 say ""
 say "=== 3. Non-root counter access ==="
+# Not every driver build exposes this knob in /proc, so an absent line means
+# "unknown", not "restricted". Step 4 is the authority either way; only a
+# positively-read restriction is reported as a failure here.
 PARAM="$(grep -s RestrictProfilingToAdminUsers /proc/driver/nvidia/params || true)"
-say "${PARAM:-/proc/driver/nvidia/params: RestrictProfilingToAdminUsers not readable}"
-RESTRICTED=1
-[[ "$PARAM" == *": 0"* ]] && RESTRICTED=0
+if [[ -z "$PARAM" ]]; then
+  RESTRICTED=unknown
+  say "UNKNOWN: RestrictProfilingToAdminUsers is not exposed in /proc/driver/nvidia/params."
+  say "  Deferring to the live test in step 4."
+elif [[ "$PARAM" == *": 0"* ]]; then
+  RESTRICTED=0
+  say "$PARAM"
+else
+  RESTRICTED=1
+  say "$PARAM"
+fi
 
 if [[ "$RESTRICTED" == "1" ]]; then
   fail "GPU performance counters are restricted to root."
@@ -111,8 +122,15 @@ if [[ "$RESTRICTED" == "1" ]]; then
   which is not the case while a vLLM server is running.
 EOS
   fi
-else
+elif [[ "$RESTRICTED" == "0" ]]; then
   say "OK: counters are available to non-root users."
+fi
+
+if [[ "$RESTRICTED" == "unknown" ]]; then
+  say ""
+  say "Remediation if step 4 reports ERR_NVGPUCTRPERM:"
+  say "  echo 'options nvidia NVreg_RestrictProfilingToAdminUsers=0' | sudo tee $CONF"
+  say "  sudo update-initramfs -u && sudo reboot"
 fi
 
 # ------------------------------------------------------------- 4. live test
