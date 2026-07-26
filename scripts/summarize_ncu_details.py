@@ -54,9 +54,19 @@ def _read(path: pathlib.Path) -> tuple[dict[str, str], list[tuple[str, float]]]:
             # Throughput" in both SOL and Memory Workload) with different units;
             # keep the first, which is the SOL percentage form.
             metrics.setdefault(name, value)
+            # ncu picks the unit per magnitude, so a slow kernel reports
+            # Gbyte/s where a fast one reports Tbyte/s. Normalize, or the
+            # column silently blanks out on exactly the regressions we care
+            # about most.
             unit = (row.get("Metric Unit") or "").strip()
-            if unit == "Tbyte/s" and name == "Memory Throughput":
-                metrics["Memory Throughput [TB/s]"] = value
+            if name == "Memory Throughput" and unit in ("Tbyte/s", "Gbyte/s"):
+                try:
+                    tb = float(value.replace(",", ""))
+                except ValueError:
+                    continue
+                if unit == "Gbyte/s":
+                    tb /= 1000.0
+                metrics["Memory Throughput [TB/s]"] = f"{tb:.2f}"
             if name.startswith("Stall "):
                 try:
                     stalls.append((name[6:], float(value.replace(",", ""))))

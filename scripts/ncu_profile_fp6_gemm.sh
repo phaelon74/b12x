@@ -20,6 +20,12 @@
 #   MODE=prefill ./scripts/ncu_profile_fp6_gemm.sh    # M=8192, expanded-B arm
 #   SHAPES=gate_up ./scripts/ncu_profile_fp6_gemm.sh  # single shard
 #   M=4 ./scripts/ncu_profile_fp6_gemm.sh             # override the M value
+#   STALLS=1 ./scripts/ncu_profile_fp6_gemm.sh        # add warp stall counters
+#
+# Occupancy/tile A/B (both are numerics-neutral, and both must be separate
+# PROCESSES because the compiled-kernel cache is per-process):
+#   SPARKINFER_DENSE_TARGET_OCCUPANCY=2 OUT_DIR=/tmp/occ2 ./scripts/ncu_profile_fp6_gemm.sh
+#   SPARKINFER_FP6_DECODE_TILE=16x64 OUT_DIR=/tmp/t1664 ./scripts/ncu_profile_fp6_gemm.sh
 
 set -uo pipefail
 
@@ -68,6 +74,24 @@ SECTIONS=(
   --section WarpStateStats
   --section SchedulerStats
 )
+
+# STALLS=1 adds the per-reason warp stall counters. The WarpStateStats section
+# alone does not put them in the details CSV, and they are what distinguishes
+# "waiting on DRAM" (long_scoreboard) from "waiting on the pipeline"
+# (barrier/membar/mio_throttle) once occupancy is no longer the limiter. Costs
+# extra replay passes, so it is opt-in.
+if [[ "${STALLS:-0}" == "1" ]]; then
+  _stall_reasons=(
+    long_scoreboard short_scoreboard barrier membar mio_throttle
+    lg_throttle tex_throttle imc_miss no_instruction wait drain
+    dispatch_stall not_selected selected sleeping misc
+  )
+  _metrics=""
+  for r in "${_stall_reasons[@]}"; do
+    _metrics+="smsp__average_warps_issue_stalled_${r}_per_issue_active.ratio,"
+  done
+  SECTIONS+=(--metrics "${_metrics%,}")
+fi
 
 for shape in $SHAPES; do
   n="${SHAPE_N[$shape]}"
