@@ -5596,6 +5596,38 @@ def _dense_gemm_target_occupancy(
         # capacity by occupancy, so an unsatisfiable value degrades to a
         # 1-stage pipeline rather than failing to launch.
         return _SPARKINFER_DENSE_TARGET_OCCUPANCY
+    if (
+        is_mxfp6_ab_dtype(ab_dtype)
+        and c_dtype == cutlass.BFloat16
+        and tile_k == 128
+        and mma_tiler_mn == (16, 64)
+        and cluster_shape_mn == (1, 1)
+        and load_path == "tma"
+        and not swap_ab
+        and not b_tile_major
+        and n_tiles > sm_count
+    ):
+        # ncu, Behemoth-123B TP=2 decode, RTX PRO 6000 GPU-41235b51 (Jul 26
+        # 2026, fp6_t1664_occ{1,2}): a second resident CTA is the only lever
+        # that moved DRAM utilization. Deepening the pipeline instead - 5 -> 8
+        # ab_stages at occupancy 1, 60.4 -> 93.2 KB smem, same 8 loads in
+        # flight - changed nothing (gate_up 235.8 -> 237.8 us, 69.5 -> 68.9%
+        # DRAM), so the limiter is intra-CTA dependency serialization, not TMA
+        # queue depth: at 96 threads and 1 CTA/SM only 3 warps cover 4
+        # schedulers. Two CTAs give two independent consumer chains
+        # (gate_up -5.5%, down -7.1%, o -0.4%).
+        #
+        # n_tiles > sm_count is the whole condition because it is also what
+        # makes the tail-wave cliff disappear: at 192 tiles the persistent grid
+        # clamps to 188 at occupancy 1 and 4 CTAs run a second wave alone
+        # (down 121.9 -> 186.1 us). Below the SM count a second CTA can never
+        # be co-resident, so it only costs stage depth (qkv, 112 tiles: 67.0 ->
+        # 68.8 us) - hence the strict comparison rather than >=.
+        #
+        # Numerics-neutral: occupancy changes how many output tiles are
+        # resident and, via _compute_stages, how deep each pipeline is, never
+        # the per-output-element accumulation order.
+        return 2
     return (
         2
         if ab_dtype == cutlass.Float8E4M3FN
@@ -6313,17 +6345,16 @@ def _select_default_mma_tiler_mn(
             # -23%, gate_up N=28672 -7%) EXCEPT when ceil(N/64) lands just
             # past a whole number of waves — o/down at N=12288 give 192 CTAs
             # on 188 SMs, a 4-CTA tail wave running alone, 1.4-1.6x slower.
-            # Those cliff shapes take (32,128), which is tied-or-better than
-            # the old (16,128) at every M<=16 on both shards. All swept
-            # tiles were bit-identical (`bit` gate). The expanded-B arm was
-            # slower-or-equal on every shard at M=1, so packed remains the
-            # decode stream. Tail threshold 16: measured cliff tail is 4,
-            # measured healthy tail is 72. Heuristic depends only on
-            # (n, sm_count) — M-independent across the warmed decode shapes.
-            ctas64 = (n + 63) // 64
-            tail = ctas64 % sm_count
-            if ctas64 > sm_count and 0 < tail <= 16:
-                return (32, 128)
+            # All swept tiles were bit-identical (`bit` gate). The expanded-B
+            # arm was slower-or-equal on every shard at M=1, so packed remains
+            # the decode stream.
+            #
+            # The (32,128) cliff exemption was retired Jul 26 2026: the tail
+            # wave is an occupancy-1 artifact. _dense_gemm_target_occupancy now
+            # returns 2 for exactly these shapes, which lets the persistent
+            # grid reach 192 CTAs so there is no lone tail wave, and the
+            # width-64 tile then beats the exemption outright (down 121.9 ->
+            # 113.2 us, o 52.7 -> 52.5 us; same ncu run as the occupancy rule).
             return (16, 64)
         if n > 1536:
             # Wide-N prefill regime (m > 16). The Jul 26 2026 FP6 tile sweep
