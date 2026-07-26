@@ -36,6 +36,12 @@ bit-equality check; run once with the default unroll and once with
 
     python benchmarks/benchmark_dense_gemm_fp6.py --preset behemoth-tp2 \\
         --tile-sweep --warmup 10 --iters 50 --json-out fp6_tile_sweep.json
+
+Decode-tile sweep (packed-B stream, M<=16 regime)::
+
+    python benchmarks/benchmark_dense_gemm_fp6.py --preset behemoth-tp2 \\
+        --tile-sweep --tile-arm packed --tiles 16x128,16x64,32x64,32x128 \\
+        --json-out fp6_decode_tile_sweep.json
 """
 
 from __future__ import annotations
@@ -479,6 +485,7 @@ def _resolve_shapes(args: argparse.Namespace) -> list[tuple[str, int, int, list[
 
 
 TILE_SWEEP_DEFAULT_M = (32, 128, 512, 2048, 8192)
+TILE_SWEEP_DECODE_DEFAULT_M = (1, 2, 4, 8, 16)
 
 
 def _parse_tiles(spec: str) -> list[tuple[int, int]]:
@@ -495,27 +502,34 @@ def _parse_tiles(spec: str) -> list[tuple[int, int]]:
 def _run_tile_sweep(args: argparse.Namespace, l2_flush, header: dict) -> None:
     """Item-4 evidence: FP6 expanded-B GEMM time per candidate MMA tile.
 
-    The prefill regime (M > 16) runs the expanded-B kernel on the policy
-    (128,128) tile today; the MXFP8 probe sweep found that tile the worst
-    wide-N choice at every M. This sweep gathers the FP6-side data before the
-    ladder in ``_select_default_mma_tiler_mn`` is changed. Any winning tile
-    must be M-INDEPENDENT across the regime (one kernel per (N,K) under
-    frozen resolution) and BIT-IDENTICAL to the default tile — both are
-    checked here (bit-equality via ``torch.equal`` vs the first tile).
-    Unsupported tiles report SKIP with the raising error and the sweep
-    continues.
+    Two arms (``--tile-arm``): ``expanded`` gathers prefill-regime (M > 16)
+    data for the wide-N ladder in ``_select_default_mma_tiler_mn`` (which
+    moved from the (128,128) pin to the measured (128,64) winner);
+    ``packed`` times the decode stream (M <= 16, in-smem expansion) for the
+    (16,64)-style decode-tile decision. Any winning tile must be
+    M-INDEPENDENT across its regime (one kernel per (N,K) under frozen
+    resolution) and BIT-IDENTICAL to the default tile — both are checked
+    here (bit-equality via ``torch.equal`` vs the first tile). Unsupported
+    tiles report SKIP with the raising error and the sweep continues.
     """
     tiles = _parse_tiles(args.tiles)
+    default_ms = (
+        TILE_SWEEP_DECODE_DEFAULT_M
+        if args.tile_arm == "packed"
+        else TILE_SWEEP_DEFAULT_M
+    )
+    ms = list(args.m) if args.m else list(default_ms)
     if args.preset == "behemoth-tp2":
-        ms = list(args.m) if args.m else list(TILE_SWEEP_DEFAULT_M)
         shapes = [(name, n, k, ms) for name, (n, k) in BEHEMOTH_TP2_SHAPES.items()]
     else:
         if args.n is None or args.k is None:
             raise SystemExit("provide --preset behemoth-tp2 or both --n and --k")
-        ms = list(args.m) if args.m else list(TILE_SWEEP_DEFAULT_M)
         shapes = [("custom", args.n, args.k, ms)]
 
-    print("\nMX-FP6 W6A8 expanded-B tile sweep (CUDA graph replay)")
+    b_packed = args.tile_arm == "packed"
+    print(
+        f"\nMX-FP6 W6A8 {args.tile_arm}-B tile sweep (CUDA graph replay)"
+    )
     print(
         f"{'shape':12s} {'M':>6s} {'tile':>9s} {'med_us':>10s} "
         f"{'tflops':>8s} {'vs_t0':>8s} {'bit':>5s} {'cos':>8s}"
@@ -535,7 +549,7 @@ def _run_tile_sweep(args: argparse.Namespace, l2_flush, header: dict) -> None:
                     n=n,
                     k=k,
                     operands=operands,
-                    b_packed=False,
+                    b_packed=b_packed,
                     warmup=args.warmup,
                     iters=args.iters,
                     l2_flush=l2_flush,
@@ -597,7 +611,12 @@ def _run_tile_sweep(args: argparse.Namespace, l2_flush, header: dict) -> None:
                     }
                 )
 
-    payload = {"header": header, "mode": "tile_sweep", "rows": rows}
+    payload = {
+        "header": header,
+        "mode": "tile_sweep",
+        "tile_arm": args.tile_arm,
+        "rows": rows,
+    }
     if args.json_out:
         out_path = pathlib.Path(args.json_out)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -654,6 +673,16 @@ def main() -> None:
         type=str,
         default="128x128,64x128,32x128,16x128,128x64,64x64",
         help="Comma-separated MxN tile candidates for --tile-sweep.",
+    )
+    parser.add_argument(
+        "--tile-arm",
+        choices=("expanded", "packed"),
+        default="expanded",
+        help=(
+            "Weight arm for --tile-sweep: 'expanded' (prefill path) or "
+            "'packed' (the decode M<=16 stream; pair with --m 1 2 4 8 16 "
+            "and decode-tile candidates like 16x128,16x64,32x64,32x128)."
+        ),
     )
     args = parser.parse_args()
 
