@@ -195,6 +195,21 @@ _SPARKINFER_DENSE_TILE_SWIZZLE = int(
 # per-stage B bytes vs (128,128), so its smem budget likely allows a deeper
 # pipeline than the default cap of 4.
 _SPARKINFER_DENSE_AB_STAGES = int(os.getenv("SPARKINFER_DENSE_AB_STAGES", "0"))
+# SPARKINFER_DENSE_TARGET_OCCUPANCY=N (default 0 = keep the built-in rule)
+# forces the CTAs-per-SM target. Also numerics-neutral: it changes how many
+# output tiles are resident at once and, through the smem split in
+# _compute_stages, how deep each pipeline is - never the per-output-element
+# accumulation order.
+#
+# Why it exists: ncu on Behemoth-123B TP=2 decode (Jul 26) measured every one of
+# the four shards pinned at "Block Limit Shared Mem = 1", i.e. a single CTA per
+# SM, for 6-10% achieved occupancy and only 61-70% of DRAM peak. The
+# occupancy-2 path in _dense_gemm_target_occupancy is gated behind `k <= 1024`,
+# which no 123B-scale shard satisfies (K is 6144-14336), so it can never fire
+# there. This knob makes the A/B runnable before that rule is retuned.
+_SPARKINFER_DENSE_TARGET_OCCUPANCY = int(
+    os.getenv("SPARKINFER_DENSE_TARGET_OCCUPANCY", "0")
+)
 _SPARKINFER_DENSE_ATOM_24 = (
     os.getenv("SPARKINFER_DENSE_ATOM_24", "0") == "1"
 )
@@ -5569,6 +5584,11 @@ def _dense_gemm_target_occupancy(
 ) -> int:
     tile_m, tile_n = mma_tiler_mn
     n_tiles = ((n + tile_n - 1) // tile_n) * l
+    if _SPARKINFER_DENSE_TARGET_OCCUPANCY:
+        # Clamped by the smem budget downstream: _compute_stages divides the
+        # capacity by occupancy, so an unsatisfiable value degrades to a
+        # 1-stage pipeline rather than failing to launch.
+        return _SPARKINFER_DENSE_TARGET_OCCUPANCY
     return (
         2
         if ab_dtype == cutlass.Float8E4M3FN

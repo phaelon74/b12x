@@ -134,8 +134,11 @@ fi
 # ------------------------------------------------------------- 4. live test
 say ""
 say "=== 4. Live profile smoke test ==="
+VERIFIED=0
 if ! "$PYTHON" -c 'import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)' 2>/dev/null; then
   say "SKIP: no CUDA-capable torch in $PYTHON (activate the venv to run this step)."
+  say "  This step is the ONLY authority on counter access when /proc does not"
+  say "  expose the knob, so a skip cannot be reported as ready."
 else
   TMP_OUT="$(mktemp)"
   set +e
@@ -155,6 +158,7 @@ a = torch.randn(512, 512, device="cuda", dtype=torch.bfloat16)
     tail -n 25 "$TMP_OUT" >&2
   elif grep -q 'sm__cycles_elapsed' "$TMP_OUT"; then
     say "OK: collected sm__cycles_elapsed from a live bf16 matmul."
+    VERIFIED=1
   else
     fail "ncu ran but produced no metric rows. Output:"
     tail -n 25 "$TMP_OUT" >&2
@@ -163,6 +167,15 @@ a = torch.randn(512, 512, device="cuda", dtype=torch.bfloat16)
 fi
 
 say ""
+# READY requires a positive live collection, not merely an absence of failures:
+# when the venv is not active step 4 skips, and on this box /proc does not
+# expose the restriction flag either, so nothing would have actually been
+# proven.
+if [[ "$ok" == "1" && "$VERIFIED" == "0" ]]; then
+  say "=== UNVERIFIED - ncu is installed but counter access was never exercised. ==="
+  say "Activate the venv (or set PYTHON=/path/to/venv/bin/python) and re-run."
+  exit 3
+fi
 if [[ "$ok" == "1" ]]; then
   say "=== READY. Record this in the evidence header: ==="
   say "ncu_path: $NCU"
