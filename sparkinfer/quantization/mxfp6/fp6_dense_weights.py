@@ -73,17 +73,36 @@ _PER_ROW_IN_KERNEL = os.getenv(
     "SPARKINFER_DENSE_PER_ROW_IN_KERNEL", "1"
 ).lower() not in ("0", "false")
 _QUANT_SCRATCH: dict[tuple, tuple] = {}
+# Phase C decode-churn fix: graph CAPTURE must also reuse buckets. The old
+# behavior (allocate fresh inside capture) baked the two uint8 zero-fills of
+# every linear's quant buffers into the decode graphs — 704 replayed
+# FillFunctor kernels per step at Behemoth-123B scale (88 layers x 4 linears
+# x 2 buffers; the Phase A trace's "712 fills/step"). Reusing an eager bucket
+# inside capture is safe: entries are retained forever (stable addresses for
+# the baked pointers), their padding rows were zeroed once at allocation and
+# are never written afterwards, and a replayed graph never runs concurrently
+# with an eager step on the same rank. Buckets are ASSIGNED per capture
+# stream (a graph may capture the MoE shared-expert side stream overlapped
+# with the main stream — two captured streams must never share a buffer);
+# a capture stream that finds no unclaimed eager bucket falls back to the
+# old allocate-in-graph-pool behavior.
+_CAPTURE_ASSIGNED: dict[tuple, tuple] = {}
+_CAPTURE_CLAIMED: dict[tuple, list[int]] = {}
 
 
 def _small_m_quant_scratch(m_pad: int, k: int, device: torch.device) -> tuple:
     """Persistent ``(BF16ToFP6TMAOutputs, alpha)`` for a decode quant bucket.
 
-    Buckets are per-stream, so they are created by the first eager pass on
+    Buckets are per-stream for eager use, created by the first eager pass on
     each stream (the plugin's load-time warm-run, then vLLM's pre-capture
-    eager warm-runs on the serving stream) — graph capture normally finds
-    them in place. If a bucket is first seen DURING capture, allocate fresh
-    without retaining it: the memory belongs to the graph's pool and must
-    not outlive it in a global cache.
+    eager warm-runs on the serving stream). Graph capture runs on its own
+    capture stream, so it can never hit those keys directly — instead it
+    CLAIMS an existing eager bucket for the capturing stream (see
+    ``_CAPTURE_ASSIGNED``), keeping the zero-fills out of the recorded graph.
+    Only when no unclaimed eager bucket exists (capture before any eager pass
+    on this shape, or every bucket claimed by another captured stream) does
+    it allocate fresh in the graph's pool — the pre-fix behavior, with the
+    fills baked in.
     """
     from sparkinfer.quantization.mxfp6 import allocate_bf16_to_fp6_tma_outputs
 
@@ -97,10 +116,21 @@ def _small_m_quant_scratch(m_pad: int, k: int, device: torch.device) -> tuple:
         else 0
     )
     key = (device.type, device.index or 0, stream, m_pad, k)
+    bucket_key = (device.type, device.index or 0, m_pad, k)
     if _PERSISTENT_SCRATCH and not capturing:
         entry = _QUANT_SCRATCH.get(key)
         if entry is not None:
             return entry
+    if _PERSISTENT_SCRATCH and capturing:
+        assigned = _CAPTURE_ASSIGNED.get(key)
+        if assigned is not None:
+            return assigned
+        claimed = _CAPTURE_CLAIMED.setdefault(bucket_key, [])
+        for (dt, di, _s, mp, kk), entry in _QUANT_SCRATCH.items():
+            if (dt, di, mp, kk) == bucket_key and id(entry) not in claimed:
+                _CAPTURE_ASSIGNED[key] = entry
+                claimed.append(id(entry))
+                return entry
     out = allocate_bf16_to_fp6_tma_outputs(m_pad, k, device=device, emit="bytes")
     alpha = torch.zeros(1, dtype=torch.float32, device=device)
     # Per-row output-correction buffer for the in-kernel per-row path: sized
@@ -109,6 +139,12 @@ def _small_m_quant_scratch(m_pad: int, k: int, device: torch.device) -> tuple:
     entry = (out, alpha, inv_gs)
     if _PERSISTENT_SCRATCH and not capturing:
         _QUANT_SCRATCH[key] = entry
+    elif _PERSISTENT_SCRATCH and capturing:
+        # Fresh graph-pool allocation: remember the assignment so later
+        # captures on the same stream reuse it (the fills are baked into
+        # whichever graph allocated it, but only that one).
+        _CAPTURE_ASSIGNED[key] = entry
+        _CAPTURE_CLAIMED.setdefault(bucket_key, []).append(id(entry))
     return entry
 
 # Minimum out_features for which the GEMM streams the 3:4-packed weight
