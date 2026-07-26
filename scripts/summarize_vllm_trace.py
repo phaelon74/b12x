@@ -59,6 +59,23 @@ class Bucket:
 # Order matters: first match wins. Keep specific kernels ahead of generic aten.
 _BUCKET_SPECS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
+        # FIRST on purpose. Inductor names its fused norm kernels after the op
+        # they were fused with, e.g.
+        # `triton_red_fused_fp6_dense_linear_fused_add_rms_norm_0`, which the
+        # `fp6_dense` GEMM pattern below would otherwise claim (0.6 ms/step of
+        # norm time booked as GEMM at Behemoth-123B decode). No real GEMM kernel
+        # name contains these tokens.
+        "norm_act_misc",
+        (
+            r"rms_norm",
+            r"rmsnorm",
+            r"silu",
+            r"SwiGLU",
+            r"rotary",
+            r"rope",
+        ),
+    ),
+    (
         "fp6_gemm",
         (
             r"dense_gemm",
@@ -173,17 +190,6 @@ _BUCKET_SPECS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     (
-        "norm_act_misc",
-        (
-            r"rms_norm",
-            r"rmsnorm",
-            r"silu",
-            r"SwiGLU",
-            r"rotary",
-            r"rope",
-        ),
-    ),
-    (
         "sampler_logit",
         (
             r"sample",
@@ -259,6 +265,17 @@ def _classify(name: str, buckets: list[Bucket]) -> Bucket:
     return other
 
 
+# Checked BEFORE _IS_CUDA_CAT_RE. Torch projects host ranges onto the GPU
+# timeline as `gpu_user_annotation` and tags runtime/driver calls `cuda_runtime`
+# / `cuda_driver`; all three match the loose "cuda|gpu|kernel" rule below and
+# would otherwise be summed as device time. A single per-step
+# `gpu_user_annotation` spanning the whole step, plus its `cudaEventSynchronize`,
+# is enough to push "other" to ~75% of a decode trace and make `cuda_total_us`
+# exceed wall-clock several times over. These are host-side rows: count them as
+# CPU.
+_IS_HOST_CAT_RE = re.compile(
+    r"cuda_runtime|cuda_driver|user_annotation|cpu_op|python|ac2g|fwdbwd", re.I
+)
 _IS_CUDA_CAT_RE = re.compile(r"cuda|gpu|kernel", re.I)
 _IS_CUDA_NAME_RE = re.compile(r"cuda|gemm|nccl|cutlass|triton", re.I)
 
@@ -372,7 +389,7 @@ def summarize_trace(
     # (name, cat-class) once instead of running every bucket regex per event.
     bucket_memo: dict[str, Bucket] = {}
     cuda_name_memo: dict[str, bool] = {}
-    cuda_cat_memo: dict[str, bool] = {}
+    cuda_cat_memo: dict[str, str] = {}
 
     for ev in _iter_events(trace):
         # X = complete events; also accept C++ CUDA kernels tagged similarly.
@@ -385,18 +402,24 @@ def summarize_trace(
         dur = _duration_us(ev)
         if dur <= 0:
             continue
-        cat_hit = cuda_cat_memo.get(cat)
-        if cat_hit is None:
-            cat_hit = bool(_IS_CUDA_CAT_RE.search(cat))
-            cuda_cat_memo[cat] = cat_hit
-        if cat_hit:
-            is_cuda = True
-        else:
+        kind = cuda_cat_memo.get(cat)
+        if kind is None:
+            if _IS_HOST_CAT_RE.search(cat):
+                kind = "host"
+            elif _IS_CUDA_CAT_RE.search(cat):
+                kind = "gpu"
+            else:
+                kind = "unknown"
+            cuda_cat_memo[cat] = kind
+        if kind == "unknown":
+            # Untagged rows: fall back to the kernel-name heuristic.
             name_hit = cuda_name_memo.get(name)
             if name_hit is None:
                 name_hit = bool(_IS_CUDA_NAME_RE.search(name))
                 cuda_name_memo[name] = name_hit
             is_cuda = name_hit
+        else:
+            is_cuda = kind == "gpu"
         bucket = bucket_memo.get(name)
         if bucket is None:
             bucket = _classify(name, buckets)
@@ -581,6 +604,13 @@ def _self_test() -> None:
             {"ph": "X", "name": "Sampler_argmax", "cat": "kernel", "dur": 60.0,
              "ts": 11800.0, "pid": 0, "tid": 7},
             {"ph": "X", "name": "cudaGraphLaunch", "cat": "cuda_runtime", "dur": 15.0},
+            {"ph": "X", "name": "triton_red_fused_fp6_dense_linear_fused_add_rms_norm_0",
+             "cat": "kernel", "dur": 300.0, "ts": 11860.0, "pid": 0, "tid": 7},
+            # Host range projected onto the GPU timeline: must NOT be counted as
+            # device time even though its category matches /gpu/.
+            {"ph": "X", "name": "execute_context_0(0)_generation_1(1)",
+             "cat": "gpu_user_annotation", "dur": 999999.0, "ts": 1000.0,
+             "pid": 0, "tid": 7},
         ]
     }
     with tempfile.TemporaryDirectory() as tmp:
@@ -599,10 +629,18 @@ def _self_test() -> None:
     assert by_name["fill_memset"]["cuda_us"] == 40.0
     assert by_name["graph_launch"]["count"] == 1
     assert summary["step_anchor_count"] == 2
+    # Fused norm stays out of the GEMM bucket.
+    assert by_name["norm_act_misc"]["cuda_us"] == 300.0
+    assert by_name["fp6_gemm"]["cuda_us"] == 5000.0
+    # The host annotation is booked as CPU and never inflates device totals.
+    assert by_name["other"]["cuda_us"] == 0.0
+    assert by_name["other"]["cpu_us"] == 999999.0
+    assert summary["cuda_total_us"] == 10660.0
 
     stream = summary["timeline"]["streams"][0]
-    # 1000 -> 11860 span, with a single 500us hole after bf16_to_fp6_tma.
-    assert stream["span_us"] == 10860.0
+    # 1000 -> 12160 span, with a single 500us hole after bf16_to_fp6_tma. The
+    # 999999us gpu_user_annotation must not appear here either.
+    assert stream["span_us"] == 11160.0
     assert stream["idle_us"] == 500.0
     assert stream["gap_count"] == 1
     # Frontend traces are filtered out only when per-rank traces are present.
