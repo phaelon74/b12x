@@ -147,7 +147,9 @@ _SPARKINFER_FP6_LARGE_M_UNROLL = (
 )
 
 
-def _parse_tile_env(name: str, default: Tuple[int, int]) -> Tuple[int, int]:
+def _parse_tile_env(
+    name: str, default: Optional[Tuple[int, int]]
+) -> Optional[Tuple[int, int]]:
     raw = os.getenv(name)
     if not raw:
         return default
@@ -164,6 +166,12 @@ def _parse_tile_env(name: str, default: Tuple[int, int]) -> Tuple[int, int]:
 # this is a pure performance knob for A/B runs.
 _SPARKINFER_FP6_LARGE_M_TILE = _parse_tile_env(
     "SPARKINFER_FP6_LARGE_M_TILE", (128, 64)
+)
+# Optional forced MX-FP6 decode-regime (m <= 16, wide-N) tile for A/B runs.
+# Unset (default) = the measured wave-cliff heuristic in
+# _select_default_mma_tiler_mn; e.g. 16x128 restores the old fixed tile.
+_SPARKINFER_FP6_DECODE_TILE = _parse_tile_env(
+    "SPARKINFER_FP6_DECODE_TILE", None
 )
 _SPARKINFER_DENSE_ATOM_24 = (
     os.getenv("SPARKINFER_DENSE_ATOM_24", "0") == "1"
@@ -6243,7 +6251,27 @@ def _select_default_mma_tiler_mn(
         # expected_m regime hint owns the decision when present.
         plan_m = expected_m if expected_m is not None else m
         if n > 1536 and plan_m <= 16:
-            return (16, 128)
+            if _SPARKINFER_FP6_DECODE_TILE is not None:
+                return _SPARKINFER_FP6_DECODE_TILE
+            # Decode-tile sweep (Jul 25 2026, packed-B stream — the
+            # production decode path — Behemoth TP=2 shards, RTX PRO 6000,
+            # /tmp/fp6_decode_tile_{packed,expanded}.json): width-64 tiles
+            # double the N-parallelism and win at M=1 (16x64: qkv N=7168
+            # -23%, gate_up N=28672 -7%) EXCEPT when ceil(N/64) lands just
+            # past a whole number of waves — o/down at N=12288 give 192 CTAs
+            # on 188 SMs, a 4-CTA tail wave running alone, 1.4-1.6x slower.
+            # Those cliff shapes take (32,128), which is tied-or-better than
+            # the old (16,128) at every M<=16 on both shards. All swept
+            # tiles were bit-identical (`bit` gate). The expanded-B arm was
+            # slower-or-equal on every shard at M=1, so packed remains the
+            # decode stream. Tail threshold 16: measured cliff tail is 4,
+            # measured healthy tail is 72. Heuristic depends only on
+            # (n, sm_count) — M-independent across the warmed decode shapes.
+            ctas64 = (n + 63) // 64
+            tail = ctas64 % sm_count
+            if ctas64 > sm_count and 0 < tail <= 16:
+                return (32, 128)
+            return (16, 64)
         if n > 1536:
             # Wide-N prefill regime (m > 16). The Jul 26 2026 FP6 tile sweep
             # (benchmark_dense_gemm_fp6.py --tile-sweep, Behemoth TP=2 shards,
