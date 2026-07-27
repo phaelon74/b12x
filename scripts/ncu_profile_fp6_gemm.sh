@@ -21,6 +21,13 @@
 #   SHAPES=gate_up ./scripts/ncu_profile_fp6_gemm.sh  # single shard
 #   M=4 ./scripts/ncu_profile_fp6_gemm.sh             # override the M value
 #   STALLS=1 ./scripts/ncu_profile_fp6_gemm.sh        # add warp stall counters
+#   ARM=fp8 MODE=prefill ./scripts/ncu_profile_fp6_gemm.sh   # the comparison arm
+#
+# ARM=fp8 profiles vLLM's blockwise CUTLASS FP8 kernel on the SAME (M,N,K) so the
+# two are directly comparable: identical shape, identical card, identical
+# capture settings, one metric set. That comparison is the point of the prefill
+# capture - FP6 trails FP8 by 16-30% there and we have no direct evidence why,
+# whereas at decode FP6 already leads.
 #
 # Occupancy/tile A/B (both are numerics-neutral, and both must be separate
 # PROCESSES because the compiled-kernel cache is per-process):
@@ -50,6 +57,18 @@ if [[ "$MODE" == "decode" ]]; then
 else
   M="${M:-8192}"
   ARM_FLAGS="--no-packed --no-fp8"
+fi
+
+ARM="${ARM:-fp6}"
+# sparkinfer compiles one CuTe DSL class, so its name is stable. vLLM's FP8 path
+# resolves to a CUTLASS 3.x instantiation whose symbol varies with the selected
+# tile; match the SM120 blockwise family broadly rather than pinning one mangled
+# name, and let --launch-count 1 keep the report to a single kernel.
+if [[ "$ARM" == "fp8" ]]; then
+  ARM_FLAGS="--no-packed --no-expanded"
+  KERNEL_RE="${KERNEL_RE:-regex:sm120|cutlass|gemm_universal|scaled_mm}"
+else
+  KERNEL_RE="${KERNEL_RE:-regex:DenseGemmKernel}"
 fi
 
 if [[ ! -x "$NCU" ]]; then
@@ -97,7 +116,7 @@ for shape in $SHAPES; do
   n="${SHAPE_N[$shape]}"
   k="${SHAPE_K[$shape]}"
   [[ -z "$n" ]] && { echo "unknown shape '$shape'" >&2; continue; }
-  rep="$OUT_DIR/${MODE}_${shape}_m${M}"
+  rep="$OUT_DIR/${MODE}_${ARM}_${shape}_m${M}"
   echo ""
   echo "=== $shape  M=$M N=$n K=$k -> $rep.ncu-rep ==="
 
@@ -108,7 +127,7 @@ for shape in $SHAPES; do
   "$NCU" \
     --target-processes all \
     --graph-profiling node \
-    --kernel-name regex:'DenseGemmKernel' \
+    --kernel-name "$KERNEL_RE" \
     --launch-skip 12 --launch-count 1 \
     "${SECTIONS[@]}" \
     --export "$rep" --force-overwrite \
@@ -128,8 +147,20 @@ for shape in $SHAPES; do
     continue
   fi
 
+  # The FP8 arm self-skips (returns a `skipped=` result) when vLLM's
+  # cutlass_scaled_mm is missing or rejects the shape, and ncu reports that as a
+  # clean run with zero profiled kernels. Say so instead of writing an empty CSV
+  # that reads as a measurement.
+  if grep -qi 'skipped' "$rep.log" && ! grep -q 'DenseGemmKernel' "$rep.log"; then
+    echo "arm '$ARM' skipped this shape; see $rep.log" >&2
+  fi
+
   # Flat CSV next to the report so the key numbers are greppable without the UI.
   "$NCU" -i "$rep.ncu-rep" --page details --csv >"$rep.details.csv" 2>/dev/null
+  if [[ ! -s "$rep.details.csv" ]]; then
+    echo "no kernel matched '$KERNEL_RE' - nothing profiled for $shape" >&2
+    continue
+  fi
   echo "--- headline metrics ---"
   grep -E 'Duration|DRAM Throughput|Memory Throughput|Achieved Occupancy|Compute \(SM\) Throughput|Waves Per SM|Block Limit|L2 Hit Rate' \
     "$rep.details.csv" 2>/dev/null | head -n 20
@@ -137,10 +168,12 @@ done
 
 echo ""
 echo "Reports in $OUT_DIR"
-echo "Open one with:  ncu-ui $OUT_DIR/${MODE}_gate_up_m${M}.ncu-rep"
+echo "Open one with:  ncu-ui $OUT_DIR/${MODE}_${ARM}_gate_up_m${M}.ncu-rep"
 {
   echo "commit: $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
   echo "mode: $MODE"
+  echo "arm: $ARM"
+  echo "kernel_filter: $KERNEL_RE"
   echo "m: $M"
   echo "ncu: $("$NCU" --version 2>/dev/null | grep -i version | head -n1)"
   date -u +"captured_utc: %Y-%m-%dT%H:%M:%SZ"
