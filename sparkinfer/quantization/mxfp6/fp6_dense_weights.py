@@ -72,6 +72,16 @@ _PERSISTENT_SCRATCH = os.getenv(
 _PER_ROW_IN_KERNEL = os.getenv(
     "SPARKINFER_DENSE_PER_ROW_IN_KERNEL", "1"
 ).lower() not in ("0", "false")
+# SPARKINFER_DENSE_ROW_SCALE_EPILOGUE=1 applies the per-row output correction
+# inside the GEMM epilogue instead of as a trailing ``result.mul_(inv_gs)``.
+# That multiply is one launch per linear (352/step on Behemoth-123B TP=2,
+# 0.63 ms/step measured) whose GPU cost is almost entirely dispatch latency.
+# The epilogue reproduces it bit-for-bit, including the second rounding to
+# bf16. Default OFF until the bit-equality suite has run against the epilogue
+# variant on the serving box; flip the default once that evidence exists.
+_ROW_SCALE_EPILOGUE = os.getenv(
+    "SPARKINFER_DENSE_ROW_SCALE_EPILOGUE", "0"
+).lower() not in ("0", "false")
 _QUANT_SCRATCH: dict[tuple, tuple] = {}
 # Phase C decode-churn fix: graph CAPTURE must also reuse buckets. The old
 # behavior (allocate fresh inside capture) baked the two uint8 zero-fills of
@@ -762,6 +772,13 @@ def dense_fp6_linear_expanded(
     # a byte-container (the quantizer emits it directly); the weight is either
     # pre-expanded at load or 3:4-packed and expanded in smem by the kernel.
     y = torch.empty((m, n, 1), device=x.device, dtype=torch.bfloat16)
+    # ``inv_gs_pr`` is a contiguous bf16 (m,) buffer that both per-row quant
+    # kernels write; the (m, 1) view exists only for the broadcast multiply.
+    _row_scale = (
+        inv_gs_pr.view(m)
+        if _ROW_SCALE_EPILOGUE and inv_gs_pr is not None
+        else None
+    )
     dense_gemm(
         (a_codes[:m].unsqueeze(-1), a_sf),
         (weight, b_sf),
@@ -782,12 +799,14 @@ def dense_fp6_linear_expanded(
             if _fused_quant
             else None
         ),
+        row_scale=_row_scale,
     )
     result = y[:, :, 0]
-    if inv_gs_pr is not None:
+    if inv_gs_pr is not None and _row_scale is None:
         # Undo per-row pre-scaling (fused path): the quant kernel already
         # emitted bf16(1/a_gs_per_row) — bit-identical to the host chain's
-        # (1.0 / a_gs_pr).to(torch.bfloat16) below.
+        # (1.0 / a_gs_pr).to(torch.bfloat16) below. When _row_scale is set the
+        # GEMM epilogue has already applied exactly this multiply.
         result.mul_(inv_gs_pr)
     elif a_gs_pr is not None:
         # Undo per-row pre-scaling: multiply by 1 / a_gs_per_row.

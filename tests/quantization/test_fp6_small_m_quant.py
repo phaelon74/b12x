@@ -185,3 +185,29 @@ def test_small_m_per_row_linear_ab_bit_exact(m, monkeypatch):
     monkeypatch.setattr(fdw, "_PER_ROW_IN_KERNEL", True)
     y_fused = fdw.dense_fp6_linear(x, w)
     torch.testing.assert_close(y_fused, y_host, rtol=0.0, atol=0.0)
+
+
+@cuda_required
+@pytest.mark.parametrize("m", [1, 2, 5, 16, 129, 256])
+def test_row_scale_epilogue_bit_exact(m, monkeypatch):
+    """The epilogue row scale equals the trailing ``result.mul_(inv_gs)``, bitwise.
+
+    Covers both per-row regimes: the small-M quant kernel (m <= 16) and the
+    RowGsKernel + TMA quantizer pair (m > 16, including a non-tile-multiple m
+    so the padded rows' sliced-away inv_gs entries are exercised). Anything
+    less than exact equality means the epilogue is not reproducing the second
+    bf16 rounding that the eager multiply performs.
+    """
+    from sparkinfer.quantization.mxfp6 import fp6_dense_weights as fdw
+
+    torch.manual_seed(3)
+    w = fdw.quantize_dense_weight_to_fp6(
+        torch.randn(512, 256, dtype=torch.bfloat16, device="cuda")
+    )
+    x = torch.randn(m, w.in_features, dtype=torch.bfloat16, device="cuda")
+
+    monkeypatch.setattr(fdw, "_ROW_SCALE_EPILOGUE", False)
+    y_eager = fdw.dense_fp6_linear(x, w).clone()
+    monkeypatch.setattr(fdw, "_ROW_SCALE_EPILOGUE", True)
+    y_epilogue = fdw.dense_fp6_linear(x, w)
+    torch.testing.assert_close(y_epilogue, y_eager, rtol=0.0, atol=0.0)

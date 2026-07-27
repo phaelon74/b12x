@@ -659,6 +659,7 @@ class DenseGemmKernel:
         b_tile_major: bool = False,
         quantize_c: bool = False,
         alpha_is_one: bool = False,
+        row_scale: bool = False,
         direct_sfa_live16: bool = False,
         direct_m1_wo_a_inputs: bool = False,
         target_occupancy: int = 1,
@@ -786,6 +787,18 @@ class DenseGemmKernel:
         self.b_tile_major = b_tile_major
         self.quantize_c = quantize_c
         self.alpha_is_one = alpha_is_one
+        # Per-row output scale applied in the epilogue, replacing a separate
+        # ``result.mul_(inv_gs)`` launch. It is NOT foldable into ``alpha``:
+        # the eager multiply rounds to c_dtype twice (once after alpha, once
+        # after the row scale), and the epilogue must reproduce both roundings
+        # to stay bit-identical. See the epilogue application site.
+        self.row_scale = row_scale
+        if row_scale:
+            # Each of these takes a store path that bypasses the r2s register
+            # stage where the row scale is applied.
+            assert not quantize_c, "row_scale is not wired for quantize_c"
+            assert split_k_slices == 1, "row_scale is not wired for split-K"
+            assert not swap_ab, "row_scale is not wired for swap_ab"
         self.direct_sfb_representative = (
             sfb_k_reuse
             and b_tile_major
@@ -1002,6 +1015,7 @@ class DenseGemmKernel:
         epilogue_op: cutlass.Constexpr = lambda x: x,
         x_bf16: cute.Tensor = None,
         w_gscale: cute.Tensor = None,
+        row_scale: cute.Tensor = None,
     ):
         """Execute the GEMM operation.
 
@@ -1017,6 +1031,8 @@ class DenseGemmKernel:
             epilogue_op: Elementwise epilogue function
             x_bf16: BF16 activation input (MX-FP6 fused quant mode only)
             w_gscale: Weight global scale, shape (1,), f32 (fused mode only)
+            row_scale: Per-row epilogue scale, shape (M,), c_dtype
+                (``row_scale=True`` construction only)
         """
         # Dead kernel arguments on every non-fused path; substitute a
         # type-compatible live tensor so the traced signature stays uniform.
@@ -1026,6 +1042,11 @@ class DenseGemmKernel:
             x_bf16 = alpha
         if cutlass.const_expr(w_gscale is None):
             w_gscale = alpha
+        if cutlass.const_expr(row_scale is None):
+            assert not self.row_scale, "row_scale=True requires a row_scale tensor"
+            row_scale = c
+        else:
+            assert self.row_scale, "row_scale tensor passed to a non-row_scale kernel"
         # Setup static attributes
         self.a_dtype = a.element_type
         self.b_dtype = b.element_type
@@ -1221,6 +1242,7 @@ class DenseGemmKernel:
             alpha,
             x_bf16,
             w_gscale,
+            row_scale,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1410,6 +1432,7 @@ class DenseGemmKernel:
         alpha: cute.Tensor,
         directX_bf16: cute.Tensor,
         w_gscale: cute.Tensor,
+        mRowScale: cute.Tensor,
     ):
         # Keep alpha in FP32 for precision
         alpha_value = alpha[0].to(cutlass.Float32)
@@ -2415,6 +2438,24 @@ class DenseGemmKernel:
                     tRS_rD_layout = cute.make_layout(rD_shape[:3])
                     tRS_rD = cute.make_rmem_tensor(tRS_rD_layout.shape, self.acc_dtype)
 
+                    if cutlass.const_expr(self.row_scale):
+                        # Retiled through the SAME copy as tRS_rAcc, so element
+                        # ``i`` of tRS_cAcc is the (m,n) tile coordinate of
+                        # element ``i`` of tRS_rAcc, and therefore of tRS_rD.
+                        # Partitioning an identity tensor against sC directly
+                        # would not be safe here: sC is a swizzled composed
+                        # layout and the identity is not.
+                        tRS_cAcc = tiled_copy_r2s.retile(
+                            thr_mma.partition_C(
+                                cute.make_identity_tensor(
+                                    cute.slice_(self.tile_shape_mnk, (None, None, 0))
+                                )
+                            )
+                        )
+                        tRS_rRowScale = cute.make_rmem_tensor(
+                            tRS_rD_layout.shape, self.acc_dtype
+                        )
+
                     sepi_for_tma_partition = cute.group_modes(sC, 0, 2)
                     tcgc_for_tma_partition = cute.zipped_divide(
                         gC_mnl_slice, self.epi_tile
@@ -2468,6 +2509,34 @@ class DenseGemmKernel:
                                         tRS_rD_slice[elem_idx] = tRS_rAcc_slice[
                                             elem_idx
                                         ]
+                                    if cutlass.const_expr(self.row_scale):
+                                        tRS_cAcc_slice = tRS_cAcc[
+                                            (None, mma_m, mma_n)
+                                        ]
+                                        tRS_rRowScale_slice = tRS_rRowScale[
+                                            (None, mma_m_in_epi, mma_n_in_epi)
+                                        ]
+                                        for elem_idx in cutlass.range_constexpr(
+                                            cute.size(tRS_rD_slice)
+                                        ):
+                                            m_coord = (
+                                                tile_coord_mnl[0]
+                                                * Int32(self.tile_shape_mnk[0])
+                                                + tRS_cAcc_slice[elem_idx][0]
+                                            )
+                                            # Out-of-range rows are never
+                                            # stored, so any finite filler is
+                                            # fine; 1.0 keeps the multiply from
+                                            # manufacturing NaN/Inf in a lane
+                                            # whose accumulator is garbage.
+                                            row_scale_value = cutlass.Float32(1.0)
+                                            if m_coord < Int32(mRowScale.shape[0]):
+                                                row_scale_value = mRowScale[
+                                                    m_coord
+                                                ].to(cutlass.Float32)
+                                            tRS_rRowScale_slice[elem_idx] = (
+                                                row_scale_value
+                                            )
 
                             gmem_coord = (epi_m, epi_n)
                             if cutlass.const_expr(self.split_k_slices > 1):
@@ -2606,6 +2675,20 @@ class DenseGemmKernel:
                                     acc_vec = epilogue_op(
                                         (alpha_value * acc_vec).to(self.c_dtype)
                                     )
+                                if cutlass.const_expr(self.row_scale):
+                                    # Deliberately a SECOND rounding to c_dtype,
+                                    # applied to the already-rounded alpha
+                                    # result. This reproduces the eager
+                                    # ``result.mul_(inv_gs)`` it replaces, which
+                                    # rounds once when the GEMM writes C and
+                                    # again after the multiply. Folding the row
+                                    # scale into alpha, or multiplying the fp32
+                                    # accumulator, would each round only once
+                                    # and would not be bit-identical.
+                                    acc_vec = (
+                                        acc_vec.to(cutlass.Float32)
+                                        * tRS_rRowScale.load()
+                                    ).to(self.c_dtype)
                                 tRS_rD_out.store(acc_vec)
 
                                 # Register to shared memory
@@ -4512,6 +4595,7 @@ class _DenseGemmMxfp6Launch(_DenseGemmLaunch):
         b_packed: bool = False,
         a_preexpanded: bool = False,
         b_preexpanded: bool = False,
+        row_scale: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -4531,6 +4615,7 @@ class _DenseGemmMxfp6Launch(_DenseGemmLaunch):
         self._a_preexpanded = bool(a_preexpanded)
         self._b_preexpanded = bool(b_preexpanded)
         self._fused_quant_env = _DENSE_FUSED_QUANT
+        self._row_scale = bool(row_scale)
 
     def compile_key(self) -> tuple[object, ...]:
         return (
@@ -4541,6 +4626,7 @@ class _DenseGemmMxfp6Launch(_DenseGemmLaunch):
             self._a_preexpanded,
             self._b_preexpanded,
             self._fused_quant_env,
+            self._row_scale,
             *super().compile_key(),
         )
 
@@ -4555,6 +4641,7 @@ class _DenseGemmMxfp6Launch(_DenseGemmLaunch):
         alpha_ptr: cute.Pointer,
         x_bf16_ptr: cute.Pointer,
         w_gscale_ptr: cute.Pointer,
+        row_scale_ptr: cute.Pointer,
         m: cutlass.Int32,
         current_stream: cuda.CUstream,
     ):
@@ -4595,6 +4682,13 @@ class _DenseGemmMxfp6Launch(_DenseGemmLaunch):
             w_gscale_ptr,
             layout=cute.make_ordered_layout((Int32(1),), order=(0,)),
         )
+        if cutlass.const_expr(self._row_scale):
+            row_scale_tensor = cute.make_tensor(
+                row_scale_ptr,
+                layout=cute.make_ordered_layout((m,), order=(0,)),
+            )
+        else:
+            row_scale_tensor = None
         policy = self._policy
         DenseGemmKernel(
             sf_vec_size=self._sf_vec_size,
@@ -4622,6 +4716,7 @@ class _DenseGemmMxfp6Launch(_DenseGemmLaunch):
             mxfp6_fmt_b=self._mxfp6_fmt_b,
             b_packed=self._b_packed,
             target_occupancy=self._target_occupancy,
+            row_scale=self._row_scale,
         )(
             a_tensor,
             a_tensor,
@@ -4639,6 +4734,7 @@ class _DenseGemmMxfp6Launch(_DenseGemmLaunch):
             current_stream,
             x_bf16=x_bf16_tensor,
             w_gscale=w_gscale_tensor,
+            row_scale=row_scale_tensor,
         )
 
 
@@ -4669,6 +4765,7 @@ def _get_compiled_dense_gemm_mxfp6(
     a_preexpanded: bool,
     b_preexpanded: bool,
     alpha_is_one: bool,
+    row_scale: bool,
 ) -> Callable:
     def _make_runtime_pointers(
         input_tensors: Optional[List[torch.Tensor]],
@@ -4683,7 +4780,8 @@ def _get_compiled_dense_gemm_mxfp6(
                 alpha_data_ptr,
                 x_bf16_data_ptr,
                 w_gscale_data_ptr,
-            ) = [16 for _ in range(8)]
+                row_scale_data_ptr,
+            ) = [16 for _ in range(9)]
         else:
             (
                 a_tensor_gpu,
@@ -4694,6 +4792,7 @@ def _get_compiled_dense_gemm_mxfp6(
                 alpha_tensor_gpu,
                 x_bf16_tensor_gpu,
                 w_gscale_tensor_gpu,
+                row_scale_tensor_gpu,
             ) = input_tensors
             (
                 a_data_ptr,
@@ -4720,6 +4819,11 @@ def _get_compiled_dense_gemm_mxfp6(
                 if w_gscale_tensor_gpu is not None
                 else 16
             )
+            row_scale_data_ptr = (
+                row_scale_tensor_gpu.data_ptr()
+                if row_scale_tensor_gpu is not None
+                else 16
+            )
 
         return [
             make_ptr(ab_dtype, a_data_ptr, cute.AddressSpace.gmem, assumed_align=16),
@@ -4739,6 +4843,12 @@ def _get_compiled_dense_gemm_mxfp6(
             make_ptr(
                 cutlass.Float32,
                 w_gscale_data_ptr,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            make_ptr(
+                c_dtype,
+                row_scale_data_ptr,
                 cute.AddressSpace.gmem,
                 assumed_align=16,
             ),
@@ -4773,6 +4883,7 @@ def _get_compiled_dense_gemm_mxfp6(
         b_packed=b_packed,
         a_preexpanded=a_preexpanded,
         b_preexpanded=b_preexpanded,
+        row_scale=row_scale,
         # MX-FP6 does not go through _get_compiled_dense_gemm, so the shared
         # rule has to be called explicitly here; hardcoding a default is what
         # silently kept this family at one CTA per SM. _target_occupancy is part
@@ -4817,6 +4928,7 @@ def _get_compiled_dense_gemm_mxfp6(
         stream_int: Optional[int] = None,
         x_bf16_tensor_gpu: Optional[torch.Tensor] = None,
         w_gscale_tensor_gpu: Optional[torch.Tensor] = None,
+        row_scale_tensor_gpu: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         m = a_tensor_gpu.shape[0]
         if c_tensor_gpu is None:
@@ -4842,6 +4954,7 @@ def _get_compiled_dense_gemm_mxfp6(
                     alpha_tensor_gpu,
                     x_bf16_tensor_gpu,
                     w_gscale_tensor_gpu,
+                    row_scale_tensor_gpu,
                 ]
             ),
             m,
@@ -6789,6 +6902,7 @@ def dense_gemm(
     b_fmt: Optional[str] = None,
     x_bf16: Optional[torch.Tensor] = None,
     w_gscale: Optional[torch.Tensor] = None,
+    row_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Execute dense block-scaled GEMM for one expert-major batch stack.
 
@@ -6823,6 +6937,12 @@ def dense_gemm(
 
     ``x_bf16`` / ``w_gscale``: fused BF16 activation-quant inputs, only used
     when SPARKINFER_DENSE_FUSED_QUANT is enabled on an m=1 MX-FP6 launch.
+
+    ``row_scale``: optional contiguous ``(M,)`` tensor in the C dtype, applied
+    per output row in the epilogue. It replaces a separate ``out.mul_(v)``
+    launch and reproduces that multiply bit-for-bit, including its second
+    rounding to the C dtype — it is NOT equivalent to folding the same values
+    into ``alpha``. MX-FP6 only.
     """
     a_torch, sfa_torch = lhs
     b_torch, sfb_torch = rhs
@@ -7033,6 +7153,21 @@ def dense_gemm(
     kernel_c_dtype_name = (
         "float32" if split_k_output and not split_k_atomic_bf16 else c_dtype
     )
+    if row_scale is not None:
+        if not is_mxfp6:
+            raise ValueError("row_scale is only wired for the MX-FP6 path")
+        if (
+            row_scale.dim() != 1
+            or row_scale.shape[0] != m
+            or not row_scale.is_contiguous()
+            or row_scale.dtype != cutlass_to_torch_dtype(c_cutlass_dtype)
+        ):
+            raise ValueError(
+                "row_scale must be a contiguous 1-D tensor of shape (M,) in the "
+                f"C dtype; got shape {tuple(row_scale.shape)} dtype "
+                f"{row_scale.dtype} for M={m}, C dtype "
+                f"{cutlass_to_torch_dtype(c_cutlass_dtype)}"
+            )
     if is_mxfp6:
         # Dedicated MX-FP6 launch path (bypasses the torch custom ops, like
         # the quantized-C path): the byte-container operands plus the
@@ -7064,6 +7199,7 @@ def dense_gemm(
             a_preexpanded=a_preexpanded,
             b_preexpanded=b_preexpanded,
             alpha_is_one=alpha_is_one,
+            row_scale=row_scale is not None,
         )
         if out is None:
             out = _empty_dense_gemm_output(
@@ -7083,6 +7219,7 @@ def dense_gemm(
             stream_int=stream_int,
             x_bf16_tensor_gpu=x_bf16,
             w_gscale_tensor_gpu=w_gscale,
+            row_scale_tensor_gpu=row_scale,
         )
     if _quantized_c is not None:
         quant_c_values, quant_c_scale_rows, quant_c_scale_mma = _quantized_c
