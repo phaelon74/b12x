@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -189,6 +190,29 @@ def test_loops_sharing_a_body_are_deduplicated(mix):
 )
 def test_opcode_categories(mix, opcode, category):
     assert mix._categorize(opcode) == category
+
+
+def test_access_widths_are_recovered_from_modifiers(mix):
+    """Byte-wide and 128-bit shared loads must not read as the same thing."""
+    code = """//--------------------- .text.kernel_demo --------------------
+        /*0000*/                   LDS.U8 R4, [R25] ;
+        /*0010*/                   LDS.U8 R5, [R25+0x1] ;
+        /*0020*/                   LDS.128 R8, [R26] ;
+        /*0030*/                   LDSM.16.M88.4 R12, [R27] ;
+"""
+    instructions = mix._instructions(code)
+    modifiers = mix._modifiers_by_offset(code)
+    assert modifiers[0x0] == ".U8"
+    assert modifiers[0x20] == ".128"
+    assert modifiers[0x30] == ".16.M88.4"
+
+    body = [(offset, opcode) for offset, opcode, _ in instructions]
+    counts = Counter(
+        f"{opcode}{modifiers[offset]}"
+        for offset, opcode in body
+        if mix._categorize(opcode) in {"lds", "ldsm"}
+    )
+    assert counts == {"LDS.U8": 2, "LDS.128": 1, "LDSM.16.M88.4": 1}
 
 
 def test_modifiers_do_not_leak_into_the_opcode(mix):

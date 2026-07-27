@@ -159,6 +159,37 @@ def _instructions(code: str) -> list[tuple[int, str, str]]:
     return out
 
 
+def _modifiers_by_offset(code: str) -> dict[int, str]:
+    """Offset -> the instruction's modifier suffix, e.g. ``.U8`` or ``.128``.
+
+    Instruction COUNTS cannot distinguish 96 byte-wide shared loads from 96
+    128-bit ones, and that distinction is the difference between a real
+    vectorization win and none at all.
+    """
+    return {
+        int(match.group("offset"), 16): match.group("modifiers")
+        for match in _INSTRUCTION_RE.finditer(code)
+    }
+
+
+def _print_access_widths(
+    body: list[tuple[int, str]],
+    modifiers: dict[int, str],
+    categories: tuple[str, ...] = ("lds", "ldsm", "sts", "ldg", "stg", "local"),
+) -> None:
+    """Break memory instructions down by their width modifier."""
+    rows: Counter = Counter()
+    for offset, opcode in body:
+        if _categorize(opcode) not in categories:
+            continue
+        rows[f"{opcode}{modifiers.get(offset, '')}"] += 1
+    if not rows:
+        return
+    print("\n  memory access widths")
+    for name, count in sorted(rows.items(), key=lambda item: -item[1]):
+        print(f"    {name:<28} {count:>6}")
+
+
 def _label_offsets(code: str) -> dict[str, int]:
     """Map each branch label to the offset of the instruction it precedes."""
     labels: dict[str, int] = {}
@@ -394,6 +425,7 @@ def main() -> int:
             print(f"instructions: {len(instructions)}")
 
             labels = _label_offsets(code)
+            modifiers = _modifiers_by_offset(code)
             loops = _dedupe_loops(_find_loops(instructions, labels))
             print(f"labels: {len(labels)}  distinct loops: {len(loops)}")
             if loops:
@@ -415,6 +447,7 @@ def main() -> int:
                         "the mainloop - the kernel is spilling."
                     )
                 _print_unclassified(mainloop.instructions)
+                _print_access_widths(mainloop.instructions, modifiers)
                 if args.top_opcodes:
                     print(f"\n  top {args.top_opcodes} mainloop opcodes")
                     for opcode, count in _opcode_census(
