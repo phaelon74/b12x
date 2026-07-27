@@ -235,20 +235,29 @@ _DENSE_FUSED_QUANT = os.environ.get(
     "SPARKINFER_DENSE_FUSED_QUANT", "0"
 ).lower() not in ("0", "false")
 
-# Strategy for the shared->register MX scale-factor copy: "off" (one access per
-# UE8M0 byte), "autovec", or "recast32". See DenseGemmKernel._copy_sf_fragment
-# for what each does and why the obvious approach - widening the copy atom -
-# does not work.
+# Strategy for the shared->register MX scale-factor copy: "autovec" (default),
+# "recast32", or "off" (one access per UE8M0 byte). See
+# DenseGemmKernel._copy_sf_fragment for what each does and why the obvious
+# approach - widening the copy atom - does not work.
 #
-# Why this exists: a SASS census of the prefill k-loop
-# (scripts/sass_instruction_mix.py, Jul 27) counts 96 LDS.U8 against 64
-# LDSM.16.M88.4 and 128 QMMA. The scale factors carry one byte per 32 elements,
-# so they move ~1/32 the operand bytes at 1.5x the load instructions, in a loop
-# where only 26.2% of issued instructions are MMA and the MMA pipe runs at
-# 72-75% against FP8's 93-95%.
+# A SASS census of the prefill k-loop found 96 LDS.U8 against 64 LDSM.16.M88.4
+# and 128 QMMA: the scale factors move ~1/32 the operand bytes at 1.5x the load
+# instructions. Vectorizing cuts that to 16 shared loads but adds 96 PRMT to
+# unpack the bytes, leaving the loop 7.2% HEAVIER at 523 instructions. It is
+# still faster, because the instructions it removes are on the throttled
+# LSU/MIO pipe and the ones it adds are on the idle ALU pipe: -1.04% to -1.26%
+# on all four Behemoth TP=2 prefill shards (200 iters, median; 538-567 ->
+# 545-574 TFLOP/s), decode flat to -1.0%, oracle max_abs/rmse/cos identical to
+# every printed digit in both arms.
 #
-# Off by default until the bit-exactness gate and a serve sweep say otherwise.
-_DENSE_SF_COPY_MODE = os.environ.get("SPARKINFER_DENSE_SF_COPY_MODE", "off").lower()
+# "autovec" over "recast32" as the default although they generate identical
+# code here: autovec narrows itself where a layout will not vectorize, while
+# recast32 fails to compile. On an untested tile - narrow-N, a future decode
+# tile, MoE - silently keeping byte loads is a perf regression, and refusing to
+# build is an outage.
+_DENSE_SF_COPY_MODE = os.environ.get(
+    "SPARKINFER_DENSE_SF_COPY_MODE", "autovec"
+).lower()
 if _DENSE_SF_COPY_MODE not in ("off", "autovec", "recast32"):
     raise ValueError(
         "SPARKINFER_DENSE_SF_COPY_MODE must be one of off/autovec/recast32, "
@@ -688,7 +697,7 @@ class DenseGemmKernel:
         mxfp6_fmt_b: Optional[str] = None,
         b_packed: bool = False,
         fused_quant_bf16: Optional[bool] = None,
-        sf_copy_mode: str = "off",
+        sf_copy_mode: str = "autovec",
     ):
         # When set, A/B operands are MX codes carried in Float8E4M3FN
         # byte-containers: the whole kernel runs the MXFP8 smem/TMA/ldmatrix
@@ -4402,7 +4411,7 @@ class _DenseGemmLaunch:
         direct_sfa_live16: bool = False,
         direct_m1_wo_a_inputs: bool = False,
         target_occupancy: int = 1,
-        sf_copy_mode: str = "off",
+        sf_copy_mode: str = "autovec",
     ):
         self._n = n
         self._k = k
