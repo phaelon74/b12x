@@ -103,6 +103,64 @@ def test_operand_immediates_are_not_mistaken_for_branch_targets(mix):
     assert targets == [0x100]
 
 
+_NESTED = """//--------------------- .text.kernel_demo ------------------------
+        /*0000*/                   IMAD.MOV.U32 R1, RZ, RZ, c[0x0][0x28] ;
+.L_tile:
+        /*0010*/                   LDGSTS.E R4, [R6] ;
+.L_kloop:
+        /*0020*/                   LDSM.16.M88.4 R8, [R25+0x800] ;
+        /*0030*/                   QMMA.16816.F32 R16, R8, R12, R16 ;
+        /*0040*/                   IADD3 R25, R25, 0x20, RZ ;
+        /*0050*/              @!P0 BRA `(.L_kloop) ;
+        /*0060*/                   F2FP.PACK_AB R20, R16, R17 ;
+        /*0070*/                   STG.E [R30], R20 ;
+        /*0080*/              @!P1 BRA `(.L_tile) ;
+        /*0090*/                   EXIT ;
+"""
+
+
+def test_mainloop_is_the_innermost_mma_loop_not_the_largest(mix):
+    """A persistent GEMM nests the k-loop inside a tile-scheduler loop.
+
+    Selecting the largest loop would charge the epilogue's conversion and
+    global store to the mainloop's per-MMA budget.
+    """
+    instructions = mix._instructions(_NESTED)
+    labels = mix._label_offsets(_NESTED)
+    loops = mix._dedupe_loops(mix._find_loops(instructions, labels))
+
+    outer = max(loops, key=lambda loop: loop.size)
+    assert (outer.start, outer.end) == (0x10, 0x80)
+
+    mainloop = mix._select_mainloop(loops)
+    assert (mainloop.start, mainloop.end) == (0x20, 0x50)
+
+    counts = mix._census(mainloop.instructions)
+    assert counts["mma"] == 1
+    # The epilogue's F2FP and STG belong to the tile loop, not the k-loop.
+    assert "fp_math" not in counts
+    assert "stg" not in counts
+
+
+def test_loops_sharing_a_body_are_deduplicated(mix):
+    """A multi-exit loop emits one backward branch per exit, not one loop."""
+    code = """//--------------------- .text.kernel_demo --------------------
+.L_a:
+        /*0000*/                   QMMA.16816.F32 R16, R8, R12, R16 ;
+        /*0010*/              @!P0 BRA `(.L_a) ;
+        /*0020*/              @!P1 BRA `(.L_a) ;
+        /*0030*/                   EXIT ;
+"""
+    instructions = mix._instructions(code)
+    labels = mix._label_offsets(code)
+    raw = mix._find_loops(instructions, labels)
+    assert len(raw) == 2
+    assert len(mix._dedupe_loops(raw)) == 2  # distinct ends, genuinely two bodies
+
+    same = [mix.Loop(start=0, end=16, instructions=[(0, "QMMA")])] * 2
+    assert len(mix._dedupe_loops(same)) == 1
+
+
 @pytest.mark.parametrize(
     ("opcode", "category"),
     [
@@ -116,7 +174,12 @@ def test_operand_immediates_are_not_mistaken_for_branch_targets(mix):
         ("LDL", "local"),
         ("STL", "local"),
         ("ULDC", "const_load"),
+        ("LDCU", "const_load"),
+        ("STSM", "sts"),
+        ("F2FP", "fp_math"),
+        ("IADD", "int_addr"),
         ("BAR", "barrier"),
+        ("SYNCS", "barrier"),
         ("NANOSLEEP", "barrier"),
         ("PLOP3", "pred"),
         ("FFMA", "fp_math"),

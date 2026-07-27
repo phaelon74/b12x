@@ -66,7 +66,7 @@ _CATEGORIES: tuple[tuple[str, re.Pattern[str]], ...] = (
     # registers; plain LDS/STS is everything else touching smem.
     ("ldsm", re.compile(r"^(?:LDSM|MOVM)$")),
     ("lds", re.compile(r"^LDS$")),
-    ("sts", re.compile(r"^STS$")),
+    ("sts", re.compile(r"^(?:STS|STSM)$")),
     # Global traffic. LDGSTS is cp.async; UTMA* is the TMA unit.
     ("tma", re.compile(r"^(?:UTMALDG|UTMASTG|UTMACCTL|UBLKCP)$")),
     ("ldgsts", re.compile(r"^(?:LDGSTS|LDGDEPBAR)$")),
@@ -77,21 +77,21 @@ _CATEGORIES: tuple[tuple[str, re.Pattern[str]], ...] = (
     # Constant-bank reads. Cheap and broadcast, but they are how a kernel
     # re-reads kernel params it failed to hoist, so keep them visible rather
     # than folded into int_addr.
-    ("const_load", re.compile(r"^(?:LDC|ULDC)$")),
+    ("const_load", re.compile(r"^(?:LDC|ULDC|LDCU)$")),
     # Synchronization. NANOSLEEP is what ncu reports as the `sleeping` stall.
     ("barrier", re.compile(r"^(?:BAR|BARRIER|BSSY|BSYNC|DEPBAR|MEMBAR|ERRBAR"
                            r"|ARRIVES|ARRIVELDS|ELECT|NANOSLEEP|YIELD|FENCE"
-                           r"|ACQBULK|ENDCOLLECTIVE|CCTL|CCTLL|CCTLT)$")),
+                           r"|SYNCS|ACQBULK|ENDCOLLECTIVE|CCTL|CCTLL|CCTLT)$")),
     # Predicate logic. Separate from int_addr because predicate pressure and
     # address pressure call for different fixes.
     ("pred", re.compile(r"^(?:PLOP3|UPLOP3|PSETP|UPSETP|P2R|R2P)$")),
     # Scalar float math: the epilogue and any in-kernel scaling.
     ("fp_math", re.compile(r"^(?:FADD|FMUL|FFMA|FSEL|FSETP|FMNMX|MUFU|FCHK"
-                           r"|HADD2|HMUL2|HFMA2|HSETP2|HMNMX2|F2F|F2I|I2F"
-                           r"|FRND|CVT)$")),
+                           r"|HADD2|HMUL2|HFMA2|HSETP2|HMNMX2|F2F|F2FP|F2I|I2F"
+                           r"|I2FP|FRND|CVT)$")),
     # Integer and address arithmetic. This is the bucket that grows when a
     # kernel recomputes addresses per k-block instead of hoisting them.
-    ("int_addr", re.compile(r"^(?:IMAD|IADD3|IABS|ISETP|LOP3|LEA|SHF|SGXT"
+    ("int_addr", re.compile(r"^(?:IMAD|IADD|IADD3|IABS|ISETP|LOP3|LEA|SHF|SGXT"
                             r"|BREV|FLO|POPC|PRMT|SEL|ICMP|IMNMX|VIADD"
                             r"|UIMAD|UIADD3|UISETP|ULOP3|ULEA|USHF|USEL"
                             r"|UPRMT|UFLO|UPOPC)$")),
@@ -215,6 +215,44 @@ def _find_loops(
         body = [(o, op) for o, op, _ in instructions[start_index : index + 1]]
         loops.append(Loop(start=min(backward), end=offset, instructions=body))
     return loops
+
+
+def _dedupe_loops(loops: list[Loop]) -> list[Loop]:
+    """Collapse loops that share a body; a multi-exit loop emits one per exit."""
+    unique: dict[tuple[int, int], Loop] = {}
+    for loop in loops:
+        unique.setdefault((loop.start, loop.end), loop)
+    return sorted(unique.values(), key=lambda loop: (loop.start, -loop.end))
+
+
+def _mma_count(loop: Loop) -> int:
+    return sum(1 for _, opcode in loop.instructions if _categorize(opcode) == "mma")
+
+
+def _select_mainloop(loops: list[Loop]) -> Loop | None:
+    """Pick the innermost loop that still issues MMA.
+
+    Not the largest loop. These kernels are persistent, so the outermost loop
+    is the tile scheduler and its body contains a whole tile's prologue,
+    mainloop and epilogue - censusing it reports epilogue conversions and
+    stores as though they were per-MMA mainloop cost. The k-loop is the
+    innermost body that retains MMA, and it is the only one whose per-MMA
+    ratios mean what Phase G needs them to mean.
+    """
+    with_mma = [loop for loop in loops if _mma_count(loop) > 0]
+    if not with_mma:
+        return None
+    return min(with_mma, key=lambda loop: loop.size)
+
+
+def _print_loop_table(loops: list[Loop], total: int) -> None:
+    print(f"\n  loop nest ({len(loops)} distinct bodies)")
+    print(f"    {'range':<21} {'insns':>6} {'% kernel':>9} {'mma':>6}")
+    print(f"    {'-' * 21} {'-' * 6} {'-' * 9} {'-' * 6}")
+    for loop in loops:
+        share = 100.0 * loop.size / total if total else 0.0
+        label = f"0x{loop.start:x}..0x{loop.end:x}"
+        print(f"    {label:<21} {loop.size:>6} {share:>8.1f}% {_mma_count(loop):>6}")
 
 
 def _census(body: list[tuple[int, str]]) -> Counter:
@@ -356,10 +394,12 @@ def main() -> int:
             print(f"instructions: {len(instructions)}")
 
             labels = _label_offsets(code)
-            loops = _find_loops(instructions, labels)
-            print(f"labels: {len(labels)}  loops: {len(loops)}")
+            loops = _dedupe_loops(_find_loops(instructions, labels))
+            print(f"labels: {len(labels)}  distinct loops: {len(loops)}")
             if loops:
-                mainloop = max(loops, key=lambda loop: loop.size)
+                _print_loop_table(loops, len(instructions))
+            mainloop = _select_mainloop(loops) if loops else None
+            if mainloop is not None:
                 counts = _census(mainloop.instructions)
                 mma = counts.get("mma", 0)
                 _print_census(
@@ -369,12 +409,6 @@ def main() -> int:
                     mainloop.size,
                     mma,
                 )
-                if mma == 0:
-                    print(
-                        "  NOTE: no MMA in the largest loop - this entry point is "
-                        "probably not the GEMM, or the loop heuristic picked an "
-                        "epilogue loop. Re-run with --whole-kernel."
-                    )
                 if counts.get("local"):
                     print(
                         f"  WARNING: {counts['local']} local-memory instructions in "
@@ -387,9 +421,26 @@ def main() -> int:
                         mainloop.instructions
                     ).most_common(args.top_opcodes):
                         print(f"    {opcode:<16} {count:>6}")
+            elif loops:
+                print(
+                    "\n  loops found but none issue MMA - not the GEMM entry point?"
+                )
             else:
                 print("\n  no loops found; censusing the whole kernel instead.")
                 _print_branches(instructions, labels)
+
+            # The outermost loop is the persistent tile scheduler: one iteration
+            # is one output tile, so this is where the epilogue cost lives.
+            outer = max(loops, key=lambda loop: loop.size) if loops else None
+            if outer is not None and mainloop is not None and outer is not mainloop:
+                counts = _census(outer.instructions)
+                _print_census(
+                    f"tile loop [0x{outer.start:x} .. 0x{outer.end:x}] "
+                    f"({outer.size} instructions, mainloop + epilogue)",
+                    counts,
+                    outer.size,
+                    counts.get("mma", 0),
+                )
 
             if args.whole_kernel or not loops:
                 body = [(offset, opcode) for offset, opcode, _ in instructions]
