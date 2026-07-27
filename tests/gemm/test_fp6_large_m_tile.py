@@ -51,8 +51,11 @@ def test_fp6_tile_regime_selection():
         assert _select_default_mma_tiler_mn(m, 7168, **common) == (16, 64)
         # gate_up N=28672: 448 CTAs, healthy 72-CTA tail -> (16,64).
         assert _select_default_mma_tiler_mn(m, 28672, **common) == (16, 64)
-        # o/down N=12288: 192 CTAs on 188 SMs, 4-CTA tail cliff -> (32,128).
-        assert _select_default_mma_tiler_mn(m, 12288, **common) == (32, 128)
+        # o/down N=12288 was exempted to (32,128) to dodge a 4-CTA tail wave on
+        # 188 SMs. Retired Jul 26 2026: that tail is an occupancy-1 artifact,
+        # and _dense_gemm_target_occupancy now returns 2 for exactly these
+        # shapes, so width-64 wins outright. Decode is width-64 everywhere.
+        assert _select_default_mma_tiler_mn(m, 12288, **common) == (16, 64)
     # Wide-N prefill regime takes the sweep winner for every m > 16.
     for m in (17, 32, 512, 8192):
         assert _select_default_mma_tiler_mn(m, 7168, **common) == (128, 64)
