@@ -21,6 +21,13 @@
 #   MODE=decode ./scripts/sass_census_fp6_gemm.sh        # the M=1 control
 #   SHAPES=gate_up ./scripts/sass_census_fp6_gemm.sh     # single shard
 #   OUT_DIR=/tmp/g1 ./scripts/sass_census_fp6_gemm.sh
+#
+# Scale-factor copy width A/B (G2b). The default emits one LDS.U8 per UE8M0
+# byte; SF_COPY_BITS asks for a vectorized copy instead. CuTe rejects the copy
+# at compile time if the SF fragment is not contiguous at that width, so a
+# failed arm is a legitimate answer and the bench log will say so:
+#   SF_COPY_BITS=32  OUT_DIR=/tmp/g2b_32  ./scripts/sass_census_fp6_gemm.sh
+#   SF_COPY_BITS=128 OUT_DIR=/tmp/g2b_128 ./scripts/sass_census_fp6_gemm.sh
 
 set -uo pipefail
 
@@ -67,6 +74,7 @@ for shape in $SHAPES; do
 
   SPARKINFER_COMPILE_CACHE_DIR="$cache" \
   SPARKINFER_COMPILE_DISK_CACHE=1 \
+  SPARKINFER_DENSE_SF_COPY_BITS="${SF_COPY_BITS:-0}" \
     "$PYTHON" "$ROOT/benchmarks/benchmark_dense_gemm_fp6.py" \
       --m "$M" --n "$n" --k "$k" $ARM_FLAGS \
       --warmup 2 --iters 2 --no-check \
@@ -102,6 +110,7 @@ echo "Censuses in $OUT_DIR/*.census.txt"
   echo "mode: $MODE"
   echo "m: $M"
   echo "shapes: $SHAPES"
+  echo "sf_copy_bits: ${SF_COPY_BITS:-0}"
   echo "nvdisasm: $(nvdisasm --version 2>/dev/null | tr '\n' ' ')"
   date -u +"captured_utc: %Y-%m-%dT%H:%M:%SZ"
 } >"$OUT_DIR/evidence_header.txt"

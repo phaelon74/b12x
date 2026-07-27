@@ -235,6 +235,23 @@ _DENSE_FUSED_QUANT = os.environ.get(
     "SPARKINFER_DENSE_FUSED_QUANT", "0"
 ).lower() not in ("0", "false")
 
+# Vector width, in bits, for the shared->register MX scale-factor copy. 0 keeps
+# one access per UE8M0 byte.
+#
+# The default is measurably wasteful. A SASS census of the prefill k-loop
+# (scripts/sass_instruction_mix.py, Jul 27) counts 96 LDS.U8 against 64
+# LDSM.16.M88.4 and 128 QMMA: the scale factors carry one byte per 32 elements,
+# so they move roughly 1/32 the operand bytes while costing 1.5x the load
+# instructions, and 2.81 non-MMA instructions issue per MMA in a loop whose MMA
+# pipe runs at 72-75% against FP8's 93-95%.
+#
+# Widening is legal only where each thread's filtered SF fragment is contiguous
+# in smem for the requested width, which depends on the SM120 SFA/SFB TV layout.
+# CuTe rejects the copy at compile time when it is not, so an illegal setting
+# fails loudly rather than reading the wrong scales. Off by default until the
+# bit-exactness gate and a serve sweep say otherwise.
+_DENSE_SF_COPY_BITS = int(os.environ.get("SPARKINFER_DENSE_SF_COPY_BITS", "0"))
+
 
 @dataclass(frozen=True)
 class _DenseGemmPlan:
@@ -668,6 +685,7 @@ class DenseGemmKernel:
         mxfp6_fmt_b: Optional[str] = None,
         b_packed: bool = False,
         fused_quant_bf16: Optional[bool] = None,
+        sf_copy_bits: int = 0,
     ):
         # When set, A/B operands are MX codes carried in Float8E4M3FN
         # byte-containers: the whole kernel runs the MXFP8 smem/TMA/ldmatrix
@@ -838,6 +856,16 @@ class DenseGemmKernel:
 
         self.tiled_mma = None
         self.occupancy = target_occupancy
+        # Vector width for the shared->register scale-factor copy, in bits.
+        # 0 keeps the historical behaviour of one access per UE8M0 byte.
+        #
+        # G1 measured the cost of that default: the prefill k-loop issues 96
+        # LDS.U8 against 64 LDSM and 128 QMMA, so the scale factors move ~1/32
+        # the bytes of the operands at 1.5x the instruction count. Widening the
+        # copy atom is only legal when each thread's filtered SF fragment is
+        # contiguous in smem for the requested width; CuTe rejects the copy at
+        # compile time when it is not, which is the intended failure mode.
+        self.sf_copy_bits = sf_copy_bits
         if mma_atom_mn in ((16, 64), (16, 128)):
             self.num_mma_warps = 2
         elif mma_atom_mn in ((32, 64), (32, 128)):
@@ -1898,6 +1926,11 @@ class DenseGemmKernel:
             atom_copy_ldmatrix_SF = cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(),
                 self.sf_dtype,
+                num_bits_per_copy=(
+                    self.sf_copy_bits
+                    if cutlass.const_expr(self.sf_copy_bits)
+                    else self.sf_dtype.width
+                ),
             )
             smem_tiled_copy_SFA = cute.make_tiled_copy(
                 atom_copy_ldmatrix_SF,
@@ -4343,6 +4376,7 @@ class _DenseGemmLaunch:
         direct_sfa_live16: bool = False,
         direct_m1_wo_a_inputs: bool = False,
         target_occupancy: int = 1,
+        sf_copy_bits: int = 0,
     ):
         self._n = n
         self._k = k
@@ -4376,6 +4410,12 @@ class _DenseGemmLaunch:
         self._direct_sfa_live16 = direct_sfa_live16
         self._direct_m1_wo_a_inputs = direct_m1_wo_a_inputs
         self._target_occupancy = target_occupancy
+        # Changes the emitted shared-load width, so it specializes the kernel
+        # and must be in compile_key(). The equivalent omission for
+        # target_occupancy was missed three times and for the fused-quant flag
+        # once, the latter handing a fused kernel to an unfused caller and
+        # faulting; a knob that changes codegen does not get to be a global.
+        self._sf_copy_bits = int(sf_copy_bits)
         if b_tile_major:
             if (n, k, l) == (1024, 4096, 4):
                 self._b_tile_n = 64
@@ -4461,6 +4501,7 @@ class _DenseGemmLaunch:
             self._direct_sfa_live16,
             self._direct_m1_wo_a_inputs,
             self._target_occupancy,
+            self._sf_copy_bits,
         )
 
     @cute.jit
@@ -4570,6 +4611,7 @@ class _DenseGemmLaunch:
             direct_sfa_live16=self._direct_sfa_live16,
             direct_m1_wo_a_inputs=self._direct_m1_wo_a_inputs,
             target_occupancy=self._target_occupancy,
+            sf_copy_bits=self._sf_copy_bits,
         )(
             a_tensor,
             a_tensor,
@@ -4730,6 +4772,7 @@ class _DenseGemmMxfp6Launch(_DenseGemmLaunch):
             mxfp6_fmt_b=self._mxfp6_fmt_b,
             b_packed=self._b_packed,
             target_occupancy=self._target_occupancy,
+            sf_copy_bits=self._sf_copy_bits,
             row_scale=self._row_scale,
             fused_quant_bf16=self._fused_quant_env,
         )(
@@ -4782,6 +4825,7 @@ def _get_compiled_dense_gemm_mxfp6(
     alpha_is_one: bool,
     row_scale: bool,
     fused_quant: bool,
+    sf_copy_bits: int,
 ) -> Callable:
     def _make_runtime_pointers(
         input_tensors: Optional[List[torch.Tensor]],
@@ -4920,6 +4964,7 @@ def _get_compiled_dense_gemm_mxfp6(
             b_tile_major=False,
             is_mxfp6=True,
         ),
+        sf_copy_bits=sf_copy_bits,
     )
     compile_key = launch.compile_key()
     raise_if_kernel_resolution_frozen(
@@ -5080,6 +5125,7 @@ class _DenseGemmFusedQuantALaunch(_DenseGemmLaunch):
             atom_shape_24=self._atom_shape_24,
             b_tile_major=self._b_tile_major,
             target_occupancy=self._target_occupancy,
+            sf_copy_bits=self._sf_copy_bits,
         )(
             a_tensor,
             a_source,
@@ -5358,6 +5404,7 @@ class _DenseGemmFusedQuantAGroupedLaunch(_DenseGemmLaunch):
             fused_quant_a_wide=self._fused_quant_a_wide,
             atom_shape_24=self._atom_shape_24,
             target_occupancy=self._target_occupancy,
+            sf_copy_bits=self._sf_copy_bits,
         )(
             a_tensor,
             a_source,
@@ -7227,6 +7274,7 @@ def dense_gemm(
             # no activation tensor" is unreachable rather than merely
             # unlikely. That state read the placeholder pointer at 0x10.
             fused_quant=_DENSE_FUSED_QUANT and x_bf16 is not None,
+            sf_copy_bits=_DENSE_SF_COPY_BITS,
         )
         if out is None:
             out = _empty_dense_gemm_output(
