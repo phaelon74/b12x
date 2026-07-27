@@ -49,8 +49,12 @@ _INSTRUCTION_RE = re.compile(
     r"(?P<operands>[^;]*);\s*$",
     re.MULTILINE,
 )
-# BRA, BRA.U, @P0 BRA ... targets are absolute hex in nvdisasm output.
-_BRANCH_TARGET_RE = re.compile(r"\b0x(?P<target>[0-9a-fA-F]+)\b")
+# nvdisasm writes branch targets symbolically - ``@!P0 BRA `(.L_x_12) ;`` - and
+# emits ``.L_x_12:`` on its own line ahead of the target instruction. Absolute
+# hex targets appear only in some builds/flag combinations, so accept both.
+_BRANCH_LABEL_RE = re.compile(r"`\((?P<label>\.L[A-Za-z0-9_$.]+)\)")
+_BRANCH_HEX_RE = re.compile(r"\b0x(?P<target>[0-9a-fA-F]+)\b")
+_LABEL_DEF_RE = re.compile(r"^\s*(?P<label>\.L[A-Za-z0-9_$.]+):", re.MULTILINE)
 
 # Ordered: the first matching category wins, so put narrow patterns first.
 # Category names are the vocabulary the Phase G writeup uses; keep them stable.
@@ -70,9 +74,17 @@ _CATEGORIES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("stg", re.compile(r"^(?:STG|ST|RED|ATOM|ATOMG|ATOMS)$")),
     # Spills. Any nonzero count here is a finding on its own.
     ("local", re.compile(r"^(?:LDL|STL)$")),
+    # Constant-bank reads. Cheap and broadcast, but they are how a kernel
+    # re-reads kernel params it failed to hoist, so keep them visible rather
+    # than folded into int_addr.
+    ("const_load", re.compile(r"^(?:LDC|ULDC)$")),
     # Synchronization. NANOSLEEP is what ncu reports as the `sleeping` stall.
     ("barrier", re.compile(r"^(?:BAR|BARRIER|BSSY|BSYNC|DEPBAR|MEMBAR|ERRBAR"
-                           r"|ARRIVES|ELECT|NANOSLEEP|YIELD)$")),
+                           r"|ARRIVES|ARRIVELDS|ELECT|NANOSLEEP|YIELD|FENCE"
+                           r"|ACQBULK|ENDCOLLECTIVE|CCTL|CCTLL|CCTLT)$")),
+    # Predicate logic. Separate from int_addr because predicate pressure and
+    # address pressure call for different fixes.
+    ("pred", re.compile(r"^(?:PLOP3|UPLOP3|PSETP|UPSETP|P2R|R2P)$")),
     # Scalar float math: the epilogue and any in-kernel scaling.
     ("fp_math", re.compile(r"^(?:FADD|FMUL|FFMA|FSEL|FSETP|FMNMX|MUFU|FCHK"
                            r"|HADD2|HMUL2|HFMA2|HSETP2|HMNMX2|F2F|F2I|I2F"
@@ -83,7 +95,7 @@ _CATEGORIES: tuple[tuple[str, re.Pattern[str]], ...] = (
                             r"|BREV|FLO|POPC|PRMT|SEL|ICMP|IMNMX|VIADD"
                             r"|UIMAD|UIADD3|UISETP|ULOP3|ULEA|USHF|USEL"
                             r"|UPRMT|UFLO|UPOPC)$")),
-    ("move", re.compile(r"^(?:MOV|UMOV|MOV32I|S2R|S2UR|CS2R|R2UR|R2P|P2R"
+    ("move", re.compile(r"^(?:MOV|UMOV|MOV32I|S2R|S2UR|CS2R|R2UR|UR2UP|R2B|B2R"
                         r"|SHFL|VOTE|VOTEU|REDUX|MATCH)$")),
     ("control", re.compile(r"^(?:BRA|BRX|JMP|JMX|CALL|RET|EXIT|NOP|PBK|BPT"
                            r"|SSY|SYNC|WARPSYNC|SETMAXREG|USETMAXREG"
@@ -147,7 +159,42 @@ def _instructions(code: str) -> list[tuple[int, str, str]]:
     return out
 
 
-def _find_loops(instructions: list[tuple[int, str, str]]) -> list[Loop]:
+def _label_offsets(code: str) -> dict[str, int]:
+    """Map each branch label to the offset of the instruction it precedes."""
+    labels: dict[str, int] = {}
+    pending: list[str] = []
+    for line in code.splitlines():
+        label = _LABEL_DEF_RE.match(line)
+        if label is not None:
+            pending.append(label.group("label"))
+            continue
+        instruction = _INSTRUCTION_RE.match(line)
+        if instruction is None or not pending:
+            continue
+        offset = int(instruction.group("offset"), 16)
+        for name in pending:
+            labels[name] = offset
+        pending.clear()
+    return labels
+
+
+def _branch_targets(text: str, labels: dict[str, int]) -> list[int]:
+    """Resolve every branch target in one instruction to an offset."""
+    targets = [
+        labels[match.group("label")]
+        for match in _BRANCH_LABEL_RE.finditer(text)
+        if match.group("label") in labels
+    ]
+    if targets:
+        return targets
+    # Hex fallback. Only consulted when no symbolic target resolved, because an
+    # instruction can carry unrelated hex immediates that would read as targets.
+    return [int(match.group("target"), 16) for match in _BRANCH_HEX_RE.finditer(text)]
+
+
+def _find_loops(
+    instructions: list[tuple[int, str, str]], labels: dict[str, int]
+) -> list[Loop]:
     """Recover loop bodies from backward branches.
 
     A branch whose target is at or before its own offset closes a loop running
@@ -160,7 +207,7 @@ def _find_loops(instructions: list[tuple[int, str, str]]) -> list[Loop]:
     for index, (offset, opcode, text) in enumerate(instructions):
         if opcode not in {"BRA", "BRX", "JMP"}:
             continue
-        targets = [int(m.group("target"), 16) for m in _BRANCH_TARGET_RE.finditer(text)]
+        targets = _branch_targets(text, labels)
         backward = [t for t in targets if t <= offset and t in by_offset]
         if not backward:
             continue
@@ -200,6 +247,45 @@ def _print_census(title: str, counts: Counter, total: int, mma: int) -> None:
         per_mma = f"{counts['other'] / mma:.2f}" if mma else "-"
         print(f"  {'other':<12} {counts['other']:>7} {share:>6.1f}% {per_mma:>9}")
     print(f"  {'TOTAL':<12} {total:>7}")
+
+
+def _print_branches(
+    instructions: list[tuple[int, str, str]], labels: dict[str, int]
+) -> None:
+    """Dump raw branch lines when loop recovery finds nothing.
+
+    Branch-target syntax varies across nvdisasm builds, so a zero-loop result
+    is at least as likely to be a parsing failure as a genuinely branch-free
+    kernel. Print the evidence rather than reporting the whole-kernel census as
+    though it were the mainloop.
+    """
+    branches = [
+        (offset, text)
+        for offset, opcode, text in instructions
+        if opcode in {"BRA", "BRX", "JMP", "CALL", "RET"}
+    ]
+    print(f"  branch instructions: {len(branches)}, resolvable labels: {len(labels)}")
+    for offset, text in branches[:10]:
+        print(f"    /*{offset:04x}*/ {text}")
+    if len(branches) > 10:
+        print(f"    ... {len(branches) - 10} more")
+
+
+def _print_unclassified(body: list[tuple[int, str]]) -> None:
+    """Name every opcode that fell into ``other``.
+
+    An unexplained bucket is not evidence. If a category is large enough to
+    matter it has to be nameable, and the opcode tables here are hand-written
+    and certain to be incomplete for SM120.
+    """
+    unknown = Counter(
+        opcode for _, opcode in body if _categorize(opcode) == "other"
+    )
+    if not unknown:
+        return
+    print("  unclassified opcodes (fix _CATEGORIES if any of these matter):")
+    for opcode, count in unknown.most_common():
+        print(f"    {opcode:<16} {count:>6}")
 
 
 def main() -> int:
@@ -269,7 +355,9 @@ def main() -> int:
             print(f"kernel: {kernel}")
             print(f"instructions: {len(instructions)}")
 
-            loops = _find_loops(instructions)
+            labels = _label_offsets(code)
+            loops = _find_loops(instructions, labels)
+            print(f"labels: {len(labels)}  loops: {len(loops)}")
             if loops:
                 mainloop = max(loops, key=lambda loop: loop.size)
                 counts = _census(mainloop.instructions)
@@ -292,6 +380,7 @@ def main() -> int:
                         f"  WARNING: {counts['local']} local-memory instructions in "
                         "the mainloop - the kernel is spilling."
                     )
+                _print_unclassified(mainloop.instructions)
                 if args.top_opcodes:
                     print(f"\n  top {args.top_opcodes} mainloop opcodes")
                     for opcode, count in _opcode_census(
@@ -299,7 +388,8 @@ def main() -> int:
                     ).most_common(args.top_opcodes):
                         print(f"    {opcode:<16} {count:>6}")
             else:
-                print("\n  no loops found (unrolled kernel?); use --whole-kernel")
+                print("\n  no loops found; censusing the whole kernel instead.")
+                _print_branches(instructions, labels)
 
             if args.whole_kernel or not loops:
                 body = [(offset, opcode) for offset, opcode, _ in instructions]
@@ -307,6 +397,7 @@ def main() -> int:
                 _print_census(
                     "whole kernel", counts, len(body), counts.get("mma", 0)
                 )
+                _print_unclassified(body)
             censused += 1
 
     if censused == 0:
