@@ -120,7 +120,23 @@ def test_fused_quant_matches_unfused(m, n, k, monkeypatch):
 
     monkeypatch.setattr(_dense_mod, "_DENSE_FUSED_QUANT", True)
     monkeypatch.setattr(_wmod, "_DENSE_FUSED_QUANT", True)
+    compiled_before = (
+        _dense_mod._get_compiled_dense_gemm_mxfp6.cache_info().currsize
+    )
     y_fused = dense_fp6_linear(x, fp6w)
+    compiled_after = (
+        _dense_mod._get_compiled_dense_gemm_mxfp6.cache_info().currsize
+    )
+    # Without this the test is vacuous. The fused-quant flag used to be read
+    # from a module global inside the kernel constructor while the compiled
+    # kernel was memoized on arguments that did not include it, so the fused
+    # arm hit the unfused arm's cache entry and this test compared the
+    # unfused path against itself - passing while never once executing the
+    # fused prologue. Assert the fused arm actually resolved a new kernel.
+    assert compiled_after > compiled_before, (
+        "fused arm reused the unfused compiled kernel; the compile cache key "
+        "is blind to the fused-quant flag, so this comparison is vacuous"
+    )
 
     assert y_fused.shape == y_unfused.shape
     assert torch.isfinite(y_fused).all()

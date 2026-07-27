@@ -667,6 +667,7 @@ class DenseGemmKernel:
         mxfp6_fmt_a: Optional[str] = None,
         mxfp6_fmt_b: Optional[str] = None,
         b_packed: bool = False,
+        fused_quant_bf16: Optional[bool] = None,
     ):
         # When set, A/B operands are MX codes carried in Float8E4M3FN
         # byte-containers: the whole kernel runs the MXFP8 smem/TMA/ldmatrix
@@ -713,7 +714,17 @@ class DenseGemmKernel:
             "b_packed expansion assumes tile_k == 128 (SW128 smem atom)"
         )
         self.b_packed = b_packed
-        self.a_bf16_fused = _DENSE_FUSED_QUANT and use_m1_non_tma_a
+        # Read the env only as a fallback. Callers that memoize compiled
+        # kernels MUST pass this explicitly, because it changes codegen: the
+        # fused prologue dereferences x_bf16, and a cache that cannot see the
+        # flag will hand a fused kernel to a caller that passes no activation
+        # tensor. That is a real illegal read at the placeholder pointer, and
+        # the milder failure is worse - two callers silently sharing one
+        # kernel makes a fused-vs-unfused comparison compare a kernel with
+        # itself and pass.
+        if fused_quant_bf16 is None:
+            fused_quant_bf16 = _DENSE_FUSED_QUANT
+        self.a_bf16_fused = bool(fused_quant_bf16) and use_m1_non_tma_a
         if self.a_bf16_fused:
             _fused_fmt = mxfp6_fmt_a or "e4m3"
             self._fused_gs_num = mx_gs_numerator(_fused_fmt)
@@ -4596,6 +4607,7 @@ class _DenseGemmMxfp6Launch(_DenseGemmLaunch):
         a_preexpanded: bool = False,
         b_preexpanded: bool = False,
         row_scale: bool = False,
+        fused_quant: Optional[bool] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -4614,7 +4626,9 @@ class _DenseGemmMxfp6Launch(_DenseGemmLaunch):
         # the generated kernel via DenseGemmKernel.a_bf16_fused.
         self._a_preexpanded = bool(a_preexpanded)
         self._b_preexpanded = bool(b_preexpanded)
-        self._fused_quant_env = _DENSE_FUSED_QUANT
+        self._fused_quant_env = (
+            _DENSE_FUSED_QUANT if fused_quant is None else bool(fused_quant)
+        )
         self._row_scale = bool(row_scale)
 
     def compile_key(self) -> tuple[object, ...]:
@@ -4717,6 +4731,7 @@ class _DenseGemmMxfp6Launch(_DenseGemmLaunch):
             b_packed=self._b_packed,
             target_occupancy=self._target_occupancy,
             row_scale=self._row_scale,
+            fused_quant_bf16=self._fused_quant_env,
         )(
             a_tensor,
             a_tensor,
@@ -4766,6 +4781,7 @@ def _get_compiled_dense_gemm_mxfp6(
     b_preexpanded: bool,
     alpha_is_one: bool,
     row_scale: bool,
+    fused_quant: bool,
 ) -> Callable:
     def _make_runtime_pointers(
         input_tensors: Optional[List[torch.Tensor]],
@@ -4884,6 +4900,7 @@ def _get_compiled_dense_gemm_mxfp6(
         a_preexpanded=a_preexpanded,
         b_preexpanded=b_preexpanded,
         row_scale=row_scale,
+        fused_quant=fused_quant,
         # MX-FP6 does not go through _get_compiled_dense_gemm, so the shared
         # rule has to be called explicitly here; hardcoding a default is what
         # silently kept this family at one CTA per SM. _target_occupancy is part
@@ -7200,6 +7217,16 @@ def dense_gemm(
             b_preexpanded=b_preexpanded,
             alpha_is_one=alpha_is_one,
             row_scale=row_scale is not None,
+            # Part of the key, not read from the module global inside the
+            # kernel: it changes codegen (the fused prologue dereferences
+            # x_bf16), so two callers differing only in this flag must not
+            # share a compiled kernel. Tests monkeypatch the global, which is
+            # exactly the case a global read would alias.
+            #
+            # Conjoined with the tensor being present so that "fused kernel,
+            # no activation tensor" is unreachable rather than merely
+            # unlikely. That state read the placeholder pointer at 0x10.
+            fused_quant=_DENSE_FUSED_QUANT and x_bf16 is not None,
         )
         if out is None:
             out = _empty_dense_gemm_output(
