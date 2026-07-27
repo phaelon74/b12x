@@ -40,6 +40,10 @@ HEADLINE: tuple[tuple[str, str], ...] = (
 )
 
 
+_STALL_PREFIX = "smsp__average_warps_issue_stalled_"
+_STALL_SUFFIX = "_per_issue_active.ratio"
+
+
 def _read(path: pathlib.Path) -> tuple[dict[str, str], list[tuple[str, float]]]:
     """Return (metric -> value, sorted stall reasons)."""
     metrics: dict[str, str] = {}
@@ -89,9 +93,19 @@ def _read(path: pathlib.Path) -> tuple[dict[str, str], list[tuple[str, float]]]:
                 if unit == "Gbyte/s":
                     tb /= 1000.0
                 metrics["Memory Throughput [TB/s]"] = f"{tb:.2f}"
+            # Two spellings reach this file. The WarpStateStats SECTION emits
+            # "Stall Long Scoreboard"; an explicit --metrics request (what
+            # STALLS=1 in ncu_profile_fp6_gemm.sh does, because the section
+            # alone omits them from the details page) emits the raw counter
+            # name. Accept both or STALLS=1 silently produces no stall table.
+            reason = None
             if name.startswith("Stall "):
+                reason = name[6:]
+            elif name.startswith(_STALL_PREFIX) and name.endswith(_STALL_SUFFIX):
+                reason = name[len(_STALL_PREFIX) : -len(_STALL_SUFFIX)]
+            if reason is not None:
                 try:
-                    stalls.append((name[6:], float(value.replace(",", ""))))
+                    stalls.append((reason, float(value.replace(",", ""))))
                 except ValueError:
                     pass
     stalls.sort(key=lambda kv: kv[1], reverse=True)

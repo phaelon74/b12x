@@ -334,6 +334,53 @@ def _quantize_fp8_per_token_kblock(
     return q.contiguous(), scale.contiguous()
 
 
+def _make_torch_scaled_mm_launch(
+    a_q: torch.Tensor,
+    b_q: torch.Tensor,
+    out: torch.Tensor,
+) -> Optional[Callable]:
+    """cuBLASLt FP8 GEMM on the same shape, as a fallback reference arm.
+
+    vLLM's ``cutlass_scaled_mm`` signature and its blockwise-scale support move
+    between nightlies, and when it rejects a call it raises a bare
+    ``AssertionError`` with no message - unusable as an arm we depend on. For
+    "what can this card do at FP8 on this shape" the vendor path answers the
+    question at least as well: per-tensor scales instead of blockwise changes
+    the epilogue, not the MMA rate, and the MMA rate is the comparison we need.
+
+    ``mat2`` must be column-major, which ``b_q`` (N,K contiguous) satisfies as
+    ``.t()`` without a copy.
+    """
+    scaled_mm = getattr(torch, "_scaled_mm", None)
+    if scaled_mm is None:
+        return None
+    b_t = b_q.t()
+    one = torch.ones((), dtype=torch.float32, device=a_q.device)
+
+    def _kw() -> None:
+        out.copy_(
+            scaled_mm(
+                a_q,
+                b_t,
+                scale_a=one,
+                scale_b=one,
+                out_dtype=torch.bfloat16,
+            )
+        )
+
+    def _pos() -> None:
+        out.copy_(scaled_mm(a_q, b_t, one, one, None, None, torch.bfloat16))
+
+    for candidate in (_kw, _pos):
+        try:
+            candidate()
+            torch.cuda.synchronize()
+            return candidate
+        except Exception:
+            continue
+    return None
+
+
 def _run_fp8_cutlass_arm(
     *,
     m: int,
@@ -398,14 +445,29 @@ def _run_fp8_cutlass_arm(
             launch()
             torch.cuda.synchronize()
         except Exception as exc:
-            return ArmResult(
-                name="fp8_cutlass",
-                median_us=float("nan"),
-                min_us=float("nan"),
-                raw_ms=[],
-                cosine=None,
-                skipped=f"cutlass_scaled_mm failed: {type(exc).__name__}: {exc}",
+            fallback = _make_torch_scaled_mm_launch(a_q, b_q, out)
+            if fallback is None:
+                return ArmResult(
+                    name="fp8_cutlass",
+                    median_us=float("nan"),
+                    min_us=float("nan"),
+                    raw_ms=[],
+                    cosine=None,
+                    skipped=(
+                        f"cutlass_scaled_mm failed: {type(exc).__name__}: {exc}"
+                        "; torch._scaled_mm fallback also unavailable"
+                    ),
+                )
+            # Printed, not silent: the arm keeps its name so the ratio summary
+            # still resolves, so the log is the only place recording that these
+            # timings are cuBLASLt and not vLLM's kernel.
+            print(
+                "fp8 arm: cutlass_scaled_mm rejected the call "
+                f"({type(exc).__name__}); using torch._scaled_mm (cuBLASLt) "
+                "with per-tensor scales instead"
             )
+            launch = fallback
+            check = False
 
     replay = capture_graph_replay(launch)
     try:

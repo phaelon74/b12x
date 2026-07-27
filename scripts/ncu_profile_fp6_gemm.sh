@@ -66,7 +66,11 @@ ARM="${ARM:-fp6}"
 # name, and let --launch-count 1 keep the report to a single kernel.
 if [[ "$ARM" == "fp8" ]]; then
   ARM_FLAGS="--no-packed --no-expanded"
-  KERNEL_RE="${KERNEL_RE:-regex:sm120|cutlass|gemm_universal|scaled_mm}"
+  # Broad on purpose: the arm resolves to vLLM's CUTLASS instantiation when
+  # cutlass_scaled_mm accepts the call and to a cuBLASLt kernel (nvjet_/xmma_
+  # families on Blackwell) when it falls back, and neither symbol is stable
+  # across builds. --launch-count 1 keeps the report to one kernel regardless.
+  KERNEL_RE="${KERNEL_RE:-regex:sm120|cutlass|gemm_universal|scaled_mm|nvjet|xmma|gemm}"
 else
   KERNEL_RE="${KERNEL_RE:-regex:DenseGemmKernel}"
 fi
