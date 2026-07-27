@@ -72,15 +72,21 @@ _PERSISTENT_SCRATCH = os.getenv(
 _PER_ROW_IN_KERNEL = os.getenv(
     "SPARKINFER_DENSE_PER_ROW_IN_KERNEL", "1"
 ).lower() not in ("0", "false")
-# SPARKINFER_DENSE_ROW_SCALE_EPILOGUE=1 applies the per-row output correction
-# inside the GEMM epilogue instead of as a trailing ``result.mul_(inv_gs)``.
-# That multiply is one launch per linear (352/step on Behemoth-123B TP=2,
-# 0.63 ms/step measured) whose GPU cost is almost entirely dispatch latency.
-# The epilogue reproduces it bit-for-bit, including the second rounding to
-# bf16. Default OFF until the bit-equality suite has run against the epilogue
-# variant on the serving box; flip the default once that evidence exists.
+# Applies the per-row output correction inside the GEMM epilogue instead of as
+# a trailing ``result.mul_(inv_gs)``. Bit-identical by construction: the
+# epilogue reproduces both roundings to bf16 that the eager multiply performs
+# (see the row_scale application site in _lib/dense_gemm.py).
+#
+# The win is in PREFILL, not decode, which is the opposite of what the decode
+# profile suggested. At m=1 the multiply is 352 launches/step costing 0.63 ms
+# in dispatch latency, but folding it in measured flat (-0.15% to +0.22%). At
+# m=8192 the same multiply is a read-modify-write pass over an (8192, N) bf16
+# tensor per GEMM - roughly 130 GB of HBM traffic per prefill chunk across 88
+# layers - and removing it measured +2.7% to +3.3% prefill on Behemoth-123B
+# TP=2 (2x RTX PRO 6000, LACT active, 3 sweeps per arm, within-arm spread
+# <0.3%; 32k TTFT 16.64 s -> 16.20 s). Set to 0 for A/B.
 _ROW_SCALE_EPILOGUE = os.getenv(
-    "SPARKINFER_DENSE_ROW_SCALE_EPILOGUE", "0"
+    "SPARKINFER_DENSE_ROW_SCALE_EPILOGUE", "1"
 ).lower() not in ("0", "false")
 _QUANT_SCRATCH: dict[tuple, tuple] = {}
 # Phase C decode-churn fix: graph CAPTURE must also reuse buckets. The old
