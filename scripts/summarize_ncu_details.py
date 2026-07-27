@@ -21,7 +21,7 @@ import sys
 
 # (column label, metric name as ncu spells it)
 HEADLINE: tuple[tuple[str, str], ...] = (
-    ("dur_us", "Duration"),
+    ("dur_us", "Duration [us]"),
     ("dram_%", "DRAM Throughput"),
     ("sm_%", "Compute (SM) Throughput"),
     ("mem_TB/s", "Memory Throughput"),
@@ -59,6 +59,28 @@ def _read(path: pathlib.Path) -> tuple[dict[str, str], list[tuple[str, float]]]:
             # column silently blanks out on exactly the regressions we care
             # about most.
             unit = (row.get("Metric Unit") or "").strip()
+            # Same magnitude-dependent unit choice bites Duration: a decode
+            # kernel reports usecond, a prefill kernel at the same shape family
+            # reports msecond, and reading the raw number makes a 6.5 ms GEMM
+            # look like 6.5 us.
+            if name == "Duration":
+                scale = {
+                    "nsecond": 1e-3,
+                    "ns": 1e-3,
+                    "usecond": 1.0,
+                    "us": 1.0,
+                    "msecond": 1e3,
+                    "ms": 1e3,
+                    "second": 1e6,
+                    "s": 1e6,
+                }.get(unit)
+                if scale is not None:
+                    try:
+                        metrics["Duration [us]"] = (
+                            f"{float(value.replace(',', '')) * scale:.2f}"
+                        )
+                    except ValueError:
+                        pass
             if name == "Memory Throughput" and unit in ("Tbyte/s", "Gbyte/s"):
                 try:
                     tb = float(value.replace(",", ""))
