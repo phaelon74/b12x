@@ -7,7 +7,8 @@ an FP6 quant). Kernel-level format details: `mxfp6-w6a8.md`; vLLM wiring:
 
 **Test hardware:** 1-2x NVIDIA RTX PRO 6000 (Blackwell, sm_120, 96 GiB).
 **Models:** `Qwen3.6-27B` (dense hybrid, 64 layers) and `Qwen3.6-35B-A3B`
-(MoE hybrid, 256 experts / top-8, ~3B active).
+(MoE hybrid, 256 experts / top-8, ~3B active). Section 3.5 adds
+`Behemoth-R1-123B-v2` (dense, 88 layers) as a large-model data point.
 
 ---
 
@@ -132,7 +133,43 @@ KV-attention cost, not quantization overhead.
 | 16k | 128.62 | 5.51 | 21.40 | 585 | 3.91 |
 | 32k | 91.10  | 7.11 | 28.33 | 997 | 4.00 |
 
-### 3.5 Reading the matrix
+### 3.5 Behemoth-R1-123B-v2 dense, TP=2 — context sweep (Jul 28)
+
+A second, much larger dense model on 2x RTX PRO 6000. Measured with
+`bench-32k-sweep.sh`, `--max-num-seqs 2`, `max-num-batched-tokens 8192`,
+`cudagraph_mode=full_decode_only`, `custom_ops=["+rms_norm","+silu_and_mul"]`,
+and `--disable-custom-all-reduce` (forced: vLLM's custom all-reduce crashes
+during graph capture on sm_120 at TP>1). Three consecutive passes; the
+run-to-run spread is +/-0.03 tok/s on decode.
+
+| Input ctx | TTFT (ms) | True prefill (tok/s) | Decode (tok/s) |
+|---|---|---|---|
+| 1k  | 486.6   | 2104 | 26.80 |
+| 4k  | 1687.2  | 2428 | 26.60 |
+| 8k  | 3373.2  | 2429 | 26.25 |
+| 16k | 7183.6  | 2281 | 25.53 |
+| 32k | 16190.2 | 2024 | 24.24 |
+
+### 3.6 Behemoth decode is at the weight-streaming DRAM roofline
+
+At 123B parameters the FP6 checkpoint is ~91 GiB, or ~46 GiB per GPU after
+the TP=2 shard, and single-stream decode reads essentially all of it per
+token. 46 GiB at 26.8 tok/s requires **1.32 TB/s** sustained; Nsight Compute
+measures 1.07-1.38 TB/s achieved on the four decode GEMM shards. Decode is
+therefore bandwidth-bound, not latency-bound, on models of this size.
+
+The practical consequence is that decode GEMM latency work has a poor
+conversion rate here. The shape-dependent 3-stage decode policy cut isolated
+decode GEMM time 6.1% (455.9 -> 427.9 us across the four shards) and returned
++1.9% end to end; what it actually bought was achieved bandwidth (DRAM
+throughput 59-71% -> 64-75%), not the latency it removed. Optimizations that
+do not either reduce bytes moved or raise achieved bandwidth should not be
+expected to move decode on a model this large.
+
+Note this is a size effect, not an FP6 property: the Qwen3.6-27B sweeps above
+are far from this wall, which is why occupancy and pipeline work paid there.
+
+### 3.7 Reading the matrix
 
 * **Dense TP=2 helps decode latency:** TPOT 9.80 -> 7.49 ms at ctx-1k
   (~24% faster per token) — the 27B GEMMs are large enough that splitting
