@@ -872,7 +872,11 @@ class DenseGemmKernel:
         # and shared-memory layouts.
         self.direct_sfa_prefix = direct_sfa_live16 and self.direct_sfb_representative
         mma_atom_mn = (self.mma_tile_shape_mnk[0], self.mma_tile_shape_mnk[1])
-        if mma_atom_mn in ((16, 64), (16, 128)):
+        if mma_atom_mn in ((16, 32), (16, 64), (16, 128)):
+            # (16,32) keeps the 2-warp N split, so num_n_tiles drops to 2
+            # rather than the warp count changing. Falling through to the
+            # (4,2,1) default would ask for 8 warps to cover 32 columns and
+            # silently build a kernel whose N range exceeds the tile.
             self.atom_shape = (1, 2, 1)
         elif mma_atom_mn in ((32, 64), (32, 128)):
             self.atom_shape = (2, 2, 1)
@@ -4352,7 +4356,19 @@ class DenseGemmKernel:
         # consume only 16/32 columns.
         mma_check_mn = (mma_tiler_mn[1], mma_tiler_mn[0]) if swap_ab else mma_tiler_mn
         if ab_dtype == cutlass.Float8E4M3FN or is_mxfp6_ab_dtype(ab_dtype):
-            if mma_check_mn not in ((16, 64), (16, 128), (32, 64), (32, 128)):
+            # (16,32) exists for decode bandwidth, not for arithmetic: it
+            # doubles the CTA count on the N-narrow shards so two blocks are
+            # actually resident per SM, which is what raises bytes in flight.
+            # It costs SF smem efficiency - sm120_make_smem_layout_sfb rounds
+            # any tile up to a full 128-column SF block - so it is worth it
+            # only where the extra CTAs are the binding constraint.
+            if mma_check_mn not in (
+                (16, 32),
+                (16, 64),
+                (16, 128),
+                (32, 64),
+                (32, 128),
+            ):
                 if mma_check_mn[0] % 64 != 0 or mma_check_mn[1] % 64 != 0:
                     return False
         elif ab_dtype == cutlass.Float4E2M1FN:
