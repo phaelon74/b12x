@@ -211,3 +211,35 @@ def test_row_scale_epilogue_bit_exact(m, monkeypatch):
     monkeypatch.setattr(fdw, "_ROW_SCALE_EPILOGUE", True)
     y_epilogue = fdw.dense_fp6_linear(x, w)
     torch.testing.assert_close(y_epilogue, y_eager, rtol=0.0, atol=0.0)
+
+
+@cuda_required
+def test_fused_quant_preserves_per_row_scaling(monkeypatch):
+    """The fused prologue must never disable per-row activation scaling.
+
+    The fused m=1 prologue derives ONE per-tensor global scale in the kernel,
+    so it is only equivalent to the per-row recipe when there is a single row.
+    Gating it at ``m <= _SMALL_M_QUANT_MAX`` instead of ``m == 1`` silently
+    downgraded 2 <= m <= 16 to per-tensor, which restores the
+    batch-composition dependence per-row scaling exists to remove: the same
+    row then produces different logits depending on which other rows share
+    its launch. Rows are independent, so y(x[:m])[i] must equal y(x)[i]
+    bit-for-bit no matter how the flag is set.
+    """
+    from sparkinfer.quantization.mxfp6 import fp6_dense_weights as fdw
+
+    monkeypatch.setattr(fdw, "_DENSE_FUSED_QUANT", True)
+
+    torch.manual_seed(7)
+    w = fdw.quantize_dense_weight_to_fp6(
+        torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+    )
+    x = torch.randn(128, w.in_features, dtype=torch.bfloat16, device="cuda")
+    x[0, 0] = 8.0  # amax in row 0, as the sibling row-independence tests do
+
+    y_full = fdw.dense_fp6_linear(x, w).clone()
+    for m in (1, 2, 4, 5, 16):
+        y_small = fdw.dense_fp6_linear(x[:m], w)
+        torch.testing.assert_close(
+            y_small, y_full[:m], rtol=0.0, atol=0.0, msg=f"m={m} diverged"
+        )

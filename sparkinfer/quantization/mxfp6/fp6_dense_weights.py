@@ -631,7 +631,13 @@ def dense_fp6_linear_expanded(
     a_fmt = act_fmt if act_fmt is not None else fmt
 
     m_pad = ((m + _TILE - 1) // _TILE) * _TILE
-    _fused_quant = _DENSE_FUSED_QUANT and m <= _SMALL_M_QUANT_MAX
+    # m == 1, NOT m <= _SMALL_M_QUANT_MAX. The fused prologue derives a single
+    # per-tensor global scale in-kernel, and the ``_per_row`` guard below keeps
+    # per-row scaling only at m == 1. Gating this at 16 therefore downgraded
+    # every 2 <= m <= 16 call from per-row to per-tensor, silently restoring the
+    # batch-composition dependence the per-row recipe exists to remove (see the
+    # comment below) and breaking row-independence against the m=128 rows.
+    _fused_quant = _DENSE_FUSED_QUANT and m == 1
     device = x.device
 
     # ---- Per-row activation global scale (unfused paths) ----
