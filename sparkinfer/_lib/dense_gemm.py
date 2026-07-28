@@ -195,6 +195,21 @@ _SPARKINFER_DENSE_TILE_SWIZZLE = int(
 # per-stage B bytes vs (128,128), so its smem budget likely allows a deeper
 # pipeline than the default cap of 4.
 _SPARKINFER_DENSE_AB_STAGES = int(os.getenv("SPARKINFER_DENSE_AB_STAGES", "0"))
+# Cap the decode-regime pipeline at 3 stages when two CTAs share the SM's smem.
+# Measured on Behemoth TP=2 (2x RTX PRO 6000, ncu, M=1, four shards): at
+# occupancy 2 the CTA gets half the budget, and the fourth stage buys less than
+# it costs - gate_up 213.9->204.3 us, down 117.1->110.1, o 53.2->49.1, with DRAM
+# throughput rising 71->75%, 66->70% and 61->66%. qkv is the control: it runs at
+# occupancy 1, keeps the whole budget, and REGRESSED 63.7->65.6 us at 3 stages,
+# which is why this is gated on occupancy rather than applied to all of decode.
+# Two stages was tried and is worse everywhere (+11% total, qkv +59%): it does
+# reach 3 CTAs/SM, but achieved occupancy never moves because the decode grids
+# are too small to fill the slots, so it only shortens the pipeline.
+# Numerics-neutral - stage depth is producer lookahead, not accumulation order.
+# Set SPARKINFER_DENSE_DECODE_STAGE3=0 to restore the flat cap for A/B.
+_DENSE_DECODE_STAGE3 = os.getenv(
+    "SPARKINFER_DENSE_DECODE_STAGE3", "1"
+).lower() not in ("0", "false")
 # SPARKINFER_DENSE_TARGET_OCCUPANCY=N (default 0 = keep the built-in rule)
 # forces the CTAs-per-SM target. Also numerics-neutral: it changes how many
 # output tiles are resident at once and, through the smem split in
@@ -4130,6 +4145,12 @@ class DenseGemmKernel:
             # In-place packed staging freed 12 KB/stage; deeper pipelines give
             # the producer the lookahead the packed consumer chain needs.
             ab_stage = max(1, min(raw_ab_stage, 5))
+        if _DENSE_DECODE_STAGE3 and occupancy >= 2 and tile_shape_mnk[0] <= 16:
+            # See _DENSE_DECODE_STAGE3: only the shapes that share an SM pay
+            # more for the fourth stage than it returns. Deliberately AFTER the
+            # b_packed bump, which would otherwise reinstate a deeper pipeline
+            # on exactly the packed decode shards this measured faster at 3.
+            ab_stage = max(1, min(raw_ab_stage, 3))
         if _SPARKINFER_DENSE_AB_STAGES:
             ab_stage = max(1, min(raw_ab_stage, _SPARKINFER_DENSE_AB_STAGES))
         return ab_stage, epi_stage
