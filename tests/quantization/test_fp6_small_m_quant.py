@@ -225,10 +225,22 @@ def test_fused_quant_preserves_per_row_scaling(monkeypatch):
     row then produces different logits depending on which other rows share
     its launch. Rows are independent, so y(x[:m])[i] must equal y(x)[i]
     bit-for-bit no matter how the flag is set.
+
+    m=1 is deliberately excluded. There the prologue legitimately DOES engage,
+    and its exactness against the m=128 rows rests on the bf16 pre-scale
+    landing the row amax exactly on mx_gs_numerator so the in-kernel gs
+    collapses to exactly 1.0. That holds for some inputs and not others, so
+    asserting it here would make this guard seed-dependent. m=1 exactness is
+    covered by test_small_m_linear_end_to_end_bit_exact; this test owns the
+    m>1 inertness contract.
     """
+    import sparkinfer._lib.dense_gemm as _dense_mod
     from sparkinfer.quantization.mxfp6 import fp6_dense_weights as fdw
 
+    # BOTH globals. The kernel reads the dense_gemm one; patching only the
+    # weights module leaves the prologue off and the test passes vacuously.
     monkeypatch.setattr(fdw, "_DENSE_FUSED_QUANT", True)
+    monkeypatch.setattr(_dense_mod, "_DENSE_FUSED_QUANT", True)
 
     torch.manual_seed(7)
     w = fdw.quantize_dense_weight_to_fp6(
@@ -238,7 +250,7 @@ def test_fused_quant_preserves_per_row_scaling(monkeypatch):
     x[0, 0] = 8.0  # amax in row 0, as the sibling row-independence tests do
 
     y_full = fdw.dense_fp6_linear(x, w).clone()
-    for m in (1, 2, 4, 5, 16):
+    for m in (2, 4, 5, 16):
         y_small = fdw.dense_fp6_linear(x[:m], w)
         torch.testing.assert_close(
             y_small, y_full[:m], rtol=0.0, atol=0.0, msg=f"m={m} diverged"
