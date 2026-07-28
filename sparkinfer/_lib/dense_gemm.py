@@ -873,10 +873,11 @@ class DenseGemmKernel:
         self.direct_sfa_prefix = direct_sfa_live16 and self.direct_sfb_representative
         mma_atom_mn = (self.mma_tile_shape_mnk[0], self.mma_tile_shape_mnk[1])
         if mma_atom_mn in ((16, 32), (16, 64), (16, 128)):
-            # (16,32) keeps the 2-warp N split, so num_n_tiles drops to 2
-            # rather than the warp count changing. Falling through to the
-            # (4,2,1) default would ask for 8 warps to cover 32 columns and
-            # silently build a kernel whose N range exceeds the tile.
+            # This table sets the MMA atom tiling only. The warp count is a
+            # SEPARATE table below and both must list the same tiles: an atom
+            # shape covering two warps of work under a launch geometry sized
+            # for eight leaves warps 2-7 with no valid tile, reading shared
+            # memory past the end of the staged operands.
             self.atom_shape = (1, 2, 1)
         elif mma_atom_mn in ((32, 64), (32, 128)):
             self.atom_shape = (2, 2, 1)
@@ -890,7 +891,7 @@ class DenseGemmKernel:
         # Strategy for the shared->register scale-factor copy. See
         # ``_copy_sf_fragment``. "off" keeps one access per UE8M0 byte.
         self.sf_copy_mode = sf_copy_mode
-        if mma_atom_mn in ((16, 64), (16, 128)):
+        if mma_atom_mn in ((16, 32), (16, 64), (16, 128)):
             self.num_mma_warps = 2
         elif mma_atom_mn in ((32, 64), (32, 128)):
             self.num_mma_warps = 4
@@ -4383,15 +4384,13 @@ class DenseGemmKernel:
         # consume only 16/32 columns.
         mma_check_mn = (mma_tiler_mn[1], mma_tiler_mn[0]) if swap_ab else mma_tiler_mn
         if ab_dtype == cutlass.Float8E4M3FN or is_mxfp6_ab_dtype(ab_dtype):
-            # (16,32) is KNOWN BROKEN and no policy selects it; it is reachable
-            # only by setting SPARKINFER_FP6_DECODE_TILE=16x32 by hand. It was
-            # meant to double the CTA count on the N-narrow decode shards so two
-            # blocks are genuinely resident per SM. It now compiles - see
-            # _partition_fragment_SFB_sub_tile - but faults with an illegal
-            # access at runtime somewhere further down the 32-column path
-            # (packed-B TMA, the SF global->smem coordinate, or the epilogue
-            # store; not yet narrowed). Split-K reaches the same CTA counts
-            # through an already-exercised path and is the supported route.
+            # (16,32) exists for decode bandwidth, not arithmetic: it doubles
+            # the CTA count on the N-narrow shards so two blocks are actually
+            # resident per SM, which is what raises bytes in flight. It costs SF
+            # smem efficiency - sm120_make_smem_layout_sfb rounds any tile up to
+            # a full 128-column SF block - so it is worth it only where the
+            # extra CTAs are the binding constraint. No policy selects it yet;
+            # it is reachable via SPARKINFER_FP6_DECODE_TILE=16x32.
             if mma_check_mn not in (
                 (16, 32),
                 (16, 64),
