@@ -1380,17 +1380,17 @@ class DenseGemmKernel:
     def _repair_sfb_fragment_rank(self, frag, tiled_mma):
         """Restore the degenerate n_rest mode dropped at tile_n == perm_n.
 
-        See _DENSE_SFB_RANK_FIX. Layout-only: the fragment is register storage
-        allocated by make_fragment_like, so re-expressing its shape moves no
-        data and changes no arithmetic. Returns frag untouched unless the rank
-        actually collapsed, so wider tiles are unaffected.
+        See _DENSE_SFB_RANK_FIX.         Layout-only: the fragment is uninitialized register storage, so
+        re-expressing its shape moves no data and changes no arithmetic.
+        Returns frag untouched unless the rank actually collapsed, so wider
+        tiles are unaffected.
         """
         if cutlass.const_expr(_DENSE_SFB_RANK_FIX == "off"):
             return frag
         if cutlass.const_expr(cute.rank(frag.layout) != 2):
             return frag
         if cutlass.const_expr(_DENSE_SFB_RANK_FIX == "append"):
-            return cute.make_fragment(
+            return cute.make_rmem_tensor(
                 cute.append(frag.layout, cute.make_layout(1, stride=0)),
                 self.sf_dtype,
             )
@@ -1403,7 +1403,7 @@ class DenseGemmKernel:
                 tiled_mma.permutation_mnk[1]
             )
             val_n = 2
-            return cute.make_fragment(
+            return cute.make_rmem_tensor(
                 cute.make_layout(
                     ((32, 1), (val_n, n_rest), k_rest),
                     stride=((0, 0), (k_rest * n_rest, k_rest), 1),
