@@ -164,9 +164,14 @@ _DENSE_DEBUG_SF_LAYOUT = os.getenv("SPARKINFER_DEBUG_SF_LAYOUT", "0") == "1"
 # the value mode. SFA hits the same single-group case at M=16 and keeps its
 # degenerate mode - ((32,1),1,4) - which is why the A side has always worked.
 #   "off"    - no repair (reproduces the abort)
-#   "append" - tack a size-1 mode on the end; cheapest, only correct if retile
-#              cares about rank and not about which mode is degenerate
-#   "split"  - rebuild ((32,1),(val_n,n_rest),k_rest), matching the N=64 form
+#   "append" - tack a size-1 mode on the end; compiles, then IMAs
+#   "split"  - rebuild ((32,1),(val_n,n_rest),k_rest); compiles, then IMAs
+# Both of the above patch only the register side, so partition_S still derives
+# the smem source view from the collapsed tile and the two ends of the copy
+# disagree - hence the illegal access rather than a compile failure.
+#   "input"  - re-split the N mode of sSFB_tile itself, so the smem view and
+#              the fragment are both derived from the same hierarchy the
+#              working 64-wide tile has. Fixes the cause, not one symptom.
 _DENSE_SFB_RANK_FIX = os.getenv("SPARKINFER_SFB_RANK_FIX", "off").lower()
 
 
@@ -1377,6 +1382,24 @@ class DenseGemmKernel:
         else:
             cute.copy(tiled_copy, src, dst)
 
+    def _repair_sfb_smem_tile(self, sfb_tile, tiled_mma):
+        """Re-split a collapsed N mode so smem view and fragment agree.
+
+        At tile_n == perm_n the local_tile above yields a flat N mode (32:16)
+        where a wider tile yields ((32,2):(16,4)). logical_divide by perm_n
+        restores the (perm_n, n_rest) nesting with n_rest=1, which is the shape
+        every downstream partition already knows how to handle. Wider tiles are
+        already nested, so this is a no-op for them.
+        """
+        if cutlass.const_expr(_DENSE_SFB_RANK_FIX != "input"):
+            return sfb_tile
+        if cutlass.const_expr(cute.rank(sfb_tile.layout[0]) != 1):
+            return sfb_tile
+        perm_n = cute.size(tiled_mma.permutation_mnk[1])
+        return cute.logical_divide(
+            sfb_tile, (cute.make_layout(perm_n), None, None)
+        )
+
     def _repair_sfb_fragment_rank(self, frag, tiled_mma):
         """Restore the degenerate n_rest mode dropped at tile_n == perm_n.
 
@@ -1385,7 +1408,9 @@ class DenseGemmKernel:
         Returns frag untouched unless the rank actually collapsed, so wider
         tiles are unaffected.
         """
-        if cutlass.const_expr(_DENSE_SFB_RANK_FIX == "off"):
+        if cutlass.const_expr(_DENSE_SFB_RANK_FIX in ("off", "input")):
+            # "input" repairs the smem tile upstream, so the fragment should
+            # already come back rank 3; leave it alone either way.
             return frag
         if cutlass.const_expr(cute.rank(frag.layout) != 2):
             return frag
@@ -2184,6 +2209,9 @@ class DenseGemmKernel:
                             sSFB,
                             cute.slice_(self.tile_shape_mnk, (0, None, None)),
                             (sfb_tile_offset, 0, None),
+                        )
+                        sSFB_tile = self._repair_sfb_smem_tile(
+                            sSFB_tile, tiled_mma
                         )
                         tCsSFB_tile_copy_view = thr_copy_ldmatrix_SFB.partition_S(
                             sSFB_tile
