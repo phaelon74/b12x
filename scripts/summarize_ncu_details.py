@@ -43,6 +43,44 @@ HEADLINE: tuple[tuple[str, str], ...] = (
 _STALL_PREFIX = "smsp__average_warps_issue_stalled_"
 _STALL_SUFFIX = "_per_issue_active.ratio"
 
+# (N, K) per Behemoth TP=2 shard, mirroring SHAPE_N/SHAPE_K in
+# scripts/ncu_profile_fp6_gemm.sh. Used only to turn a BYTES=1 capture into a
+# read-amplification ratio, which needs the shard's value count.
+_SHARD_NK: dict[str, tuple[int, int]] = {
+    "qkv": (7168, 12288),
+    "o": (12288, 6144),
+    "gate_up": (28672, 12288),
+    "down": (12288, 14336),
+}
+
+
+def _weight_bytes(report_name: str) -> tuple[str, float] | None:
+    """Theoretical DRAM bytes for one pass over a shard's weights.
+
+    Report names look like ``decode_fp6_gate_up_m1``. Returns (arm, bytes) or
+    None when the name does not identify a known shard/arm, in which case the
+    amplification column is left blank rather than guessed.
+    """
+    stem = report_name
+    # Longest first: "o" is a substring of nothing here, but keeping the order
+    # explicit avoids a future shard name shadowing another.
+    shard = next(
+        (s for s in sorted(_SHARD_NK, key=len, reverse=True) if f"_{s}_" in stem),
+        None,
+    )
+    if shard is None:
+        return None
+    n, k = _SHARD_NK[shard]
+    values = float(n) * float(k)
+    if "_fp8_" in stem:
+        # FP8 block-scaled: 1 byte per value plus a per-128x128-block scale,
+        # which rounds to nothing at these sizes but is included for honesty.
+        return "fp8", values + values / (128.0 * 128.0) * 4.0
+    if "_fp6_" in stem:
+        # Packed MX-FP6: 6 bits per value plus one UE8M0 byte per 32 values.
+        return "fp6", values * 6.0 / 8.0 + values / 32.0
+    return None
+
 
 def _read(path: pathlib.Path) -> tuple[dict[str, str], list[tuple[str, float]]]:
     """Return (metric -> value, sorted stall reasons)."""
@@ -112,6 +150,36 @@ def _read(path: pathlib.Path) -> tuple[dict[str, str], list[tuple[str, float]]]:
     return metrics, stalls
 
 
+def _print_bytes(files: list[pathlib.Path]) -> None:
+    """Read-amplification table, printed only for BYTES=1 captures."""
+    rows: list[tuple[str, float, float, float, str]] = []
+    for f in files:
+        metrics, _ = _read(f)
+        raw = metrics.get("dram__bytes_read.sum")
+        if raw is None:
+            continue
+        name = f.name.replace(".details.csv", "")
+        expected = _weight_bytes(name)
+        if expected is None:
+            continue
+        try:
+            actual = float(raw.replace(",", ""))
+        except ValueError:
+            continue
+        _, want = expected
+        hit = metrics.get("lts__t_sector_hit_rate.pct", "-")
+        rows.append((name, actual / 1e6, want / 1e6, actual / want, hit))
+    if not rows:
+        return
+    width = max(len(r[0]) for r in rows)
+    print(f"\n{'report':{width}s} {'read_MB':>10s} {'weight_MB':>10s} "
+          f"{'amplif':>8s} {'L2_sect_hit_%':>14s}")
+    for name, got, want, ratio, hit in rows:
+        print(f"{name:{width}s} {got:10.1f} {want:10.1f} {ratio:8.3f} {hit:>14s}")
+    print("\namplif = DRAM bytes read / bytes the shard's packed weights occupy.")
+    print("1.00 means the layout is clean and the roofline is the hardware.")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("paths", nargs="+")
@@ -141,6 +209,8 @@ def main() -> None:
             cells.append(f"{metrics.get(key, '-'):>10s}")
         print(f"{f.name.replace('.details.csv', ''):{width}s} " + " ".join(cells))
         all_stalls.append((f.name.replace(".details.csv", ""), stalls))
+
+    _print_bytes(files)
 
     for name, stalls in all_stalls:
         if not stalls:

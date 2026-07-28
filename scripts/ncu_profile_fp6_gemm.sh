@@ -8,12 +8,19 @@
 # the same policy selection, and runs one shape at a time, so the report holds
 # the kernel under test instead of 1977 kernels per decode step.
 #
-# What we are chasing (measured in D1): the FP6 decode kernel moves 1.51 TB/s on
-# a 1.792 TB/s card (84%), while DeepGEMM's SM120 FP8 kernel reaches 1.72 TB/s
-# (96%) and then hands the difference back in a separate split-K reduce. At
-# decode, M=1, so these GEMMs are pure weight streaming: DRAM throughput is the
-# metric that matters and everything else is a candidate explanation for why it
-# falls short.
+# What we are chasing. At decode M=1, so these GEMMs are pure weight streaming
+# and DRAM throughput is the only metric that decides them. Measured Jul 28 on
+# the current build: 1.07-1.38 TB/s on a 1.792 TB/s card (60-77%). Serving
+# corroborates it - Behemoth needs 1.32 TB/s to hold its measured 26.8 tok/s, so
+# decode is pinned to this roofline and latency work does not move it.
+#
+# The open question is where the missing bandwidth goes. FP6 moves 33% fewer
+# weight bytes per token than FP8 yet decodes only 5-7% faster, which implies
+# FP8 sustains ~1.55 TB/s where FP6 gets ~1.30. BYTES=1 measures whether the
+# 6-bit packed layout reads more DRAM than its values require.
+#
+# An earlier header here claimed 1.51 TB/s / 84% for FP6 and 1.72 TB/s for the
+# FP8 arm. Those did not reproduce; treat the numbers above as current.
 #
 # Usage:
 #   ./scripts/ncu_profile_fp6_gemm.sh                 # decode sweep, all 4 shards
@@ -98,6 +105,11 @@ SECTIONS=(
   --section SchedulerStats
 )
 
+# ncu takes one --metrics list; a second occurrence replaces the first rather
+# than adding to it, so STALLS=1 BYTES=1 together would silently drop the stall
+# counters. Accumulate here and append once.
+_EXTRA_METRICS=""
+
 # STALLS=1 adds the per-reason warp stall counters. The WarpStateStats section
 # alone does not put them in the details CSV, and they are what distinguishes
 # "waiting on DRAM" (long_scoreboard) from "waiting on the pipeline"
@@ -109,11 +121,36 @@ if [[ "${STALLS:-0}" == "1" ]]; then
     lg_throttle tex_throttle imc_miss no_instruction wait drain
     dispatch_stall not_selected selected sleeping misc
   )
-  _metrics=""
   for r in "${_stall_reasons[@]}"; do
-    _metrics+="smsp__average_warps_issue_stalled_${r}_per_issue_active.ratio,"
+    _EXTRA_METRICS+="smsp__average_warps_issue_stalled_${r}_per_issue_active.ratio,"
   done
-  SECTIONS+=(--metrics "${_metrics%,}")
+fi
+
+# BYTES=1 adds the DRAM/L2/sector counters needed to compute read amplification:
+# actual bytes fetched divided by the bytes the shard's packed weights occupy.
+# The percentage throughput metrics cannot answer this - a kernel reading 30%
+# waste at 75% of peak and one reading nothing spare at 75% of peak are
+# indistinguishable there, and the two call for opposite fixes. Sector counts
+# come along because partial-sector reads are the expected failure mode for a
+# 6-bit layout, whose natural granularity divides neither the 32-byte sector nor
+# the 16-byte vector load.
+if [[ "${BYTES:-0}" == "1" ]]; then
+  _byte_metrics=(
+    dram__bytes_read.sum
+    dram__bytes_write.sum
+    dram__sectors_read.sum
+    lts__t_sectors_srcunit_tex_op_read.sum
+    lts__t_sector_hit_rate.pct
+    l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum
+    l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum
+  )
+  for m in "${_byte_metrics[@]}"; do
+    _EXTRA_METRICS+="${m},"
+  done
+fi
+
+if [[ -n "$_EXTRA_METRICS" ]]; then
+  SECTIONS+=(--metrics "${_EXTRA_METRICS%,}")
 fi
 
 for shape in $SHAPES; do
