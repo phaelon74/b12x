@@ -169,9 +169,15 @@ _DENSE_DEBUG_SF_LAYOUT = os.getenv("SPARKINFER_DEBUG_SF_LAYOUT", "0") == "1"
 # Both of the above patch only the register side, so partition_S still derives
 # the smem source view from the collapsed tile and the two ends of the copy
 # disagree - hence the illegal access rather than a compile failure.
-#   "input"  - re-split the N mode of sSFB_tile itself, so the smem view and
-#              the fragment are both derived from the same hierarchy the
-#              working 64-wide tile has. Fixes the cause, not one symptom.
+#   "input"  - re-split the N mode of sSFB_tile itself. Verified to produce
+#              ((32,1),(32,4),5) as intended, but the fragment STILL comes back
+#              rank 2, which localizes the collapse to upstream's
+#              partition_fragment_SFB rather than to the tensor we hand it.
+#   "derive" - our own partition_fragment_SFB. Identical to upstream except the
+#              second group_modes is applied only when there are enough modes
+#              to merge; with n_rest=1 that call otherwise eats the k mode.
+#              Layout math, not hand-written strides.
+#   "derive+input" - both.
 _DENSE_SFB_RANK_FIX = os.getenv("SPARKINFER_SFB_RANK_FIX", "off").lower()
 
 
@@ -1382,6 +1388,26 @@ class DenseGemmKernel:
         else:
             cute.copy(tiled_copy, src, dst)
 
+    def _partition_fragment_SFB_rank_safe(self, sfb_tensor, thr_mma, tidx):
+        """partition_fragment_SFB with the n_rest=1 mode collapse fixed.
+
+        Mirrors cutlass.utils.blackwell_helpers.partition_fragment_SFB. The
+        only change is that the second group_modes runs only when the layout
+        still has the mode it is meant to merge; upstream applies it
+        unconditionally, so a tile whose N spans exactly one perm_n group
+        (tile_n == 32) has its k mode folded into the value mode and comes out
+        rank 2, which tiled_copy_retile cannot consume.
+        """
+        thrfrg = sm120_utils.thrfrg_SFB(sfb_tensor.layout, thr_mma)
+        thr_tensor = cute.make_tensor(sfb_tensor.iterator, thrfrg)
+        thr_vmnk = thr_mma.thr_layout_vmnk.get_flat_coord(tidx)
+        thr_vnk = (thr_vmnk[0], (thr_vmnk[2], thr_vmnk[3]))
+        partitioned = thr_tensor[thr_vnk, (None, None)]
+        partitioned = cute.group_modes(cute.flatten(partitioned), 0, 2)
+        if cutlass.const_expr(cute.rank(partitioned) > 3):
+            partitioned = cute.group_modes(partitioned, 1, 3)
+        return cute.make_fragment_like(partitioned)
+
     def _repair_sfb_smem_tile(self, sfb_tile, tiled_mma):
         """Re-split a collapsed N mode so smem view and fragment agree.
 
@@ -1391,7 +1417,7 @@ class DenseGemmKernel:
         every downstream partition already knows how to handle. Wider tiles are
         already nested, so this is a no-op for them.
         """
-        if cutlass.const_expr(_DENSE_SFB_RANK_FIX != "input"):
+        if cutlass.const_expr("input" not in _DENSE_SFB_RANK_FIX):
             return sfb_tile
         if cutlass.const_expr(cute.rank(sfb_tile.layout[0]) != 1):
             return sfb_tile
@@ -1408,9 +1434,13 @@ class DenseGemmKernel:
         Returns frag untouched unless the rank actually collapsed, so wider
         tiles are unaffected.
         """
-        if cutlass.const_expr(_DENSE_SFB_RANK_FIX in ("off", "input")):
-            # "input" repairs the smem tile upstream, so the fragment should
-            # already come back rank 3; leave it alone either way.
+        if cutlass.const_expr(
+            _DENSE_SFB_RANK_FIX == "off" or "input" in _DENSE_SFB_RANK_FIX
+        ):
+            # "input" and "derive" repair the shape upstream of here; the
+            # hand-built variants below are only for the standalone A/B.
+            return frag
+        if cutlass.const_expr("derive" in _DENSE_SFB_RANK_FIX):
             return frag
         if cutlass.const_expr(cute.rank(frag.layout) != 2):
             return frag
@@ -2216,9 +2246,14 @@ class DenseGemmKernel:
                         tCsSFB_tile_copy_view = thr_copy_ldmatrix_SFB.partition_S(
                             sSFB_tile
                         )
-                        tCrSFB_tile = self._partition_fragment_SFB(
-                            sSFB_tile[None, None, 0], thr_mma, tidx
-                        )
+                        if cutlass.const_expr("derive" in _DENSE_SFB_RANK_FIX):
+                            tCrSFB_tile = self._partition_fragment_SFB_rank_safe(
+                                sSFB_tile[None, None, 0], thr_mma, tidx
+                            )
+                        else:
+                            tCrSFB_tile = self._partition_fragment_SFB(
+                                sSFB_tile[None, None, 0], thr_mma, tidx
+                            )
                         # This is the abort site at tile N=32. Everything above
                         # prints; if the next line is the last thing in the log,
                         # retile is what rejected tCrSFB_tile.
