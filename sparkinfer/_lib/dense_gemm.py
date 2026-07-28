@@ -191,10 +191,52 @@ _SPARKINFER_DENSE_TILE_SWIZZLE = int(
 )
 # SPARKINFER_DENSE_AB_STAGES=N (default 0 = keep the measured caps) overrides
 # the mainloop stage cap. Always clamped by the smem-derived raw_ab_stage, so
-# an over-large N cannot exceed the smem budget. The (128,64) tile halves the
-# per-stage B bytes vs (128,128), so its smem budget likely allows a deeper
-# pipeline than the default cap of 4.
+# an over-large N cannot exceed the smem budget.
+#
+# That clamp is not theoretical for prefill. The (128,64,128) tile resolves
+# raw_ab_stage=3 at occupancy 1: 101376 B of smem, less 2048 for the occupancy
+# reserve and mbarriers and 16384 for the epilogue sC, leaves 82944 against
+# 25600 per stage (A 16384 + B 8192 + SF 1024). So the flat cap of 4 has never
+# bound prefill, requesting 4/5/6 all compile the same three-stage kernel, and
+# an earlier sweep reading "s4 == s3, noise" was comparing a kernel to itself.
+# Only the s2 arm was a real stage-depth measurement, and it cost +15%.
 _SPARKINFER_DENSE_AB_STAGES = int(os.getenv("SPARKINFER_DENSE_AB_STAGES", "0"))
+# SPARKINFER_DENSE_EPI_TILE=MxN (default unset = the whole MMA tile) shrinks the
+# epilogue staging tile. Must divide the MMA tile in both modes.
+#
+# The epilogue buffer is sized epi_tile * epi_stage, and epi_stage_max is
+# (tile_n / epi_n) * (tile_m / epi_m), so an epi_tile equal to the MMA tile
+# pins epi_stage at 1 and reserves the full tile in smem. That is affordable at
+# (128,64) - 16384 B of 99328 - and decisive at (128,128), where it takes 32768
+# and leaves 66560 against 33792 per stage: ab_stage=1, i.e. no mainloop
+# pipeline at all. A (128,128) sweep therefore measured an unpipelined kernel
+# and reported it as a tile result.
+#
+# Numerics-neutral: this only changes the granularity at which finished output
+# tiles are staged and TMA-stored, not accumulation order, rounding, or any
+# operand value.
+_SPARKINFER_DENSE_EPI_TILE = _parse_tile_env("SPARKINFER_DENSE_EPI_TILE", None)
+
+
+def _dense_epi_tile(mma_tiler_mn: Tuple[int, int]) -> Tuple[int, int]:
+    """Epilogue staging tile: the whole MMA tile unless overridden."""
+    if _SPARKINFER_DENSE_EPI_TILE is None:
+        return (mma_tiler_mn[0], mma_tiler_mn[1])
+    epi_m, epi_n = _SPARKINFER_DENSE_EPI_TILE
+    # A non-dividing epi_tile does not fail at compile time: zipped_divide and
+    # the TMA store atom would silently stage a tile that does not tessellate
+    # the output, so reject it here rather than write wrong C.
+    if (
+        epi_m <= 0
+        or epi_n <= 0
+        or mma_tiler_mn[0] % epi_m
+        or mma_tiler_mn[1] % epi_n
+    ):
+        raise ValueError(
+            "SPARKINFER_DENSE_EPI_TILE must divide the MMA tile in both modes, "
+            f"got {epi_m}x{epi_n} for MMA tile {mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
+        )
+    return (epi_m, epi_n)
 # Cap the decode-regime pipeline at 3 stages when two CTAs share the SM's smem.
 # Measured on Behemoth TP=2 (2x RTX PRO 6000, ncu, M=1, four shards): at
 # occupancy 2 the CTA gets half the budget, and the fourth stage buys less than
@@ -800,7 +842,7 @@ class DenseGemmKernel:
         self.sfb_tile_shape_nk = (max(128, mma_tiler_mn[1]), tile_k)
         self.sfb_tiles_per_block = self.sfb_tile_shape_nk[0] // mma_tiler_mn[1]
         self.cluster_shape_mnk = (1, 1, 1)  # Always (1,1,1) on the current target
-        self.epi_tile = (mma_tiler_mn[0], mma_tiler_mn[1])
+        self.epi_tile = _dense_epi_tile(mma_tiler_mn)
         self.single_work_tile_per_cta = single_work_tile_per_cta
         self.use_prefetch = use_prefetch
         self.direct_one_m_tile_scheduler = direct_one_m_tile_scheduler
@@ -4191,13 +4233,15 @@ class DenseGemmKernel:
         # compiled the same kernel".
         logger.debug(
             "dense stages: tile=%s occ=%d raw=%d -> ab_stage=%d "
-            "(ab %dB + sf %dB per stage, epi %dB, smem %dB)",
+            "(ab %dB + sf %dB per stage, epi %s x%d = %dB, smem %dB)",
             tile_shape_mnk,
             occupancy,
             raw_ab_stage,
             ab_stage,
             ab_bytes_per_stage,
             sf_bytes_per_stage,
+            epi_tile,
+            epi_stage,
             epi_bytes,
             smem_capacity,
         )
