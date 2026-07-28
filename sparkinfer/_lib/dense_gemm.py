@@ -226,22 +226,30 @@ _SPARKINFER_DENSE_EPI_STAGES = int(os.getenv("SPARKINFER_DENSE_EPI_STAGES", "0")
 
 
 def _dense_epi_tile(mma_tiler_mn: Tuple[int, int]) -> Tuple[int, int]:
-    """Epilogue staging tile: the whole MMA tile unless overridden."""
+    """Epilogue staging tile: the whole MMA tile unless overridden.
+
+    The override is an upper bound per mode, not an exact request. One process
+    compiles several tile shapes - a serving run builds the prefill tile and the
+    decode 16x64 in the same interpreter - so an exact request aimed at prefill
+    would abort the decode warmup on a tile it was never meant to describe.
+    """
     if _SPARKINFER_DENSE_EPI_TILE is None:
         return (mma_tiler_mn[0], mma_tiler_mn[1])
-    epi_m, epi_n = _SPARKINFER_DENSE_EPI_TILE
+    req_m, req_n = _SPARKINFER_DENSE_EPI_TILE
+    if req_m <= 0 or req_n <= 0:
+        raise ValueError(
+            f"SPARKINFER_DENSE_EPI_TILE must be positive, got {req_m}x{req_n}"
+        )
+    epi_m = min(req_m, mma_tiler_mn[0])
+    epi_n = min(req_n, mma_tiler_mn[1])
     # A non-dividing epi_tile does not fail at compile time: zipped_divide and
     # the TMA store atom would silently stage a tile that does not tessellate
     # the output, so reject it here rather than write wrong C.
-    if (
-        epi_m <= 0
-        or epi_n <= 0
-        or mma_tiler_mn[0] % epi_m
-        or mma_tiler_mn[1] % epi_n
-    ):
+    if mma_tiler_mn[0] % epi_m or mma_tiler_mn[1] % epi_n:
         raise ValueError(
-            "SPARKINFER_DENSE_EPI_TILE must divide the MMA tile in both modes, "
-            f"got {epi_m}x{epi_n} for MMA tile {mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
+            "SPARKINFER_DENSE_EPI_TILE must divide the MMA tile in both modes "
+            f"once clamped to it, got {req_m}x{req_n} -> {epi_m}x{epi_n} for "
+            f"MMA tile {mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
         )
     return (epi_m, epi_n)
 # Cap the decode-regime pipeline at 3 stages when two CTAs share the SM's smem.
@@ -4685,6 +4693,12 @@ class _DenseGemmLaunch:
             self._direct_m1_wo_a_inputs,
             self._target_occupancy,
             self._sf_copy_mode,
+            # Resolved epilogue shape, not the raw env values: it decides both
+            # the staged output tile and, through epi_bytes, how many mainloop
+            # stages fit. A cached kernel built under a different epilogue is a
+            # different kernel even at the same mma_tiler.
+            _dense_epi_tile(self._mma_tiler_mn),
+            _SPARKINFER_DENSE_EPI_STAGES,
         )
 
     @cute.jit
