@@ -169,6 +169,39 @@ expected to move decode on a model this large.
 Note this is a size effect, not an FP6 property: the Qwen3.6-27B sweeps above
 are far from this wall, which is why occupancy and pipeline work paid there.
 
+### 3.6b Negative result: the 32-wide N decode tile cannot raise CTA count
+
+Achieved occupancy on the decode shards is ~6.6% against a theoretical 12.5%,
+with shared memory permitting 2 blocks/SM. The obvious reading is that the
+shards launch too few CTAs (`down`/`o` 192, `qkv` 112, against 188 SMs) to ever
+place a second block, so a 32-wide N tile was built to double them.
+
+**It does not work, and the premise was wrong.** Decode runs the persistent
+tile scheduler, whose grid is sized from resident-CTA capacity rather than the
+output-tile count. Halving the tile width doubles the work tiles each CTA loops
+over and creates no CTAs. Measured on `down` (1x12288x14336), Jul 28 2026, RTX
+PRO 6000 GPU-41235b51:
+
+| | (16,64) | (16,32) |
+|---|---|---|
+| grid | 192 | **188** (not 384) |
+| DRAM throughput | 71.3% | 39.8% |
+| duration (ncu) | 109.1 us | 195.7 us |
+| duration (bench) | 96.2 us | 145.2 us |
+| dynamic smem/block | 37.89 KB | 38.91 KB |
+
+Shared memory per block *rises* because `sm120_make_smem_layout_sfb` rounds any
+tile up to a full 128-column SF block, so narrowing N frees nothing and
+quadruples SFB reads. Numerics were byte-identical (cos 0.9992541075, max_abs
+0.68877006), as expected: tile width changes column ownership, not accumulation
+order.
+
+The occupancy diagnosis above survives; only this fix for it is dead. The one
+remaining lever that genuinely changes CTA count is split-K, which bypasses the
+persistent scheduler for a `(1, slices, n_tiles)` grid — at the cost of
+changing FP32 accumulation order, so it is not bit-identical to the current
+kernel and would need a fresh KLD gate rather than a byte comparison.
+
 ### 3.7 Reading the matrix
 
 * **Dense TP=2 helps decode latency:** TPOT 9.80 -> 7.49 ms at ctx-1k

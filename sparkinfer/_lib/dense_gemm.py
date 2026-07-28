@@ -4384,13 +4384,26 @@ class DenseGemmKernel:
         # consume only 16/32 columns.
         mma_check_mn = (mma_tiler_mn[1], mma_tiler_mn[0]) if swap_ab else mma_tiler_mn
         if ab_dtype == cutlass.Float8E4M3FN or is_mxfp6_ab_dtype(ab_dtype):
-            # (16,32) exists for decode bandwidth, not arithmetic: it doubles
-            # the CTA count on the N-narrow shards so two blocks are actually
-            # resident per SM, which is what raises bytes in flight. It costs SF
-            # smem efficiency - sm120_make_smem_layout_sfb rounds any tile up to
-            # a full 128-column SF block - so it is worth it only where the
-            # extra CTAs are the binding constraint. No policy selects it yet;
-            # it is reachable via SPARKINFER_FP6_DECODE_TILE=16x32.
+            # (16,32) is supported but MEASURED SLOWER; no policy selects it and
+            # it is reachable only via SPARKINFER_FP6_DECODE_TILE=16x32. Do not
+            # retry it for decode bandwidth. It was built to double the CTA
+            # count on the N-narrow shards so two blocks land per SM, and that
+            # premise is simply wrong: decode runs the persistent tile
+            # scheduler, whose grid comes from resident-CTA capacity, not from
+            # the output-tile count. Halving N doubles the work tiles each CTA
+            # loops over and creates no CTAs.
+            #
+            # ncu on down (1x12288x14336), Jul 28 2026, RTX PRO 6000
+            # GPU-41235b51, /tmp/fp6_ncu_t1632 vs /tmp/fp6_ncu_t1664:
+            #   grid       192  -> 188   (not 384)
+            #   DRAM       71.3% -> 39.8%
+            #   duration   109.1 -> 195.7 us  (bench 96.2 -> 145.2)
+            #   smem/block 37.89 -> 38.91 KB  (UP: sm120_make_smem_layout_sfb
+            #              rounds any tile to a full 128-column SF block, so
+            #              narrowing N frees no smem and quadruples SFB reads)
+            # Numerics were byte-identical to (16,64) - cos 0.9992541075,
+            # max_abs 0.68877006 - as expected, since tile width changes column
+            # ownership and not accumulation order.
             if mma_check_mn not in (
                 (16, 32),
                 (16, 64),
