@@ -155,6 +155,20 @@ _SPARKINFER_FP6_LARGE_M_UNROLL = (
 # see what retile was handed.
 _DENSE_DEBUG_SF_LAYOUT = os.getenv("SPARKINFER_DEBUG_SF_LAYOUT", "0") == "1"
 
+# Repair strategy for the rank-2 SFB fragment that appears when a tile's N
+# equals exactly one perm_n width (i.e. tile_n == 32). Measured layouts:
+#   N=128 -> ((32,1),(2,4),4)   rank 3, retiles
+#   N=64  -> ((32,1),(2,2),4)   rank 3, retiles
+#   N=32  -> ((32,1),(2,4))     rank 2, aborts in tiled_copy_retile
+# The N=32 form has lost the degenerate n_rest=1 mode and merged k_rest into
+# the value mode. SFA hits the same single-group case at M=16 and keeps its
+# degenerate mode - ((32,1),1,4) - which is why the A side has always worked.
+#   "off"    - no repair (reproduces the abort)
+#   "append" - tack a size-1 mode on the end; cheapest, only correct if retile
+#              cares about rank and not about which mode is degenerate
+#   "split"  - rebuild ((32,1),(val_n,n_rest),k_rest), matching the N=64 form
+_DENSE_SFB_RANK_FIX = os.getenv("SPARKINFER_SFB_RANK_FIX", "off").lower()
+
 
 def _dbg_sf(tag: str, value) -> None:
     if _DENSE_DEBUG_SF_LAYOUT:
@@ -1363,6 +1377,44 @@ class DenseGemmKernel:
         else:
             cute.copy(tiled_copy, src, dst)
 
+    def _repair_sfb_fragment_rank(self, frag, tiled_mma):
+        """Restore the degenerate n_rest mode dropped at tile_n == perm_n.
+
+        See _DENSE_SFB_RANK_FIX. Layout-only: the fragment is register storage
+        allocated by make_fragment_like, so re-expressing its shape moves no
+        data and changes no arithmetic. Returns frag untouched unless the rank
+        actually collapsed, so wider tiles are unaffected.
+        """
+        if cutlass.const_expr(_DENSE_SFB_RANK_FIX == "off"):
+            return frag
+        if cutlass.const_expr(cute.rank(frag.layout) != 2):
+            return frag
+        if cutlass.const_expr(_DENSE_SFB_RANK_FIX == "append"):
+            return cute.make_fragment(
+                cute.append(frag.layout, cute.make_layout(1, stride=0)),
+                self.sf_dtype,
+            )
+        if cutlass.const_expr(_DENSE_SFB_RANK_FIX == "split"):
+            # Rebuild the N=64 shape with n_rest=1. val_n is the per-thread N
+            # value count of the atom (2 for both SM120 block-scaled atoms);
+            # k_rest is how many atom-K blocks a tile_k covers.
+            k_rest = self.tile_shape_mnk[2] // tiled_mma.shape_mnk[2]
+            n_rest = self.tile_shape_mnk[1] // cute.size(
+                tiled_mma.permutation_mnk[1]
+            )
+            val_n = 2
+            return cute.make_fragment(
+                cute.make_layout(
+                    ((32, 1), (val_n, n_rest), k_rest),
+                    stride=((0, 0), (k_rest * n_rest, k_rest), 1),
+                ),
+                self.sf_dtype,
+            )
+        raise ValueError(
+            f"SPARKINFER_SFB_RANK_FIX must be off/append/split, got "
+            f"{_DENSE_SFB_RANK_FIX!r}"
+        )
+
     def _partition_fragment_SFA(
         self,
         sfa_tensor: cute.Tensor,
@@ -2144,7 +2196,11 @@ class DenseGemmKernel:
                         # retile is what rejected tCrSFB_tile.
                         _dbg_sf("sSFB_tile.layout", sSFB_tile.layout)
                         _dbg_sf("sSFB_tile[,,0].layout", sSFB_tile[None, None, 0].layout)
-                        _dbg_sf("tCrSFB_tile.layout", tCrSFB_tile.layout)
+                        _dbg_sf("tCrSFB_tile.layout (raw)", tCrSFB_tile.layout)
+                        tCrSFB_tile = self._repair_sfb_fragment_rank(
+                            tCrSFB_tile, tiled_mma
+                        )
+                        _dbg_sf("tCrSFB_tile.layout (repaired)", tCrSFB_tile.layout)
                         _dbg_sf("about to retile SFB", "<<<")
                         tCrSFB_tile_copy_view = thr_copy_ldmatrix_SFB.retile(
                             tCrSFB_tile
