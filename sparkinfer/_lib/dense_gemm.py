@@ -147,45 +147,6 @@ _SPARKINFER_FP6_LARGE_M_UNROLL = (
 )
 
 
-# SPARKINFER_DEBUG_SF_LAYOUT=1 dumps the SFA/SFB layouts at trace time. The
-# scale-factor sub-tile path is the one place where a narrow N tile changes
-# layout RANK rather than just extents, and a rank mismatch surfaces as a
-# std::bad_variant_access abort inside the MLIR builder with no Python context.
-# Printing the layouts on both a working and a failing tile is the only way to
-# see what retile was handed.
-_DENSE_DEBUG_SF_LAYOUT = os.getenv("SPARKINFER_DEBUG_SF_LAYOUT", "0") == "1"
-
-# Repair strategy for the rank-2 SFB fragment that appears when a tile's N
-# equals exactly one perm_n width (i.e. tile_n == 32). Measured layouts:
-#   N=128 -> ((32,1),(2,4),4)   rank 3, retiles
-#   N=64  -> ((32,1),(2,2),4)   rank 3, retiles
-#   N=32  -> ((32,1),(2,4))     rank 2, aborts in tiled_copy_retile
-# The N=32 form has lost the degenerate n_rest=1 mode and merged k_rest into
-# the value mode. SFA hits the same single-group case at M=16 and keeps its
-# degenerate mode - ((32,1),1,4) - which is why the A side has always worked.
-#   "off"    - no repair (reproduces the abort)
-#   "append" - tack a size-1 mode on the end; compiles, then IMAs
-#   "split"  - rebuild ((32,1),(val_n,n_rest),k_rest); compiles, then IMAs
-# Both of the above patch only the register side, so partition_S still derives
-# the smem source view from the collapsed tile and the two ends of the copy
-# disagree - hence the illegal access rather than a compile failure.
-#   "input"  - re-split the N mode of sSFB_tile itself. Verified to produce
-#              ((32,1),(32,4),5) as intended, but the fragment STILL comes back
-#              rank 2, which localizes the collapse to upstream's
-#              partition_fragment_SFB rather than to the tensor we hand it.
-#   "derive" - our own partition_fragment_SFB. Identical to upstream except the
-#              second group_modes is applied only when there are enough modes
-#              to merge; with n_rest=1 that call otherwise eats the k mode.
-#              Layout math, not hand-written strides.
-#   "derive+input" - both.
-_DENSE_SFB_RANK_FIX = os.getenv("SPARKINFER_SFB_RANK_FIX", "off").lower()
-
-
-def _dbg_sf(tag: str, value) -> None:
-    if _DENSE_DEBUG_SF_LAYOUT:
-        print(f"[sf-layout] {tag}: {value}", flush=True)
-
-
 def _parse_tile_env(
     name: str, default: Optional[Tuple[int, int]]
 ) -> Optional[Tuple[int, int]]:
@@ -1388,15 +1349,22 @@ class DenseGemmKernel:
         else:
             cute.copy(tiled_copy, src, dst)
 
-    def _partition_fragment_SFB_rank_safe(self, sfb_tensor, thr_mma, tidx):
-        """partition_fragment_SFB with the n_rest=1 mode collapse fixed.
+    def _partition_fragment_SFB_sub_tile(self, sfb_tensor, thr_mma, tidx):
+        """partition_fragment_SFB with the n_rest=1 mode collapse repaired.
 
-        Mirrors cutlass.utils.blackwell_helpers.partition_fragment_SFB. The
-        only change is that the second group_modes runs only when the layout
-        still has the mode it is meant to merge; upstream applies it
-        unconditionally, so a tile whose N spans exactly one perm_n group
-        (tile_n == 32) has its k mode folded into the value mode and comes out
-        rank 2, which tiled_copy_retile cannot consume.
+        Mirrors cutlass.utils.blackwell_helpers.partition_fragment_SFB. The one
+        change is that the second group_modes runs only when the layout still
+        has the mode it is meant to merge. Upstream applies it unconditionally,
+        so a tile whose N spans exactly one perm_n group (tile_n == 32) has its
+        k mode folded into the value mode and comes back rank 2:
+
+            N=128 -> ((32,1),(2,4),4)   rank 3
+            N=64  -> ((32,1),(2,2),4)   rank 3
+            N=32  -> ((32,1),(2,4))     rank 2, aborts in tiled_copy_retile
+
+        SFA meets the same single-group case at M=16 and keeps its degenerate
+        mode, which is why only the B side ever hit this. The guard is inert
+        for every tile the policy actually selects.
         """
         thrfrg = sm120_utils.thrfrg_SFB(sfb_tensor.layout, thr_mma)
         thr_tensor = cute.make_tensor(sfb_tensor.iterator, thrfrg)
@@ -1407,68 +1375,6 @@ class DenseGemmKernel:
         if cutlass.const_expr(cute.rank(partitioned) > 3):
             partitioned = cute.group_modes(partitioned, 1, 3)
         return cute.make_fragment_like(partitioned)
-
-    def _repair_sfb_smem_tile(self, sfb_tile, tiled_mma):
-        """Re-split a collapsed N mode so smem view and fragment agree.
-
-        At tile_n == perm_n the local_tile above yields a flat N mode (32:16)
-        where a wider tile yields ((32,2):(16,4)). logical_divide by perm_n
-        restores the (perm_n, n_rest) nesting with n_rest=1, which is the shape
-        every downstream partition already knows how to handle. Wider tiles are
-        already nested, so this is a no-op for them.
-        """
-        if cutlass.const_expr("input" not in _DENSE_SFB_RANK_FIX):
-            return sfb_tile
-        if cutlass.const_expr(cute.rank(sfb_tile.layout[0]) != 1):
-            return sfb_tile
-        perm_n = cute.size(tiled_mma.permutation_mnk[1])
-        return cute.logical_divide(
-            sfb_tile, (cute.make_layout(perm_n), None, None)
-        )
-
-    def _repair_sfb_fragment_rank(self, frag, tiled_mma):
-        """Restore the degenerate n_rest mode dropped at tile_n == perm_n.
-
-        See _DENSE_SFB_RANK_FIX.         Layout-only: the fragment is uninitialized register storage, so
-        re-expressing its shape moves no data and changes no arithmetic.
-        Returns frag untouched unless the rank actually collapsed, so wider
-        tiles are unaffected.
-        """
-        if cutlass.const_expr(
-            _DENSE_SFB_RANK_FIX == "off" or "input" in _DENSE_SFB_RANK_FIX
-        ):
-            # "input" and "derive" repair the shape upstream of here; the
-            # hand-built variants below are only for the standalone A/B.
-            return frag
-        if cutlass.const_expr("derive" in _DENSE_SFB_RANK_FIX):
-            return frag
-        if cutlass.const_expr(cute.rank(frag.layout) != 2):
-            return frag
-        if cutlass.const_expr(_DENSE_SFB_RANK_FIX == "append"):
-            return cute.make_rmem_tensor(
-                cute.append(frag.layout, cute.make_layout(1, stride=0)),
-                self.sf_dtype,
-            )
-        if cutlass.const_expr(_DENSE_SFB_RANK_FIX == "split"):
-            # Rebuild the N=64 shape with n_rest=1. val_n is the per-thread N
-            # value count of the atom (2 for both SM120 block-scaled atoms);
-            # k_rest is how many atom-K blocks a tile_k covers.
-            k_rest = self.tile_shape_mnk[2] // tiled_mma.shape_mnk[2]
-            n_rest = self.tile_shape_mnk[1] // cute.size(
-                tiled_mma.permutation_mnk[1]
-            )
-            val_n = 2
-            return cute.make_rmem_tensor(
-                cute.make_layout(
-                    ((32, 1), (val_n, n_rest), k_rest),
-                    stride=((0, 0), (k_rest * n_rest, k_rest), 1),
-                ),
-                self.sf_dtype,
-            )
-        raise ValueError(
-            f"SPARKINFER_SFB_RANK_FIX must be off/append/split, got "
-            f"{_DENSE_SFB_RANK_FIX!r}"
-        )
 
     def _partition_fragment_SFA(
         self,
@@ -2146,23 +2052,6 @@ class DenseGemmKernel:
             )
             tCrSFB_copy_view_full = thr_copy_ldmatrix_SFB.retile(tCrSFB_full)
 
-            if _DENSE_DEBUG_SF_LAYOUT:
-                _dbg_sf("tile_shape_mnk", self.tile_shape_mnk)
-                _dbg_sf("atom_shape", self.atom_shape)
-                _dbg_sf("swap_ab", self.swap_ab)
-                _dbg_sf("sfa_tile_shape_mk", self.sfa_tile_shape_mk)
-                _dbg_sf("sfa_tiles_per_block", self.sfa_tiles_per_block)
-                _dbg_sf("sfb_tile_shape_nk", self.sfb_tile_shape_nk)
-                _dbg_sf("sfb_tiles_per_block", self.sfb_tiles_per_block)
-                _dbg_sf("mma.shape_mnk", tiled_mma.shape_mnk)
-                _dbg_sf("mma.permutation_mnk", tiled_mma.permutation_mnk)
-                _dbg_sf("layoutSFB_TV", self._get_layoutSFB_TV(tiled_mma))
-                _dbg_sf("sSFA.layout", sSFA.layout)
-                _dbg_sf("sSFB.layout", sSFB.layout)
-                _dbg_sf("tCrSFA_full.layout", tCrSFA_full.layout)
-                _dbg_sf("tCrSFB_full.layout", tCrSFB_full.layout)
-                _dbg_sf("tCrSFB_copy_view_full.layout", tCrSFB_copy_view_full.layout)
-
             while work_tile.is_valid_tile:
                 tile_coord_mnl = work_tile.tile_idx
                 gC_mnl_slice = gC_mnl[(None, None, *tile_coord_mnl)]
@@ -2220,16 +2109,9 @@ class DenseGemmKernel:
                         tCrSFA_tile = self._partition_fragment_SFA(
                             sSFA_tile[None, None, 0], thr_mma, tidx
                         )
-                        # The A side is the working control: at M=16 it already
-                        # sub-tiles a 128-row SF block 8 ways and retiles fine.
-                        _dbg_sf("sSFA_tile.layout", sSFA_tile.layout)
-                        _dbg_sf("sSFA_tile[,,0].layout", sSFA_tile[None, None, 0].layout)
-                        _dbg_sf("tCrSFA_tile.layout", tCrSFA_tile.layout)
                         tCrSFA_tile_copy_view = thr_copy_ldmatrix_SFA.retile(
                             tCrSFA_tile
                         )
-                        _dbg_sf("tCrSFA_tile_copy_view.layout (A retile OK)",
-                                tCrSFA_tile_copy_view.layout)
                     else:
                         tCsSFA_tile_copy_view = tCsSFA_copy_view_full
                         tCrSFA_tile = tCrSFA_full
@@ -2240,36 +2122,15 @@ class DenseGemmKernel:
                             cute.slice_(self.tile_shape_mnk, (0, None, None)),
                             (sfb_tile_offset, 0, None),
                         )
-                        sSFB_tile = self._repair_sfb_smem_tile(
-                            sSFB_tile, tiled_mma
-                        )
                         tCsSFB_tile_copy_view = thr_copy_ldmatrix_SFB.partition_S(
                             sSFB_tile
                         )
-                        if cutlass.const_expr("derive" in _DENSE_SFB_RANK_FIX):
-                            tCrSFB_tile = self._partition_fragment_SFB_rank_safe(
-                                sSFB_tile[None, None, 0], thr_mma, tidx
-                            )
-                        else:
-                            tCrSFB_tile = self._partition_fragment_SFB(
-                                sSFB_tile[None, None, 0], thr_mma, tidx
-                            )
-                        # This is the abort site at tile N=32. Everything above
-                        # prints; if the next line is the last thing in the log,
-                        # retile is what rejected tCrSFB_tile.
-                        _dbg_sf("sSFB_tile.layout", sSFB_tile.layout)
-                        _dbg_sf("sSFB_tile[,,0].layout", sSFB_tile[None, None, 0].layout)
-                        _dbg_sf("tCrSFB_tile.layout (raw)", tCrSFB_tile.layout)
-                        tCrSFB_tile = self._repair_sfb_fragment_rank(
-                            tCrSFB_tile, tiled_mma
+                        tCrSFB_tile = self._partition_fragment_SFB_sub_tile(
+                            sSFB_tile[None, None, 0], thr_mma, tidx
                         )
-                        _dbg_sf("tCrSFB_tile.layout (repaired)", tCrSFB_tile.layout)
-                        _dbg_sf("about to retile SFB", "<<<")
                         tCrSFB_tile_copy_view = thr_copy_ldmatrix_SFB.retile(
                             tCrSFB_tile
                         )
-                        _dbg_sf("tCrSFB_tile_copy_view.layout (B retile OK)",
-                                tCrSFB_tile_copy_view.layout)
                     else:
                         tCsSFB_tile_copy_view = tCsSFB_copy_view_full
                         tCrSFB_tile = tCrSFB_full
@@ -4522,12 +4383,15 @@ class DenseGemmKernel:
         # consume only 16/32 columns.
         mma_check_mn = (mma_tiler_mn[1], mma_tiler_mn[0]) if swap_ab else mma_tiler_mn
         if ab_dtype == cutlass.Float8E4M3FN or is_mxfp6_ab_dtype(ab_dtype):
-            # (16,32) exists for decode bandwidth, not for arithmetic: it
-            # doubles the CTA count on the N-narrow shards so two blocks are
-            # actually resident per SM, which is what raises bytes in flight.
-            # It costs SF smem efficiency - sm120_make_smem_layout_sfb rounds
-            # any tile up to a full 128-column SF block - so it is worth it
-            # only where the extra CTAs are the binding constraint.
+            # (16,32) is KNOWN BROKEN and no policy selects it; it is reachable
+            # only by setting SPARKINFER_FP6_DECODE_TILE=16x32 by hand. It was
+            # meant to double the CTA count on the N-narrow decode shards so two
+            # blocks are genuinely resident per SM. It now compiles - see
+            # _partition_fragment_SFB_sub_tile - but faults with an illegal
+            # access at runtime somewhere further down the 32-column path
+            # (packed-B TMA, the SF global->smem coordinate, or the epilogue
+            # store; not yet narrowed). Split-K reaches the same CTA counts
+            # through an already-exercised path and is the supported route.
             if mma_check_mn not in (
                 (16, 32),
                 (16, 64),
