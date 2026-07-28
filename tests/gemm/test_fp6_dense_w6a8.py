@@ -99,7 +99,14 @@ def test_w6a8_source_format_sets_act_fmt():
 )
 def test_fused_quant_matches_unfused(m, n, k, monkeypatch):
     """Phase 4.1: fused quant→GEMM must produce the same output as the
-    standalone-quant + GEMM path (bit-identical)."""
+    standalone-quant + GEMM path (bit-identical).
+
+    Two regimes. At m=1 the fused prologue really runs, and its single
+    per-tensor global scale is equivalent to per-row scaling because there is
+    only one row, so the arms must compile to different kernels and agree
+    bitwise. At m>1 the prologue must not engage at all; the assertions there
+    pin that inertness rather than tolerating a near-match.
+    """
     import sparkinfer._lib.dense_gemm as _dense_mod
     import sparkinfer.quantization.mxfp6.fp6_dense_weights as _wmod
     from sparkinfer.quantization.mxfp6.fp6_dense_weights import (
@@ -141,11 +148,19 @@ def test_fused_quant_matches_unfused(m, n, k, monkeypatch):
     y_fused = dense_fp6_linear(x, fp6w)
 
     assert len(resolved) == 2, f"expected one GEMM per arm, got {len(resolved)}"
-    assert resolved[0] is not resolved[1], (
-        "fused and unfused arms resolved the SAME compiled kernel; the "
-        "compile cache key is blind to the fused-quant flag, so this "
-        "comparison is vacuous"
-    )
+    if m == 1:
+        assert resolved[0] is not resolved[1], (
+            "fused and unfused arms resolved the SAME compiled kernel; the "
+            "compile cache key is blind to the fused-quant flag, so this "
+            "comparison is vacuous"
+        )
+    else:
+        assert resolved[0] is resolved[1], (
+            f"the fused prologue must be inert at m={m}: it derives one "
+            "per-tensor global scale, so enabling it above m=1 would drop "
+            "per-row activation scaling and make a row's output depend on "
+            "which other rows share its launch"
+        )
 
     assert y_fused.shape == y_unfused.shape
     assert torch.isfinite(y_fused).all()
@@ -153,11 +168,12 @@ def test_fused_quant_matches_unfused(m, n, k, monkeypatch):
     if m == 1:
         # m=1: both paths use per-tensor scaling → bit-identical.
         assert cos > 0.999, f"fused/unfused cosine sim {cos:.6f} < 0.999"
-        torch.testing.assert_close(y_fused, y_unfused, rtol=0, atol=0)
     else:
-        # m>1: unfused uses per-row activation scaling (deterministic) while
-        # fused uses per-tensor; different quantization → close but not equal.
-        assert cos > 0.99, f"fused/unfused cosine sim {cos:.6f} < 0.99"
+        # m>1: the flag is inert, so this is the same kernel on the same
+        # per-row inputs. A cosine tolerance here would re-admit the
+        # per-tensor downgrade this parametrization exists to forbid.
+        assert cos > 0.999, f"fused/unfused cosine sim {cos:.6f} < 0.999"
+    torch.testing.assert_close(y_fused, y_unfused, rtol=0, atol=0)
 
 
 @cuda_required
