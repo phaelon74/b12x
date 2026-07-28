@@ -216,6 +216,13 @@ _SPARKINFER_DENSE_AB_STAGES = int(os.getenv("SPARKINFER_DENSE_AB_STAGES", "0"))
 # tiles are staged and TMA-stored, not accumulation order, rounding, or any
 # operand value.
 _SPARKINFER_DENSE_EPI_TILE = _parse_tile_env("SPARKINFER_DENSE_EPI_TILE", None)
+# SPARKINFER_DENSE_EPI_STAGES=N (default 0 = the min(epi_stage_max, 4) rule)
+# caps the epilogue pipeline depth. Required to make EPI_TILE mean anything:
+# epi_stage_max is (tile_m/epi_m) * (tile_n/epi_n), so shrinking the epilogue
+# tile raises the stage count by the same factor and epi_bytes does not move
+# until the x4 cap bites. Measured: (128,128) with epi (128,64) resolved
+# epi_stage=2 and epi_bytes=32768, identical to the full-tile epilogue.
+_SPARKINFER_DENSE_EPI_STAGES = int(os.getenv("SPARKINFER_DENSE_EPI_STAGES", "0"))
 
 
 def _dense_epi_tile(mma_tiler_mn: Tuple[int, int]) -> Tuple[int, int]:
@@ -4190,6 +4197,8 @@ class DenseGemmKernel:
             tile_shape_mnk[0] // epi_tile[0]
         )
         epi_stage = min(epi_stage_max, 4)
+        if _SPARKINFER_DENSE_EPI_STAGES:
+            epi_stage = max(1, min(epi_stage, _SPARKINFER_DENSE_EPI_STAGES))
         c_bytes_per_stage = cute.size(epi_tile) * c_dtype.width // 8
         epi_bytes = c_bytes_per_stage * epi_stage
 
