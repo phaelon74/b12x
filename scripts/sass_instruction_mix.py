@@ -384,7 +384,20 @@ def main() -> int:
         action="store_true",
         help="also census the whole entry point, not just its largest loop",
     )
+    parser.add_argument(
+        "--dump-sass",
+        type=Path,
+        default=None,
+        help=(
+            "also write each censused entry point's disassembly here, so the "
+            "instruction stream can be read directly; the cubin is embedded in "
+            "the host object and nvdisasm cannot open the .o itself"
+        ),
+    )
     args = parser.parse_args()
+
+    if args.dump_sass is not None:
+        args.dump_sass.mkdir(parents=True, exist_ok=True)
 
     nvdisasm = shutil.which("nvdisasm")
     if nvdisasm is None:
@@ -423,6 +436,11 @@ def main() -> int:
             print(f"object: {object_path.name}")
             print(f"kernel: {kernel}")
             print(f"instructions: {len(instructions)}")
+
+            if args.dump_sass is not None:
+                dump = args.dump_sass / f"{object_path.stem[:16]}_{kernel[:80]}.sass"
+                dump.write_text(code)
+                print(f"sass: {dump}")
 
             labels = _label_offsets(code)
             modifiers = _modifiers_by_offset(code)
