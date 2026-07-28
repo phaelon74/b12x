@@ -147,6 +147,20 @@ _SPARKINFER_FP6_LARGE_M_UNROLL = (
 )
 
 
+# SPARKINFER_DEBUG_SF_LAYOUT=1 dumps the SFA/SFB layouts at trace time. The
+# scale-factor sub-tile path is the one place where a narrow N tile changes
+# layout RANK rather than just extents, and a rank mismatch surfaces as a
+# std::bad_variant_access abort inside the MLIR builder with no Python context.
+# Printing the layouts on both a working and a failing tile is the only way to
+# see what retile was handed.
+_DENSE_DEBUG_SF_LAYOUT = os.getenv("SPARKINFER_DEBUG_SF_LAYOUT", "0") == "1"
+
+
+def _dbg_sf(tag: str, value) -> None:
+    if _DENSE_DEBUG_SF_LAYOUT:
+        print(f"[sf-layout] {tag}: {value}", flush=True)
+
+
 def _parse_tile_env(
     name: str, default: Optional[Tuple[int, int]]
 ) -> Optional[Tuple[int, int]]:
@@ -2025,6 +2039,23 @@ class DenseGemmKernel:
             )
             tCrSFB_copy_view_full = thr_copy_ldmatrix_SFB.retile(tCrSFB_full)
 
+            if _DENSE_DEBUG_SF_LAYOUT:
+                _dbg_sf("tile_shape_mnk", self.tile_shape_mnk)
+                _dbg_sf("atom_shape", self.atom_shape)
+                _dbg_sf("swap_ab", self.swap_ab)
+                _dbg_sf("sfa_tile_shape_mk", self.sfa_tile_shape_mk)
+                _dbg_sf("sfa_tiles_per_block", self.sfa_tiles_per_block)
+                _dbg_sf("sfb_tile_shape_nk", self.sfb_tile_shape_nk)
+                _dbg_sf("sfb_tiles_per_block", self.sfb_tiles_per_block)
+                _dbg_sf("mma.shape_mnk", tiled_mma.shape_mnk)
+                _dbg_sf("mma.permutation_mnk", tiled_mma.permutation_mnk)
+                _dbg_sf("layoutSFB_TV", self._get_layoutSFB_TV(tiled_mma))
+                _dbg_sf("sSFA.layout", sSFA.layout)
+                _dbg_sf("sSFB.layout", sSFB.layout)
+                _dbg_sf("tCrSFA_full.layout", tCrSFA_full.layout)
+                _dbg_sf("tCrSFB_full.layout", tCrSFB_full.layout)
+                _dbg_sf("tCrSFB_copy_view_full.layout", tCrSFB_copy_view_full.layout)
+
             while work_tile.is_valid_tile:
                 tile_coord_mnl = work_tile.tile_idx
                 gC_mnl_slice = gC_mnl[(None, None, *tile_coord_mnl)]
@@ -2082,9 +2113,16 @@ class DenseGemmKernel:
                         tCrSFA_tile = self._partition_fragment_SFA(
                             sSFA_tile[None, None, 0], thr_mma, tidx
                         )
+                        # The A side is the working control: at M=16 it already
+                        # sub-tiles a 128-row SF block 8 ways and retiles fine.
+                        _dbg_sf("sSFA_tile.layout", sSFA_tile.layout)
+                        _dbg_sf("sSFA_tile[,,0].layout", sSFA_tile[None, None, 0].layout)
+                        _dbg_sf("tCrSFA_tile.layout", tCrSFA_tile.layout)
                         tCrSFA_tile_copy_view = thr_copy_ldmatrix_SFA.retile(
                             tCrSFA_tile
                         )
+                        _dbg_sf("tCrSFA_tile_copy_view.layout (A retile OK)",
+                                tCrSFA_tile_copy_view.layout)
                     else:
                         tCsSFA_tile_copy_view = tCsSFA_copy_view_full
                         tCrSFA_tile = tCrSFA_full
@@ -2101,9 +2139,18 @@ class DenseGemmKernel:
                         tCrSFB_tile = self._partition_fragment_SFB(
                             sSFB_tile[None, None, 0], thr_mma, tidx
                         )
+                        # This is the abort site at tile N=32. Everything above
+                        # prints; if the next line is the last thing in the log,
+                        # retile is what rejected tCrSFB_tile.
+                        _dbg_sf("sSFB_tile.layout", sSFB_tile.layout)
+                        _dbg_sf("sSFB_tile[,,0].layout", sSFB_tile[None, None, 0].layout)
+                        _dbg_sf("tCrSFB_tile.layout", tCrSFB_tile.layout)
+                        _dbg_sf("about to retile SFB", "<<<")
                         tCrSFB_tile_copy_view = thr_copy_ldmatrix_SFB.retile(
                             tCrSFB_tile
                         )
+                        _dbg_sf("tCrSFB_tile_copy_view.layout (B retile OK)",
+                                tCrSFB_tile_copy_view.layout)
                     else:
                         tCsSFB_tile_copy_view = tCsSFB_copy_view_full
                         tCrSFB_tile = tCrSFB_full
