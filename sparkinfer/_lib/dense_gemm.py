@@ -4185,6 +4185,22 @@ class DenseGemmKernel:
             ab_stage = max(1, min(raw_ab_stage, 3))
         if _SPARKINFER_DENSE_AB_STAGES:
             ab_stage = max(1, min(raw_ab_stage, _SPARKINFER_DENSE_AB_STAGES))
+        # Every stage-depth sweep so far has had to infer whether the request
+        # took effect from timings alone, which cannot distinguish "the deeper
+        # pipeline did not help" from "raw_ab_stage clamped and both arms
+        # compiled the same kernel".
+        logger.debug(
+            "dense stages: tile=%s occ=%d raw=%d -> ab_stage=%d "
+            "(ab %dB + sf %dB per stage, epi %dB, smem %dB)",
+            tile_shape_mnk,
+            occupancy,
+            raw_ab_stage,
+            ab_stage,
+            ab_bytes_per_stage,
+            sf_bytes_per_stage,
+            epi_bytes,
+            smem_capacity,
+        )
         return ab_stage, epi_stage
 
     @staticmethod
