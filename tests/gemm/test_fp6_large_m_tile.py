@@ -165,6 +165,29 @@ def test_choose_epilogue_refuses_sub_atom_tiles():
         ) == (tile, 0)
 
 
+def test_choose_epilogue_refuses_the_m1_register_store_path():
+    """A non-smem-staged epilogue must keep the full tile.
+
+    use_m1_non_tma_c swaps the TMA store for a direct store out of registers,
+    so sC is not the staging buffer the policy assumes. Sizing a sub-tiled
+    multi-stage epilogue around it writes garbage rows without erroring. Live
+    case: the narrow-N (n <= 1536) coarse (128,128) tile serving m=1, where the
+    atom guard alone would happily allow (64,64).
+    """
+    import sparkinfer._lib.dense_gemm as dg
+
+    def probe_gain(epi_tile, cap):
+        return (1, 1) if cap == 0 else (2, 2)
+
+    assert dg.DenseGemmKernel._choose_epilogue(
+        (128, 128), (64, 16), probe_gain, stages_through_smem=False
+    ) == ((128, 128), 0)
+    # ... and the same tile does shrink when the epilogue really is staged.
+    assert dg.DenseGemmKernel._choose_epilogue(
+        (128, 128), (64, 16), probe_gain, stages_through_smem=True
+    ) == ((64, 64), 2)
+
+
 def test_choose_epilogue_defers_to_env_override(monkeypatch):
     import sparkinfer._lib.dense_gemm as dg
 

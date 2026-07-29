@@ -1077,6 +1077,7 @@ class DenseGemmKernel:
             (self.tile_shape_mnk[0], self.tile_shape_mnk[1]),
             (16 * self.atom_shape[0], 8 * self.atom_shape[1]),
             _probe_stages,
+            stages_through_smem=not self.use_m1_non_tma_c,
         )
         self.ab_stage, self.epi_stage = _probe_stages(
             self.epi_tile, _epi_stage_cap
@@ -4291,7 +4292,12 @@ class DenseGemmKernel:
         return ab_stage, epi_stage
 
     @staticmethod
-    def _choose_epilogue(mma_tiler_mn: tuple, mma_atom_tile_mn: tuple, probe) -> tuple:
+    def _choose_epilogue(
+        mma_tiler_mn: tuple,
+        mma_atom_tile_mn: tuple,
+        probe,
+        stages_through_smem: bool = True,
+    ) -> tuple:
         """Pick (epi_tile, epi_stage_cap) so the epilogue costs no mainloop stage.
 
         The staged output tile competes with the mainloop for the same shared
@@ -4313,6 +4319,13 @@ class DenseGemmKernel:
         keeps the full tile for that reason as well as on the tie; (128,128)
         sits on a 64x16 atom and (64,64) is exactly one atom tall.
         """
+        full = (mma_tiler_mn[0], mma_tiler_mn[1])
+        if not stages_through_smem:
+            # The m=1 epilogue stores straight out of registers rather than
+            # staging through sC (the use_m1_non_tma_c branches below), so a
+            # sub-tiled multi-stage buffer does not describe what it does. It
+            # does not fail loudly either: it writes garbage rows.
+            return full, 0
         atom_m, atom_n = mma_atom_tile_mn
 
         def _legal(epi_tile: tuple) -> bool:
@@ -4336,7 +4349,6 @@ class DenseGemmKernel:
                     f"{atom_m}x{atom_n} MMA atom tiles"
                 )
             return override, 0
-        full = (mma_tiler_mn[0], mma_tiler_mn[1])
         full_ab, _ = probe(full, 0)
         half = (mma_tiler_mn[0] // 2, mma_tiler_mn[1] // 2)
         if not _legal(half):
