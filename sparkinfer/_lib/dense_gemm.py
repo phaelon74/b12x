@@ -160,12 +160,18 @@ def _parse_tile_env(
         raise ValueError(f"{name} must look like '128x64', got {raw!r}") from exc
 
 
-# Wide-N (n > 1536) MX-FP6 prefill-regime (m > 16) MMA tile. (128,64) is the
-# measured M-independent winner of the FP6 tile sweep on Behemoth TP=2 shards
-# (see _select_default_mma_tiler_mn); all sweep tiles were bit-identical, so
-# this is a pure performance knob for A/B runs.
+# Wide-N (n > 1536) MX-FP6 prefill-regime (m > 16) MMA tile. All candidate
+# tiles are bit-identical, so this is a pure performance knob for A/B runs.
+#
+# (128,128) since Jul 28 2026. The earlier sweep that picked (128,64) could not
+# see this: every (128,128) arm it measured ran at ab_stage=1 because the
+# full-tile epilogue took 32KB of shared memory, so it compared a pipelined
+# narrow tile against an unpipelined wide one. With _choose_epilogue freeing
+# those bytes, (128,128) reaches 2 stages and wins on all four Behemoth TP=2
+# shards at M=8192 (qkv -18.0%, o -18.9%, down -17.1%, gate_up -18.1%), and
+# end-to-end serving prefill gains 8.7-14.6% across 1k-32k context.
 _SPARKINFER_FP6_LARGE_M_TILE = _parse_tile_env(
-    "SPARKINFER_FP6_LARGE_M_TILE", (128, 64)
+    "SPARKINFER_FP6_LARGE_M_TILE", (128, 128)
 )
 # Optional forced MX-FP6 decode-regime (m <= 16, wide-N) tile for A/B runs.
 # Unset (default) = the measured wave-cliff heuristic in
@@ -215,6 +221,10 @@ _SPARKINFER_DENSE_AB_STAGES = int(os.getenv("SPARKINFER_DENSE_AB_STAGES", "0"))
 # Numerics-neutral: this only changes the granularity at which finished output
 # tiles are staged and TMA-stored, not accumulation order, rounding, or any
 # operand value.
+#
+# Setting this disables _choose_epilogue, which otherwise makes the decision
+# per tile. Kept as an A/B and escape hatch, and it is an upper bound per mode
+# rather than an exact request - see _dense_epi_tile.
 _SPARKINFER_DENSE_EPI_TILE = _parse_tile_env("SPARKINFER_DENSE_EPI_TILE", None)
 # SPARKINFER_DENSE_EPI_STAGES=N (default 0 = the min(epi_stage_max, 4) rule)
 # caps the epilogue pipeline depth. Required to make EPI_TILE mean anything:
@@ -1047,18 +1057,27 @@ class DenseGemmKernel:
         )
 
         # Compute stage before compute smem layout
-        self.ab_stage, self.epi_stage = self._compute_stages(
-            self.tile_shape_mnk,
-            self.a_dtype,
-            self.b_dtype,
-            self.sf_dtype,
-            sfa_smem_layout_per_stage,
-            sfb_smem_layout_per_stage,
-            self.epi_tile,
-            self.c_dtype,
-            self.smem_capacity,
-            self.occupancy,
-            self.b_packed,
+        def _probe_stages(epi_tile: tuple, epi_stage_cap: int) -> tuple:
+            return self._compute_stages(
+                self.tile_shape_mnk,
+                self.a_dtype,
+                self.b_dtype,
+                self.sf_dtype,
+                sfa_smem_layout_per_stage,
+                sfb_smem_layout_per_stage,
+                epi_tile,
+                self.c_dtype,
+                self.smem_capacity,
+                self.occupancy,
+                self.b_packed,
+                epi_stage_cap,
+            )
+
+        self.epi_tile, _epi_stage_cap = self._choose_epilogue(
+            mma_tiler_mn, _probe_stages
+        )
+        self.ab_stage, self.epi_stage = _probe_stages(
+            self.epi_tile, _epi_stage_cap
         )
 
         assert self.epi_stage > 0, (
@@ -4200,13 +4219,18 @@ class DenseGemmKernel:
         smem_capacity: int,
         occupancy: int,
         b_packed: bool = False,
+        epi_stage_cap: int = 0,
     ) -> tuple:
         epi_stage_max = (tile_shape_mnk[1] // epi_tile[1]) * (
             tile_shape_mnk[0] // epi_tile[0]
         )
         epi_stage = min(epi_stage_max, 4)
-        if _SPARKINFER_DENSE_EPI_STAGES:
-            epi_stage = max(1, min(epi_stage, _SPARKINFER_DENSE_EPI_STAGES))
+        # A smaller epi_tile on its own frees nothing: epi_stage_max rises by
+        # exactly the factor the tile shrank, so epi_bytes is invariant until
+        # the x4 cap bites. Shrinking the epilogue footprint takes both.
+        cap = epi_stage_cap or _SPARKINFER_DENSE_EPI_STAGES
+        if cap:
+            epi_stage = max(1, min(epi_stage, cap))
         c_bytes_per_stage = cute.size(epi_tile) * c_dtype.width // 8
         epi_bytes = c_bytes_per_stage * epi_stage
 
@@ -4263,6 +4287,38 @@ class DenseGemmKernel:
             smem_capacity,
         )
         return ab_stage, epi_stage
+
+    @staticmethod
+    def _choose_epilogue(mma_tiler_mn: tuple, probe) -> tuple:
+        """Pick (epi_tile, epi_stage_cap) so the epilogue costs no mainloop stage.
+
+        The staged output tile competes with the mainloop for the same shared
+        memory, and the full-tile epilogue that every tile used to get is large
+        enough to decide the pipeline depth rather than merely fit beside it.
+        At (128,128) it reserved 32KB and left room for a single stage, which is
+        why that tile was recorded as 36% slower than (128,64) - the comparison
+        was against an unpipelined kernel.
+
+        Only two candidates, and the full tile wins ties, so a shape whose
+        epilogue was never the binding constraint keeps exactly the kernel it
+        has today. Measured on Behemoth TP=2 (RTX PRO 6000, M=8192, 2 passes,
+        bit-identical on every shard): (128,128) takes the fallback and runs
+        qkv -18.0%, o -18.9%, down -17.1%, gate_up -18.1% against the (128,64)
+        baseline, which itself keeps the full-tile epilogue.
+        """
+        if _SPARKINFER_DENSE_EPI_TILE is not None:
+            return _dense_epi_tile(mma_tiler_mn), 0
+        full = (mma_tiler_mn[0], mma_tiler_mn[1])
+        full_ab, _ = probe(full, 0)
+        half = (mma_tiler_mn[0] // 2, mma_tiler_mn[1] // 2)
+        if half[0] < 1 or half[1] < 1:
+            return full, 0
+        # Halving the tile alone is inert - epi_stage_max rises by the same
+        # factor - so the cap is what actually reclaims the bytes.
+        half_ab, _ = probe(half, 2)
+        if half_ab > full_ab:
+            return half, 2
+        return full, 0
 
     @staticmethod
     def _make_smem_layouts(
@@ -4693,11 +4749,12 @@ class _DenseGemmLaunch:
             self._direct_m1_wo_a_inputs,
             self._target_occupancy,
             self._sf_copy_mode,
-            # Resolved epilogue shape, not the raw env values: it decides both
-            # the staged output tile and, through epi_bytes, how many mainloop
-            # stages fit. A cached kernel built under a different epilogue is a
-            # different kernel even at the same mma_tiler.
-            _dense_epi_tile(self._mma_tiler_mn),
+            # Only the overrides. _choose_epilogue is a deterministic function
+            # of the tile, dtypes, occupancy and smem capacity, all of which are
+            # already keyed above, so the resolved epilogue needs no entry - but
+            # the env knobs bypass it and would otherwise let a run with the
+            # override set load a kernel cached without it.
+            _SPARKINFER_DENSE_EPI_TILE,
             _SPARKINFER_DENSE_EPI_STAGES,
         )
 
@@ -6747,17 +6804,14 @@ def _select_default_mma_tiler_mn(
             # 113.2 us, o 52.7 -> 52.5 us; same ncu run as the occupancy rule).
             return (16, 64)
         if n > 1536:
-            # Wide-N prefill regime (m > 16). The Jul 26 2026 FP6 tile sweep
-            # (benchmark_dense_gemm_fp6.py --tile-sweep, Behemoth TP=2 shards,
-            # RTX PRO 6000 GPU-41235b51, /tmp/fp6_tile_sweep.json) measured
-            # (128,64) fastest at every M >= 512 on every shard (534-582 TF at
-            # M=8192, 8-22% under the old (128,128) pin) AND faster than
-            # (128,128) at every smaller M too, so it is a safe M-INDEPENDENT
-            # choice for the whole regime — one kernel per (N,K) under frozen
-            # resolution is preserved. All candidate tiles were bit-identical
-            # (sweep `bit` gate). Override for A/B via
-            # SPARKINFER_FP6_LARGE_M_TILE=MxN (e.g. 128x128 restores the old
-            # pin).
+            # Wide-N prefill regime (m > 16). M-INDEPENDENT by construction, so
+            # one kernel per (N,K) under frozen resolution is preserved. All
+            # candidate tiles are bit-identical (sweep `bit` gate). Override for
+            # A/B via SPARKINFER_FP6_LARGE_M_TILE=MxN.
+            #
+            # The Jul 26 2026 sweep that put (128,64) here is retired, not
+            # merely outvoted: it read the epilogue's shared-memory reservation
+            # as a property of the wide tile. See _SPARKINFER_FP6_LARGE_M_TILE.
             return _SPARKINFER_FP6_LARGE_M_TILE
         return coarse_tile
     # The serving WO-B prefill GEMM is [M,4096] x [4096,4096]. DeepGEMM's
