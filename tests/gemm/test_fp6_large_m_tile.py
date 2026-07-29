@@ -1,12 +1,14 @@
 """Bit-equality and regime isolation for the MX-FP6 wide-N prefill tile.
 
-Phase B item 4: the wide-N m>16 default tile moved from the (128,128) pin to
-the sweep-measured (128,64) winner (``SPARKINFER_FP6_LARGE_M_TILE`` overrides
-for A/B). Tiles only change the CTA work decomposition — the per-output-element
-accumulation order is identical — so outputs must be BIT-IDENTICAL across
-tiles. The m<=16 decode regime takes the wave-cliff heuristic ((16,64), or
-(32,128) when ceil(N/64) leaves a tiny tail wave); `SPARKINFER_FP6_DECODE_TILE`
-forces a fixed tile for A/B.
+The wide-N m>16 default tile is (128,128) (``SPARKINFER_FP6_LARGE_M_TILE``
+overrides for A/B). It was briefly (128,64): the sweep that chose that could
+only see (128,128) starved to a single mainloop stage by a full-tile epilogue,
+and once ``_choose_epilogue`` frees those bytes the wide tile wins by 17-19% on
+every Behemoth shard. Tiles only change the CTA work decomposition — the
+per-output-element accumulation order is identical — so outputs must be
+BIT-IDENTICAL across tiles. The m<=16 decode regime takes the wave-cliff
+heuristic ((16,64), or (32,128) when ceil(N/64) leaves a tiny tail wave);
+`SPARKINFER_FP6_DECODE_TILE` forces a fixed tile for A/B.
 """
 from __future__ import annotations
 
@@ -56,15 +58,15 @@ def test_fp6_tile_regime_selection():
         # and _dense_gemm_target_occupancy now returns 2 for exactly these
         # shapes, so width-64 wins outright. Decode is width-64 everywhere.
         assert _select_default_mma_tiler_mn(m, 12288, **common) == (16, 64)
-    # Wide-N prefill regime takes the sweep winner for every m > 16.
+    # Wide-N prefill regime takes one tile for every m > 16.
     for m in (17, 32, 512, 8192):
-        assert _select_default_mma_tiler_mn(m, 7168, **common) == (128, 64)
+        assert _select_default_mma_tiler_mn(m, 7168, **common) == (128, 128)
     # Narrow-N keeps the unmeasured coarse default.
     assert _select_default_mma_tiler_mn(8192, 1024, **common) == (128, 128)
     # A declared expected_m regime hint owns the decision.
     assert _select_default_mma_tiler_mn(
         1, 7168, expected_m=8192, **common
-    ) == (128, 64)
+    ) == (128, 128)
     assert _select_default_mma_tiler_mn(
         8192, 7168, expected_m=8, **common
     ) == (16, 64)
@@ -95,6 +97,67 @@ def test_fp6_decode_tile_bit_exact_vs_old_pin(m, monkeypatch):
     y_new = fdw.dense_fp6_linear_expanded(x, fp6w.packed, *args)
 
     torch.testing.assert_close(y_new, y_old, rtol=0.0, atol=0.0)
+
+
+def test_choose_epilogue_only_shrinks_to_buy_a_stage(monkeypatch):
+    """The full-tile epilogue must survive unless shrinking buys a stage.
+
+    This tie-break is the whole safety argument for the policy: it is what
+    leaves (128,64) prefill and (16,64) decode compiling byte-identical kernels
+    while (128,128) picks up a second mainloop stage.
+    """
+    import sparkinfer._lib.dense_gemm as dg
+
+    monkeypatch.setattr(dg, "_SPARKINFER_DENSE_EPI_TILE", None)
+    kernel = dg.DenseGemmKernel
+
+    # Decode/(128,64) shape of the problem: the epilogue was never binding, so
+    # both candidates reach the same depth and the larger tile must win.
+    seen = []
+
+    def probe_no_gain(epi_tile, cap):
+        seen.append((epi_tile, cap))
+        return 3, 1
+
+    assert kernel._choose_epilogue((128, 64), probe_no_gain) == ((128, 64), 0)
+    assert seen == [((128, 64), 0), ((64, 32), 2)]
+
+    # (128,128) shape of the problem: halving buys a stage, so take it.
+    def probe_gain(epi_tile, cap):
+        return (1, 1) if epi_tile == (128, 128) else (2, 2)
+
+    assert kernel._choose_epilogue((128, 128), probe_gain) == ((64, 64), 2)
+
+    # A shrink that buys nothing but costs nothing is still refused, because a
+    # smaller epilogue means more TMA stores for the same shared memory.
+    def probe_equal_deeper(epi_tile, cap):
+        return 2, 2
+
+    assert kernel._choose_epilogue((128, 128), probe_equal_deeper) == (
+        (128, 128),
+        0,
+    )
+
+
+def test_choose_epilogue_defers_to_env_override(monkeypatch):
+    import sparkinfer._lib.dense_gemm as dg
+
+    monkeypatch.setattr(dg, "_SPARKINFER_DENSE_EPI_TILE", (64, 64))
+
+    def probe_gain(epi_tile, cap):  # pragma: no cover - must not be consulted
+        raise AssertionError("policy ran despite an explicit override")
+
+    assert dg.DenseGemmKernel._choose_epilogue((128, 128), probe_gain) == (
+        (64, 64),
+        0,
+    )
+    # The override is an upper bound per mode, so a tile smaller than the
+    # request clamps instead of raising - a serving process compiles the decode
+    # tile in the same interpreter as the prefill tile it was aimed at.
+    assert dg.DenseGemmKernel._choose_epilogue((16, 64), probe_gain) == (
+        (16, 64),
+        0,
+    )
 
 
 def test_parse_tile_env_guard(monkeypatch):
