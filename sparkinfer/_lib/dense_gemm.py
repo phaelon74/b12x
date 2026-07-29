@@ -1074,7 +1074,9 @@ class DenseGemmKernel:
             )
 
         self.epi_tile, _epi_stage_cap = self._choose_epilogue(
-            (self.tile_shape_mnk[0], self.tile_shape_mnk[1]), _probe_stages
+            (self.tile_shape_mnk[0], self.tile_shape_mnk[1]),
+            (16 * self.atom_shape[0], 8 * self.atom_shape[1]),
+            _probe_stages,
         )
         self.ab_stage, self.epi_stage = _probe_stages(
             self.epi_tile, _epi_stage_cap
@@ -4289,7 +4291,7 @@ class DenseGemmKernel:
         return ab_stage, epi_stage
 
     @staticmethod
-    def _choose_epilogue(mma_tiler_mn: tuple, probe) -> tuple:
+    def _choose_epilogue(mma_tiler_mn: tuple, mma_atom_tile_mn: tuple, probe) -> tuple:
         """Pick (epi_tile, epi_stage_cap) so the epilogue costs no mainloop stage.
 
         The staged output tile competes with the mainloop for the same shared
@@ -4305,13 +4307,39 @@ class DenseGemmKernel:
         bit-identical on every shard): (128,128) takes the fallback and runs
         qkv -18.0%, o -18.9%, down -17.1%, gate_up -18.1% against the (128,64)
         baseline, which itself keeps the full-tile epilogue.
+
+        The candidate must also be a whole number of MMA atom tiles. Decode's
+        (16,64) sits on a 16x16 atom, so its halved candidate is illegal and it
+        keeps the full tile for that reason as well as on the tie; (128,128)
+        sits on a 64x16 atom and (64,64) is exactly one atom tall.
         """
+        atom_m, atom_n = mma_atom_tile_mn
+
+        def _legal(epi_tile: tuple) -> bool:
+            # The epilogue walks MmaMPerEpiM = epi_m // mma_tile_m atoms per
+            # staged tile. An epilogue smaller than one atom floors that to
+            # zero, so the accumulator is never copied in and the TMA stores
+            # whatever was in shared memory - silent NaN, not a compile error.
+            return (
+                epi_tile[0] >= atom_m
+                and epi_tile[1] >= atom_n
+                and epi_tile[0] % atom_m == 0
+                and epi_tile[1] % atom_n == 0
+            )
+
         if _SPARKINFER_DENSE_EPI_TILE is not None:
-            return _dense_epi_tile(mma_tiler_mn), 0
+            override = _dense_epi_tile(mma_tiler_mn)
+            if not _legal(override):
+                raise ValueError(
+                    f"SPARKINFER_DENSE_EPI_TILE resolved to {override[0]}x"
+                    f"{override[1]}, which is not a whole number of "
+                    f"{atom_m}x{atom_n} MMA atom tiles"
+                )
+            return override, 0
         full = (mma_tiler_mn[0], mma_tiler_mn[1])
         full_ab, _ = probe(full, 0)
         half = (mma_tiler_mn[0] // 2, mma_tiler_mn[1] // 2)
-        if half[0] < 1 or half[1] < 1:
+        if not _legal(half):
             return full, 0
         # Halving the tile alone is inert - epi_stage_max rises by the same
         # factor - so the cap is what actually reclaims the bytes.

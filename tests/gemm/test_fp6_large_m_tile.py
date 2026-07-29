@@ -119,24 +119,50 @@ def test_choose_epilogue_only_shrinks_to_buy_a_stage(monkeypatch):
         seen.append((epi_tile, cap))
         return 3, 1
 
-    assert kernel._choose_epilogue((128, 64), probe_no_gain) == ((128, 64), 0)
+    assert kernel._choose_epilogue((128, 64), (64, 16), probe_no_gain) == (
+        (128, 64),
+        0,
+    )
     assert seen == [((128, 64), 0), ((64, 32), 2)]
 
     # (128,128) shape of the problem: halving buys a stage, so take it.
     def probe_gain(epi_tile, cap):
         return (1, 1) if epi_tile == (128, 128) else (2, 2)
 
-    assert kernel._choose_epilogue((128, 128), probe_gain) == ((64, 64), 2)
+    assert kernel._choose_epilogue((128, 128), (64, 16), probe_gain) == (
+        (64, 64),
+        2,
+    )
 
     # A shrink that buys nothing but costs nothing is still refused, because a
     # smaller epilogue means more TMA stores for the same shared memory.
     def probe_equal_deeper(epi_tile, cap):
         return 2, 2
 
-    assert kernel._choose_epilogue((128, 128), probe_equal_deeper) == (
+    assert kernel._choose_epilogue((128, 128), (64, 16), probe_equal_deeper) == (
         (128, 128),
         0,
     )
+
+
+def test_choose_epilogue_refuses_sub_atom_tiles():
+    """A sub-atom epilogue must never be selected, however much it would buy.
+
+    MmaMPerEpiM is epi_m // mma_tile_m, so an epilogue shorter than one atom
+    floors the accumulator copy loop to zero trips and the TMA stores
+    uninitialized shared memory. There is no exception and no compile error -
+    it is silently NaN - so the guard is a hard precondition, not a heuristic.
+    Decode's (16,64) on a 16x16 atom is the live case.
+    """
+    import sparkinfer._lib.dense_gemm as dg
+
+    def probe_huge_gain(epi_tile, cap):
+        return (1, 1) if cap == 0 else (99, 2)
+
+    for tile in ((16, 64), (16, 128), (16, 32)):
+        assert dg.DenseGemmKernel._choose_epilogue(
+            tile, (16, 16), probe_huge_gain
+        ) == (tile, 0)
 
 
 def test_choose_epilogue_defers_to_env_override(monkeypatch):
@@ -147,17 +173,15 @@ def test_choose_epilogue_defers_to_env_override(monkeypatch):
     def probe_gain(epi_tile, cap):  # pragma: no cover - must not be consulted
         raise AssertionError("policy ran despite an explicit override")
 
-    assert dg.DenseGemmKernel._choose_epilogue((128, 128), probe_gain) == (
-        (64, 64),
-        0,
-    )
+    assert dg.DenseGemmKernel._choose_epilogue(
+        (128, 128), (64, 16), probe_gain
+    ) == ((64, 64), 0)
     # The override is an upper bound per mode, so a tile smaller than the
     # request clamps instead of raising - a serving process compiles the decode
     # tile in the same interpreter as the prefill tile it was aimed at.
-    assert dg.DenseGemmKernel._choose_epilogue((16, 64), probe_gain) == (
-        (16, 64),
-        0,
-    )
+    assert dg.DenseGemmKernel._choose_epilogue(
+        (16, 64), (16, 16), probe_gain
+    ) == ((16, 64), 0)
 
 
 def test_parse_tile_env_guard(monkeypatch):
