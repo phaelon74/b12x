@@ -360,6 +360,51 @@ Behemoth shard stays above the N>1536 wide-N threshold at either TP, so the
 selector resolves (128,128) in both cases and this is not a new tile regime —
 but the row-parallel shards do run a different K, and the value held.
 
+### 3.6d The MoE epilogue is hardwired too, and it does not matter
+
+MoE carries the same construct 3.6c fixed — `dynamic.py:904` pins `epi_tile` to
+the MMA tile, and the resulting `sC` enters the fixed shared-memory
+reservation at `:1163`. The FP6 MoE kernel is also unpipelined. Measured:
+
+```
+dynamic stages: tile=(128, 128, 128) gated=True ab_stage=1 (dense suggested 1,
+  max_fit 1) epi_tile=(128, 128) epi_stage=1 per_stage=50736 fixed=44352
+  (sC 32768) capacity=101376
+```
+
+But the epilogue is not the binding constraint here, and porting
+`_choose_epilogue` would be a no-op. The per-stage footprint is twice dense's:
+
+| | bytes |
+|---|---|
+| sA (128x128, one E4M3 byte per element) | 16384 |
+| sB x2 — gated FC1 keeps gate and up | 32768 |
+| sSFA + sSFB x2 | ~1536 |
+| mbar | 48 |
+| **per stage** | **50736** |
+
+`(101376 - 44352) / 50736 = 1.12`, hence one stage. Delete the epilogue
+*entirely*, not merely shrink it, and it is `(101376 - 11584) / 50736 = 1.77`
+— still one stage. Two stages need `per_stage <= 44896`, an 11.5% cut. So the
+policy's two candidates would both fail the probe and the full tile would win
+on the tie, producing a byte-identical kernel.
+
+The contrast with 3.6c is the whole point: dense's per-stage was 25600 against
+a 32768 epilogue, so the epilogue was *larger* than a mainloop stage and
+freeing it bought one outright. Here it is two thirds of a stage. Same
+construct, opposite conclusion — which is why the budget has to be computed
+per kernel rather than inferred from the dense result.
+
+Two consequences. There is no confounded MoE tile record to retire, because
+only (128,128) is ever built for `w6a8_mx` (the ctor rejects the rest and
+`_select_dynamic_tile_mn` returns the fixed tile unconditionally), so no MoE
+tile sweep was ever run under this. And if MoE pipelining is worth pursuing at
+all, the lever is the doubled B buffer — 32768 of the 50736, 65% of the
+per-stage cost — which is a structural change to gated FC1 staging, not a
+policy port. That should not be started without a profile establishing the
+kernel is pipeline-starved rather than bound elsewhere; `ab_stage=1` proves
+the pipeline is absent, not that adding one would pay.
+
 ### 3.7 Reading the matrix
 
 * **Dense TP=2 helps decode latency:** TPOT 9.80 -> 7.49 ms at ctx-1k
