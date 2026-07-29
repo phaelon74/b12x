@@ -1074,7 +1074,7 @@ class DenseGemmKernel:
             )
 
         self.epi_tile, _epi_stage_cap = self._choose_epilogue(
-            mma_tiler_mn, _probe_stages
+            (self.tile_shape_mnk[0], self.tile_shape_mnk[1]), _probe_stages
         )
         self.ab_stage, self.epi_stage = _probe_stages(
             self.epi_tile, _epi_stage_cap
